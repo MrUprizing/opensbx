@@ -70,6 +70,9 @@ func main() {
 	h := api.New(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr())
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(v1)
+	mcpHandler := api.NewMCPHandler(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr())
+	v1.Any("/mcp", gin.WrapH(mcpHandler))
+	v1.Any("/mcp/*path", gin.WrapH(mcpHandler))
 
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerfiles.Handler))
 
