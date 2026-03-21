@@ -23,6 +23,7 @@ import (
 )
 
 const integrationTestImage = "node:25-alpine"
+const integrationLifecycleTimeoutSeconds = 1800
 
 // realRouter builds a Gin engine wired to the real Docker daemon.
 func realRouter(t *testing.T) *gin.Engine {
@@ -66,7 +67,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	// 1. Create a sandbox using a lightweight image.
 	w := do(r, "POST", "/v1/sandboxes", map[string]any{
 		"image":   testImage,
-		"timeout": 300,
+		"timeout": integrationLifecycleTimeoutSeconds,
 	})
 	require.Equal(t, http.StatusCreated, w.Code, "create should return 201: %s", w.Body.String())
 
