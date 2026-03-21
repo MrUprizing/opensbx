@@ -1,7 +1,11 @@
+//go:build integration
+// +build integration
+
 package api_test
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -18,23 +22,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const integrationTestImage = "node:25-alpine"
+
 // realRouter builds a Gin engine wired to the real Docker daemon.
-func realRouter() *gin.Engine {
+func realRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+
 	db := database.New(":memory:")
 	repo := database.NewRepository(db)
+	dc := docker.New(repo)
+	if err := dc.Ping(context.Background()); err != nil {
+		t.Skipf("skipping integration test: Docker unavailable (%v)", err)
+	}
+
 	r := gin.New()
-	h := api.New(docker.New(repo), "localhost", ":3000")
+	h := api.New(dc, "localhost", ":3000")
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(r.Group("/v1"))
 	return r
 }
 
-func TestIntegration_FullLifecycle(t *testing.T) {
-	r := realRouter()
+func ensureTestImage(t *testing.T, r *gin.Engine, image string) {
+	t.Helper()
 
-	// 1. Create a sandbox using a lightweight image (assumes nextjs-docker:latest is already available locally).
+	check := do(r, "GET", "/v1/images/"+image, nil)
+	if check.Code == http.StatusOK {
+		return
+	}
+	if check.Code != http.StatusNotFound {
+		require.FailNowf(t, "image check failed", "check should return 200 or 404: %d %s", check.Code, check.Body.String())
+	}
+
+	w := do(r, "POST", "/v1/images/pull", map[string]any{"image": image})
+	require.Equal(t, http.StatusOK, w.Code,
+		"image %q is not available locally and pull failed: %s", image, w.Body.String())
+}
+
+func TestIntegration_FullLifecycle(t *testing.T) {
+	r := realRouter(t)
+	testImage := integrationTestImage
+	ensureTestImage(t, r, testImage)
+
+	// 1. Create a sandbox using a lightweight image.
 	w := do(r, "POST", "/v1/sandboxes", map[string]any{
-		"image":   "nextjs-docker:latest",
+		"image":   testImage,
 		"timeout": 300,
 	})
 	require.Equal(t, http.StatusCreated, w.Code, "create should return 201: %s", w.Body.String())
@@ -202,7 +233,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 }
 
 func TestIntegration_NotFound(t *testing.T) {
-	r := realRouter()
+	r := realRouter(t)
 
 	endpoints := []struct {
 		method string
@@ -229,11 +260,13 @@ func TestIntegration_NotFound(t *testing.T) {
 }
 
 func TestIntegration_DefaultResourceLimits(t *testing.T) {
-	r := realRouter()
+	r := realRouter(t)
+	testImage := integrationTestImage
+	ensureTestImage(t, r, testImage)
 
 	// Create a sandbox without specifying resource limits
 	w := do(r, "POST", "/v1/sandboxes", map[string]any{
-		"image":   "nextjs-docker:latest",
+		"image":   testImage,
 		"timeout": 60,
 	})
 	require.Equal(t, http.StatusCreated, w.Code, "create should return 201: %s", w.Body.String())
@@ -260,10 +293,9 @@ func TestIntegration_DefaultResourceLimits(t *testing.T) {
 }
 
 func TestIntegration_ImagePull(t *testing.T) {
-	r := realRouter()
+	r := realRouter(t)
 
-	// Test pulling a lightweight image
-	testImage := "busybox:1.36.1"
+	testImage := integrationTestImage
 
 	w := do(r, "POST", "/v1/images/pull", map[string]any{
 		"image": testImage,

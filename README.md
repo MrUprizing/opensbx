@@ -50,6 +50,22 @@ go run cmd/api/main.go
 
 The API runs on `http://localhost:8080` by default. Swagger docs at `/swagger/index.html`.
 
+## Testing
+
+See the full guide at [docs/testing.md](docs/testing.md).
+
+Run unit tests:
+
+```bash
+go test ./...
+```
+
+Run integration tests (Docker required):
+
+```bash
+go test -tags=integration ./... -run '^TestIntegration'
+```
+
 ## Configuration
 
 | Variable | Flag | Default | Description |
