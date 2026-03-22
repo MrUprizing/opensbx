@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BINARY_NAME="open-sandbox"
-REPO="${OPEN_SANDBOX_REPO:-MrUprizing/opensandbox}"
-INSTALL_DIR="${OPEN_SANDBOX_INSTALL_DIR:-/usr/local/bin}"
+BINARY_NAME="opensbx"
+REPO="${OPENSBX_REPO:-MrUprizing/opensbx}"
+INSTALL_DIR="${OPENSBX_INSTALL_DIR:-/usr/local/bin}"
 
 detect_os() {
   case "$(uname -s)" in
@@ -76,7 +76,7 @@ main() {
 
   os="$(detect_os)"
   arch="$(detect_arch)"
-  version="${OPEN_SANDBOX_VERSION:-}"
+  version="${OPENSBX_VERSION:-}"
   if [[ -z "$version" ]]; then
     version="$(fetch_latest_version)"
   fi

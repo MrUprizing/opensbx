@@ -6,7 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"open-sandbox/internal/docker"
+	"opensbx/internal/docker"
 )
 
 // ErrorResponse is the standard error body returned by all API endpoints.

@@ -12,10 +12,10 @@ import (
 
 	"testing"
 
-	"open-sandbox/internal/api"
-	"open-sandbox/internal/database"
-	"open-sandbox/internal/docker"
-	"open-sandbox/models"
+	"opensbx/internal/api"
+	"opensbx/internal/database"
+	"opensbx/internal/docker"
+	"opensbx/models"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"

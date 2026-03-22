@@ -1,4 +1,4 @@
-module open-sandbox
+module opensbx
 
 go 1.25.6
 

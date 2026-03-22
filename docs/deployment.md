@@ -5,7 +5,7 @@ Goal:
 - API at `your-domain.com`
 - Sandboxes at `*.your-domain.com`
 
-Cloudflare handles TLS. `cloudflared` forwards traffic to local Open Sandbox ports.
+Cloudflare handles TLS. `cloudflared` forwards traffic to local Opensbx ports.
 
 ## Fast setup (macOS)
 
@@ -69,18 +69,18 @@ cloudflared tunnel ingress validate
 cloudflared tunnel run opensbx-local
 ```
 
-## Run Open Sandbox
+## Run Opensbx
 
 ### Install binary from script
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
 ```
 
 ### Run for deployment
 
 ```bash
-open-sandbox -addr :8080 -proxy-addr :3000 -base-domain your-domain.com
+opensbx -addr :8080 -proxy-addr :3000 -base-domain your-domain.com
 ```
 
 ## Verify

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/url"
 
-	"open-sandbox/internal/database"
+	"opensbx/internal/database"
 )
 
 // resolve looks up the sandbox by name and returns the target URL (http://127.0.0.1:{hostPort}).

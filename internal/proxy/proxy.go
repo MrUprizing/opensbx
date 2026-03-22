@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"open-sandbox/internal/database"
+	"opensbx/internal/database"
 )
 
 // Server is a reverse proxy that routes HTTP requests based on subdomain.

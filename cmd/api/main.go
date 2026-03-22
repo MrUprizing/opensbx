@@ -13,16 +13,16 @@ import (
 	"github.com/gin-gonic/gin"
 	swaggerfiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
-	"open-sandbox/internal/api"
-	"open-sandbox/internal/config"
-	"open-sandbox/internal/database"
-	"open-sandbox/internal/docker"
-	"open-sandbox/internal/proxy"
+	"opensbx/internal/api"
+	"opensbx/internal/config"
+	"opensbx/internal/database"
+	"opensbx/internal/docker"
+	"opensbx/internal/proxy"
 
-	_ "open-sandbox/docs"
+	_ "opensbx/docs"
 )
 
-// @title           Open Sandbox API
+// @title           Opensbx API
 // @version         1.0
 // @description     Docker sandbox orchestrator REST API. Create, manage, and execute commands inside isolated Docker containers.
 

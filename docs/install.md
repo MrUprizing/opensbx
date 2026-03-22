@@ -11,13 +11,13 @@
 Install latest release binary:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
 ```
 
 Run locally:
 
 ```bash
-open-sandbox -addr :8080 -proxy-addr :3000 -base-domain localhost
+opensbx -addr :8080 -proxy-addr :3000 -base-domain localhost
 ```
 
 Health check:

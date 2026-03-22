@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"open-sandbox/internal/database"
+	"opensbx/internal/database"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -1729,7 +1729,7 @@ var SwaggerInfo = &swag.Spec{
 	Host:             "localhost:8080",
 	BasePath:         "/v1",
 	Schemes:          []string{},
-	Title:            "Open Sandbox API",
+	Title:            "Opensbx API",
 	Description:      "Docker sandbox orchestrator REST API. Create, manage, and execute commands inside isolated Docker containers.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,

@@ -297,7 +297,7 @@ info:
   contact: {}
   description: Docker sandbox orchestrator REST API. Create, manage, and execute commands
     inside isolated Docker containers.
-  title: Open Sandbox API
+  title: Opensbx API
   version: "1.0"
 paths:
   /health:

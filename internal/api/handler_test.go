@@ -12,9 +12,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
-	"open-sandbox/internal/api"
-	"open-sandbox/internal/docker"
-	"open-sandbox/models"
+	"opensbx/internal/api"
+	"opensbx/internal/docker"
+	"opensbx/models"
 )
 
 // Compile-time check that stub implements api.DockerClient.

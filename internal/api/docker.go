@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"open-sandbox/models"
+	"opensbx/models"
 )
 
 // DockerClient defines the sandbox operations used by the API handlers.

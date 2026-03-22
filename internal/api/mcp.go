@@ -7,13 +7,13 @@ import (
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"open-sandbox/models"
+	"opensbx/models"
 )
 
 // NewMCPHandler returns a streamable HTTP MCP handler mounted under /v1/mcp.
 func NewMCPHandler(d DockerClient, baseDomain, proxyAddr string, disableLocalhostProtection bool) http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "open-sandbox",
+		Name:    "opensbx",
 		Version: "1.0.0",
 	}, &mcp.ServerOptions{Instructions: mcpServerInstructions()})
 
@@ -450,13 +450,13 @@ func mcpJSON(v any) (*mcp.CallToolResult, any, error) {
 
 func addMCPContext(server *mcp.Server) {
 	server.AddResource(&mcp.Resource{
-		Name:        "opensandbox-how-it-works",
-		Title:       "OpenSandbox MCP: How It Works",
-		Description: "Operational model and best practices for using OpenSandbox tools",
-		URI:         "opensandbox://docs/how-it-works",
+		Name:        "opensbx-how-it-works",
+		Title:       "Opensbx MCP: How It Works",
+		Description: "Operational model and best practices for using Opensbx tools",
+		URI:         "opensbx://docs/how-it-works",
 		MIMEType:    "text/markdown",
 	}, func(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		if req.Params.URI != "opensandbox://docs/how-it-works" {
+		if req.Params.URI != "opensbx://docs/how-it-works" {
 			return nil, mcp.ResourceNotFoundError(req.Params.URI)
 		}
 		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
@@ -467,13 +467,13 @@ func addMCPContext(server *mcp.Server) {
 	})
 
 	server.AddResource(&mcp.Resource{
-		Name:        "opensandbox-quickstart",
-		Title:       "OpenSandbox MCP: Quickstart",
+		Name:        "opensbx-quickstart",
+		Title:       "Opensbx MCP: Quickstart",
 		Description: "Fast workflow and command templates for common tasks",
-		URI:         "opensandbox://docs/quickstart",
+		URI:         "opensbx://docs/quickstart",
 		MIMEType:    "text/markdown",
 	}, func(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		if req.Params.URI != "opensandbox://docs/quickstart" {
+		if req.Params.URI != "opensbx://docs/quickstart" {
 			return nil, mcp.ResourceNotFoundError(req.Params.URI)
 		}
 		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
@@ -497,7 +497,7 @@ func addMCPContext(server *mcp.Server) {
 		if sandboxID == "" {
 			sandboxID = "<create_one_first>"
 		}
-		text := fmt.Sprintf(`You are using OpenSandbox over MCP.
+		text := fmt.Sprintf(`You are using Opensbx over MCP.
 
 Goal: %s
 Sandbox ID: %s
@@ -516,7 +516,7 @@ Important:
 - Detect the correct working directory before running app-specific commands.
 `, goal, sandboxID)
 		return &mcp.GetPromptResult{
-			Description: "OpenSandbox best-practice workflow",
+			Description: "Opensbx best-practice workflow",
 			Messages: []*mcp.PromptMessage{{
 				Role:    mcp.Role("user"),
 				Content: &mcp.TextContent{Text: text},
@@ -526,7 +526,7 @@ Important:
 }
 
 func mcpServerInstructions() string {
-	return `OpenSandbox MCP exposes Docker-backed sandboxes.
+	return `Opensbx MCP exposes Docker-backed sandboxes.
 
 Recommended flow:
 1) Create sandbox with sandbox_create.
@@ -541,9 +541,9 @@ Important details:
 }
 
 func mcpHowItWorksDoc() string {
-	return `# OpenSandbox MCP: How It Works
+	return `# Opensbx MCP: How It Works
 
-OpenSandbox exposes tools to manage isolated Docker sandboxes.
+Opensbx exposes tools to manage isolated Docker sandboxes.
 
 ## Core mental model
 - ` + "`sandbox_create`" + ` provisions a container.
@@ -566,7 +566,7 @@ OpenSandbox exposes tools to manage isolated Docker sandboxes.
 }
 
 func mcpQuickstartDoc() string {
-	return `# OpenSandbox MCP Quickstart
+	return `# Opensbx MCP Quickstart
 
 ## Start project app
 1. ` + "`sandbox_create`" + ` with your image.

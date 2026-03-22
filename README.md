@@ -1,10 +1,10 @@
-# Open Sandbox
+# Opensbx
 
 A lightweight, self-hosted API for creating and managing isolated Docker containers on demand. Think of it as your own mini cloud — spin up sandboxes, run code, manage files, and tear them down when you're done.
 
 ## What is this?
 
-Open Sandbox lets you programmatically create Docker containers through a simple REST API. Each container (called a "sandbox") is an isolated environment where you can execute commands, read/write files, and expose ports — all without touching Docker directly.
+Opensbx lets you programmatically create Docker containers through a simple REST API. Each container (called a "sandbox") is an isolated environment where you can execute commands, read/write files, and expose ports — all without touching Docker directly.
 
 It's useful for:
 
@@ -43,8 +43,8 @@ See the [Installation Guide](docs/install.md) for detailed setup instructions in
 ### Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
-open-sandbox -addr :8080 -proxy-addr :3000 -base-domain localhost
+curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
+opensbx -addr :8080 -proxy-addr :3000 -base-domain localhost
 ```
 
 The API runs on `http://localhost:8080` by default. Swagger docs at `/swagger/index.html`.

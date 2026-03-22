@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
-	"open-sandbox/models"
+	"opensbx/models"
 )
 
 // Handler holds dependencies for all API handlers.

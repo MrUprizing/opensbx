@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"open-sandbox/internal/database"
-	"open-sandbox/models"
+	"opensbx/internal/database"
+	"opensbx/models"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"

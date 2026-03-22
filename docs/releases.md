@@ -35,19 +35,19 @@ GitHub Actions will create the Release and upload binaries automatically.
 Linux/macOS install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
 ```
 
 Optional env vars:
 
-- `OPEN_SANDBOX_VERSION` (example: `v1.0.0`)
-- `OPEN_SANDBOX_INSTALL_DIR` (default: `/usr/local/bin`)
-- `OPEN_SANDBOX_REPO` (default: `MrUprizing/opensandbox`)
+- `OPENSBX_VERSION` (example: `v1.0.0`)
+- `OPENSBX_INSTALL_DIR` (default: `/usr/local/bin`)
+- `OPENSBX_REPO` (default: `MrUprizing/opensbx`)
 
 Example pinned install:
 
 ```bash
-OPEN_SANDBOX_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
+OPENSBX_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
 ```
 
 Windows users can download the `.zip` binary directly from the GitHub Release page.
