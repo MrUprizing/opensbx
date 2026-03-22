@@ -1,79 +1,67 @@
 # Installation
 
-### Prerequisites
+## Prerequisites
 
 - Docker
-- Go
-- gVisor (Production & unsafe environments)
+- Go (recommended: latest stable)
+- Optional for hardened runtime: gVisor (`runsc`)
 
-## Update
+## Quick install (recommended)
 
-```bash
-sudo apt update
-sudo apt upgrade -y
-```
-
-## Installation Steps
-
-### Go
-
-Download Go
+Install latest release binary:
 
 ```bash
-wget https://dl.google.com/go/go1.26.0.linux-amd64.tar.gz
+curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
 ```
 
-Install Go
+Run locally:
 
 ```bash
-rm -rf /usr/local/go
-tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz
-echo 'export PATH=/usr/local/go/bin:$PATH' >> /root/.bashrc
-bash
+open-sandbox -addr :8080 -proxy-addr :3000 -base-domain localhost
 ```
 
-Verify Installation
+Health check:
 
 ```bash
-go version
+curl http://127.0.0.1:8080/v1/health
 ```
 
-### Docker
+## Docker setup
 
-Install Docker
+### macOS
 
-```bash
-sudo apt install -y docker.io docker-compose
-```
-
-Start and enable Docker
-
-```bash
-sudo systemctl start docker
-sudo systemctl enable docker
-```
-
-Verify Installation
+Install Docker Desktop, then verify:
 
 ```bash
 docker --version
+docker info
 ```
 
-### gVisor (Production & unsafe environments)
+### Ubuntu
 
 ```bash
-#!/bin/bash
-set -e
+sudo apt update
+sudo apt install -y docker.io
+sudo systemctl enable docker
+sudo systemctl start docker
+docker --version
+```
 
-# 1. Add gVisor repository
+## gVisor setup (optional, Ubuntu)
+
+Use this if you want stronger isolation for untrusted workloads.
+
+```bash
 curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+sudo apt update
+sudo apt install -y runsc
+```
 
-# 2. Install runsc
-sudo apt-get update && sudo apt-get install -y runsc
+Configure Docker runtime:
 
-# 3. Set as default Docker runtime
-RUNSC_PATH=$(which runsc)
+```bash
+RUNSC_PATH=$(command -v runsc)
 sudo mkdir -p /etc/docker
 cat <<EOF | sudo tee /etc/docker/daemon.json
 {
@@ -85,38 +73,18 @@ cat <<EOF | sudo tee /etc/docker/daemon.json
   }
 }
 EOF
-
-# 4. Restart Docker
 sudo systemctl restart docker
+```
 
-# 5. Verify
-echo "--- Default Runtime ---"
-docker info 2>/dev/null | grep "Default Runtime"
-echo "--- Test ---"
+Validate:
+
+```bash
+docker info | grep "Default Runtime"
 docker run --rm hello-world
 ```
 
-Recomended:
+## Next docs
 
-```bash
-sudo reboot
-```
-
-# Opensandbox
-
-Install and run Open Sandbox without cloning:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts/install.sh | bash
-open-sandbox -addr :8080 -proxy-addr :3000 -base-domain localhost
-```
-
-Build from source (optional):
-
-```bash
-git clone https://github.com/MrUprizing/opensandbox.git
-cd opensandbox
-go run cmd/api/main.go
-```
-
-For release/tag workflow details, see [releases.md](releases.md).
+- Deployment with Cloudflare Tunnel: [deployment.md](deployment.md)
+- Releases and tags: [releases.md](releases.md)
+- Testing: [testing.md](testing.md)

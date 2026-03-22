@@ -47,17 +47,10 @@ curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensandbox/main/scripts
 open-sandbox -addr :8080 -proxy-addr :3000 -base-domain localhost
 ```
 
-Build from source instead:
-
-```bash
-git clone https://github.com/MrUprizing/opensandbox.git
-cd opensandbox
-go run cmd/api/main.go
-```
-
 The API runs on `http://localhost:8080` by default. Swagger docs at `/swagger/index.html`.
 
 Release automation and binaries are documented in [docs/releases.md](docs/releases.md).
+Deployment with Cloudflare Tunnel is documented in [docs/deployment.md](docs/deployment.md).
 
 ## Testing
 

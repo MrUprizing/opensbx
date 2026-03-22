@@ -94,4 +94,4 @@ Sandboxes are now accessible at `http://<name>.sandbox.example.com`.
 
 ### 3. HTTPS (optional)
 
-Place a TLS-terminating reverse proxy (Caddy, nginx) in front of the proxy server with a wildcard certificate for `*.sandbox.example.com`. The open-sandbox proxy handles plain HTTP behind it.
+Place a TLS-terminating reverse proxy in front of the proxy server with a wildcard certificate for `*.sandbox.example.com`. The open-sandbox proxy handles plain HTTP behind it.
