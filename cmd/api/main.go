@@ -36,6 +36,10 @@ import (
 
 func main() {
 	cfg := config.Load()
+	mcpLocalhostProtection := "enabled"
+	if cfg.MCPDisableLocalhostProtection {
+		mcpLocalhostProtection = "disabled"
+	}
 
 	db := database.New("sandbox.db")
 	repo := database.NewRepository(db)
@@ -58,6 +62,7 @@ func main() {
 		}(addr)
 	}
 	log.Printf("proxy URLs via %s", strings.Join(cfg.ProxyAddrs, ", "))
+	log.Printf("mcp localhost protection: %s (base-domain: %s)", mcpLocalhostProtection, cfg.BaseDomain)
 
 	// --- API server ---
 	r := gin.New()
@@ -71,7 +76,7 @@ func main() {
 	h := api.New(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr())
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(v1)
-	mcpHandler := api.NewMCPHandler(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr())
+	mcpHandler := api.NewMCPHandler(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr(), cfg.MCPDisableLocalhostProtection)
 	v1.Any("/mcp", gin.WrapH(mcpHandler))
 	v1.Any("/mcp/*path", gin.WrapH(mcpHandler))
 

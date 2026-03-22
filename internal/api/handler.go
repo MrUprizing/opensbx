@@ -3,7 +3,6 @@ package api
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -24,17 +23,11 @@ func New(d DockerClient, baseDomain, proxyAddr string) *Handler {
 	return &Handler{docker: d, baseDomain: baseDomain, proxyAddr: proxyAddr}
 }
 
-// proxyURL builds the proxy URL for a named sandbox.
-// Returns "http://mi-app.localhost" when proxy listens on :80,
-// or "http://mi-app.localhost:3000" for non-standard ports.
+// proxyURL builds the public URL for a named sandbox.
+// Local domains return http URLs and keep the proxy port when needed.
+// Public domains return https URLs without exposing internal proxy ports.
 func (h *Handler) proxyURL(name string) string {
-	if name == "" {
-		return ""
-	}
-	if h.proxyAddr == ":80" || h.proxyAddr == ":443" {
-		return fmt.Sprintf("http://%s.%s", name, h.baseDomain)
-	}
-	return fmt.Sprintf("http://%s.%s%s", name, h.baseDomain, h.proxyAddr)
+	return buildSandboxURL(name, h.baseDomain, h.proxyAddr)
 }
 
 // healthCheck handles GET /health.

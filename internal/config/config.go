@@ -2,16 +2,18 @@ package config
 
 import (
 	"flag"
+	"net"
 	"os"
 	"strings"
 )
 
 // Config holds all application configuration.
 type Config struct {
-	Addr       string   // HTTP listen address, e.g. ":8080"
-	APIKey     string   // API key for authentication (env API_KEY). Empty = auth disabled.
-	ProxyAddrs []string // Reverse proxy listen addresses, e.g. [":80", ":3000"]
-	BaseDomain string   // Base domain for subdomain routing, e.g. "localhost"
+	Addr                          string   // HTTP listen address, e.g. ":8080"
+	APIKey                        string   // API key for authentication (env API_KEY). Empty = auth disabled.
+	ProxyAddrs                    []string // Reverse proxy listen addresses, e.g. [":80", ":3000"]
+	BaseDomain                    string   // Base domain for subdomain routing, e.g. "localhost"
+	MCPDisableLocalhostProtection bool     // Disable MCP SDK localhost Host-header guard for non-local domains.
 }
 
 // PrimaryProxyAddr returns the first proxy address, used for generating URLs.
@@ -29,11 +31,14 @@ func Load() *Config {
 	baseDomain := flag.String("base-domain", envOrDefault("BASE_DOMAIN", "localhost"), "Base domain for subdomain routing")
 	flag.Parse()
 
+	normalizedBaseDomain := normalizeBaseDomain(*baseDomain)
+
 	return &Config{
-		Addr:       *addr,
-		APIKey:     os.Getenv("API_KEY"),
-		ProxyAddrs: parseAddrs(*proxyAddr),
-		BaseDomain: *baseDomain,
+		Addr:                          *addr,
+		APIKey:                        os.Getenv("API_KEY"),
+		ProxyAddrs:                    parseAddrs(*proxyAddr),
+		BaseDomain:                    normalizedBaseDomain,
+		MCPDisableLocalhostProtection: !isLocalBaseDomain(normalizedBaseDomain),
 	}
 }
 
@@ -54,4 +59,21 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func normalizeBaseDomain(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "localhost"
+	}
+	return v
+}
+
+func isLocalBaseDomain(raw string) bool {
+	host := strings.Trim(strings.TrimSpace(raw), "[]")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

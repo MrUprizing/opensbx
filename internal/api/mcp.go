@@ -11,7 +11,7 @@ import (
 )
 
 // NewMCPHandler returns a streamable HTTP MCP handler mounted under /v1/mcp.
-func NewMCPHandler(d DockerClient, baseDomain, proxyAddr string) http.Handler {
+func NewMCPHandler(d DockerClient, baseDomain, proxyAddr string, disableLocalhostProtection bool) http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "open-sandbox",
 		Version: "1.0.0",
@@ -21,7 +21,7 @@ func NewMCPHandler(d DockerClient, baseDomain, proxyAddr string) http.Handler {
 	addMCPContext(server)
 	return mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return server
-	}, nil)
+	}, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: disableLocalhostProtection})
 }
 
 func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr string) {
@@ -114,7 +114,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 				return nil, nil, err
 			}
 			for i := range items {
-				items[i].URL = mcpProxyURL(items[i].Name, baseDomain, proxyAddr)
+				items[i].URL = buildSandboxURL(items[i].Name, baseDomain, proxyAddr)
 			}
 			return mcpJSON(map[string]any{"sandboxes": items})
 		})
@@ -146,7 +146,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			if err != nil {
 				return nil, nil, err
 			}
-			resp.URL = mcpProxyURL(resp.Name, baseDomain, proxyAddr)
+			resp.URL = buildSandboxURL(resp.Name, baseDomain, proxyAddr)
 			return mcpJSON(resp)
 		})
 
@@ -159,7 +159,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			if err != nil {
 				return nil, nil, err
 			}
-			resp.URL = mcpProxyURL(resp.Name, baseDomain, proxyAddr)
+			resp.URL = buildSandboxURL(resp.Name, baseDomain, proxyAddr)
 			return mcpJSON(resp)
 		})
 
@@ -584,14 +584,4 @@ func mcpQuickstartDoc() string {
 3. Write updated content with ` + "`file_write`" + `.
 4. Re-run command or check logs for validation.
 `
-}
-
-func mcpProxyURL(name, baseDomain, proxyAddr string) string {
-	if name == "" {
-		return ""
-	}
-	if proxyAddr == ":80" || proxyAddr == ":443" {
-		return fmt.Sprintf("http://%s.%s", name, baseDomain)
-	}
-	return fmt.Sprintf("http://%s.%s%s", name, baseDomain, proxyAddr)
 }
