@@ -935,6 +935,52 @@ const docTemplate = `{
                 }
             }
         },
+        "/sandboxes/{id}/network": {
+            "get": {
+                "security": [
+                    {
+                        "ApiKeyAuth": []
+                    }
+                ],
+                "description": "Returns the selected main proxy port and current container-to-host port mapping.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sandboxes"
+                ],
+                "summary": "Get sandbox network routing",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Sandbox ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/models.SandboxNetwork"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/internal_api.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/sandboxes/{id}/pause": {
             "post": {
                 "security": [
@@ -1688,6 +1734,22 @@ const docTemplate = `{
                 },
                 "url": {
                     "type": "string"
+                }
+            }
+        },
+        "models.SandboxNetwork": {
+            "type": "object",
+            "properties": {
+                "main_port": {
+                    "description": "selected container port for proxy routing (e.g. \"3000/tcp\")",
+                    "type": "string"
+                },
+                "ports_map": {
+                    "description": "map of container port -\u003e docker host port",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 }
             }
         },

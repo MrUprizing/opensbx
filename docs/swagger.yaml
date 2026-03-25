@@ -279,6 +279,17 @@ definitions:
       url:
         type: string
     type: object
+  models.SandboxNetwork:
+    properties:
+      main_port:
+        description: selected container port for proxy routing (e.g. "3000/tcp")
+        type: string
+      ports_map:
+        additionalProperties:
+          type: string
+        description: map of container port -> docker host port
+        type: object
+    type: object
   models.SandboxStats:
     properties:
       cpu_percent:
@@ -896,6 +907,36 @@ paths:
       summary: List a directory
       tags:
       - files
+  /sandboxes/{id}/network:
+    get:
+      description: Returns the selected main proxy port and current container-to-host
+        port mapping.
+      parameters:
+      - description: Sandbox ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.SandboxNetwork'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/internal_api.ErrorResponse'
+      security:
+      - ApiKeyAuth: []
+      summary: Get sandbox network routing
+      tags:
+      - sandboxes
   /sandboxes/{id}/pause:
     post:
       description: Freeze all processes inside the sandbox.
