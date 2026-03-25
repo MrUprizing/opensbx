@@ -45,3 +45,24 @@ func TestIsLocalBaseDomain(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeLogFile(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: "opensbx.log"},
+		{name: "whitespace", in: "   ", want: "opensbx.log"},
+		{name: "keeps custom path", in: "logs/server.log", want: "logs/server.log"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeLogFile(tt.in)
+			if got != tt.want {
+				t.Fatalf("normalizeLogFile(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

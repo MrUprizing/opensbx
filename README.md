@@ -86,6 +86,7 @@ Opensbx includes MCP endpoints so MCP clients can create sandboxes, execute comm
 | `ADDR` | `-addr` | `:8080` | HTTP API listen address |
 | `PROXY_ADDR` | `-proxy-addr` | `:80,:3000` | Proxy listen addresses (comma-separated) |
 | `BASE_DOMAIN` | `-base-domain` | `localhost` | Base domain for subdomain routing |
+| `LOG_FILE` | `-log-file` | `opensbx.log` | Log file path for API and MCP metadata |
 | `API_KEY` | — | *(empty, auth disabled)* | Bearer token for API authentication |
 
 ## Sandbox defaults

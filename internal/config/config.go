@@ -13,6 +13,7 @@ type Config struct {
 	APIKey                        string   // API key for authentication (env API_KEY). Empty = auth disabled.
 	ProxyAddrs                    []string // Reverse proxy listen addresses, e.g. [":80", ":3000"]
 	BaseDomain                    string   // Base domain for subdomain routing, e.g. "localhost"
+	LogFile                       string   // Path to .log file where API/MCP logs are written.
 	MCPDisableLocalhostProtection bool     // Disable MCP SDK localhost Host-header guard for non-local domains.
 }
 
@@ -29,6 +30,7 @@ func Load() *Config {
 	addr := flag.String("addr", envOrDefault("ADDR", ":8080"), "HTTP listen address")
 	proxyAddr := flag.String("proxy-addr", envOrDefault("PROXY_ADDR", ":80,:3000"), "Comma-separated proxy listen addresses (first is used for URL generation)")
 	baseDomain := flag.String("base-domain", envOrDefault("BASE_DOMAIN", "localhost"), "Base domain for subdomain routing")
+	logFile := flag.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
 	flag.Parse()
 
 	normalizedBaseDomain := normalizeBaseDomain(*baseDomain)
@@ -38,6 +40,7 @@ func Load() *Config {
 		APIKey:                        os.Getenv("API_KEY"),
 		ProxyAddrs:                    parseAddrs(*proxyAddr),
 		BaseDomain:                    normalizedBaseDomain,
+		LogFile:                       normalizeLogFile(*logFile),
 		MCPDisableLocalhostProtection: !isLocalBaseDomain(normalizedBaseDomain),
 	}
 }
@@ -65,6 +68,14 @@ func normalizeBaseDomain(raw string) string {
 	v := strings.TrimSpace(raw)
 	if v == "" {
 		return "localhost"
+	}
+	return v
+}
+
+func normalizeLogFile(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "opensbx.log"
 	}
 	return v
 }

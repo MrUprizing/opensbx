@@ -14,6 +14,7 @@ import (
 	"opensbx/internal/config"
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
+	"opensbx/internal/logging"
 	"opensbx/internal/proxy"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,12 @@ import (
 
 func main() {
 	cfg := config.Load()
+	logFileCloser, err := logging.Setup(cfg.LogFile)
+	if err != nil {
+		log.Fatalf("logging setup failed: %v", err)
+	}
+	defer logFileCloser.Close()
+
 	mcpLocalhostProtection := "enabled"
 	if cfg.MCPDisableLocalhostProtection {
 		mcpLocalhostProtection = "disabled"
@@ -63,6 +70,7 @@ func main() {
 	}
 	log.Printf("proxy URLs via %s", strings.Join(cfg.ProxyAddrs, ", "))
 	log.Printf("mcp localhost protection: %s (base-domain: %s)", mcpLocalhostProtection, cfg.BaseDomain)
+	log.Printf("logs file: %s", cfg.LogFile)
 
 	// --- API server ---
 	r := gin.New()
@@ -77,8 +85,10 @@ func main() {
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(v1)
 	mcpHandler := api.NewMCPHandler(dc, cfg.BaseDomain, cfg.PrimaryProxyAddr(), cfg.MCPDisableLocalhostProtection)
-	v1.Any("/mcp", gin.WrapH(mcpHandler))
-	v1.Any("/mcp/*path", gin.WrapH(mcpHandler))
+	mcp := v1.Group("")
+	mcp.Use(api.MCPMetadataLogger())
+	mcp.Any("/mcp", gin.WrapH(mcpHandler))
+	mcp.Any("/mcp/*path", gin.WrapH(mcpHandler))
 
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerfiles.Handler))
 
