@@ -320,6 +320,32 @@ func (c *Client) Inspect(ctx context.Context, id string) (models.SandboxDetail, 
 	return detail, nil
 }
 
+// GetNetwork returns current exposed port mappings and selected main routing port.
+func (c *Client) GetNetwork(ctx context.Context, id string) (models.SandboxNetwork, error) {
+	sb, err := c.repo.FindByID(id)
+	if err != nil {
+		return models.SandboxNetwork{}, err
+	}
+	if sb == nil {
+		return models.SandboxNetwork{}, ErrNotFound
+	}
+
+	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
+	if err != nil {
+		return models.SandboxNetwork{}, wrapNotFound(err)
+	}
+
+	ports := extractPorts(info.Container.NetworkSettings.Ports)
+	mainPort := sb.Port
+	if mainPort == "" && len(ports) == 1 {
+		for p := range ports {
+			mainPort = p
+		}
+	}
+
+	return models.SandboxNetwork{MainPort: mainPort, PortsMap: ports}, nil
+}
+
 // Start starts a stopped sandbox and re-schedules the auto-stop timer.
 // Returns ErrAlreadyRunning (409) if the sandbox is already running.
 func (c *Client) Start(ctx context.Context, id string) (models.RestartResponse, error) {

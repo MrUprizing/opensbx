@@ -33,6 +33,7 @@ type stub struct {
 	start             func(string) (models.RestartResponse, error)
 	stop              func(string) error
 	restart           func(string) (models.RestartResponse, error)
+	getNetwork        func(string) (models.SandboxNetwork, error)
 	remove            func(string) error
 	pause             func(string) error
 	resume            func(string) error
@@ -79,6 +80,12 @@ func (s *stub) Start(_ context.Context, id string) (models.RestartResponse, erro
 func (s *stub) Stop(_ context.Context, id string) error { return s.stop(id) }
 func (s *stub) Restart(_ context.Context, id string) (models.RestartResponse, error) {
 	return s.restart(id)
+}
+func (s *stub) GetNetwork(_ context.Context, id string) (models.SandboxNetwork, error) {
+	if s.getNetwork != nil {
+		return s.getNetwork(id)
+	}
+	return models.SandboxNetwork{}, nil
 }
 func (s *stub) Remove(_ context.Context, id string) error { return s.remove(id) }
 func (s *stub) Pause(_ context.Context, id string) error  { return s.pause(id) }
@@ -832,6 +839,23 @@ func TestRenewExpiration_ZeroTimeout(t *testing.T) {
 	w := do(r, "POST", "/v1/sandboxes/abc123/renew-expiration", map[string]any{"timeout": 0})
 	assert.Equal(t, 400, w.Code)
 	assert.Contains(t, w.Body.String(), "BAD_REQUEST")
+}
+
+func TestGetSandboxNetwork(t *testing.T) {
+	r := newRouter(&stub{
+		getNetwork: func(id string) (models.SandboxNetwork, error) {
+			assert.Equal(t, "abc123", id)
+			return models.SandboxNetwork{
+				MainPort: "3000/tcp",
+				PortsMap: map[string]string{"3000/tcp": "32768", "5173/tcp": "32769"},
+			}, nil
+		},
+	})
+
+	w := do(r, "GET", "/v1/sandboxes/abc123/network", nil)
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "3000/tcp")
+	assert.Contains(t, w.Body.String(), "32769")
 }
 
 // ── API Key Auth Tests ──────────────────────────────────────────────────────

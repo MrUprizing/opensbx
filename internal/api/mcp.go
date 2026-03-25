@@ -257,6 +257,18 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			return mcpJSON(stats)
 		})
 
+	mcp.AddTool(server, &mcp.Tool{Name: "sandbox_network_get", Description: "Get sandbox proxy routing network"},
+		func(ctx context.Context, _ *mcp.CallToolRequest, args sandboxIDArgs) (*mcp.CallToolResult, any, error) {
+			if args.ID == "" {
+				return nil, nil, fmt.Errorf("id is required")
+			}
+			network, err := d.GetNetwork(ctx, args.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return mcpJSON(network)
+		})
+
 	mcp.AddTool(server, &mcp.Tool{Name: "command_exec", Description: "Execute a command in a sandbox"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, args commandExecArgs) (*mcp.CallToolResult, any, error) {
 			if args.SandboxID == "" {

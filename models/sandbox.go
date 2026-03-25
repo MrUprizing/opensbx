@@ -59,6 +59,12 @@ type RestartResponse struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
+// SandboxNetwork is the network/routing view for a sandbox.
+type SandboxNetwork struct {
+	MainPort string            `json:"main_port"` // selected container port for proxy routing (e.g. "3000/tcp")
+	PortsMap map[string]string `json:"ports_map"` // map of container port -> docker host port
+}
+
 // ExecCommandRequest is the body for POST /v1/sandboxes/:id/cmd
 type ExecCommandRequest struct {
 	Command string            `json:"command" binding:"required" example:"npm"` // executable name (e.g. "npm")

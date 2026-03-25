@@ -672,6 +672,27 @@ func (h *Handler) renewExpiration(c *gin.Context) {
 	c.JSON(http.StatusOK, models.RenewExpirationResponse{Status: "renewed", Timeout: req.Timeout})
 }
 
+// getSandboxNetwork handles GET /v1/sandboxes/:id/network.
+// @Summary      Get sandbox network routing
+// @Description  Returns the selected main proxy port and current container-to-host port mapping.
+// @Tags         sandboxes
+// @Produce      json
+// @Param        id   path      string  true  "Sandbox ID"
+// @Success      200  {object}  models.SandboxNetwork
+// @Failure      404  {object}  ErrorResponse
+// @Failure      500  {object}  ErrorResponse
+// @Security     ApiKeyAuth
+// @Router       /sandboxes/{id}/network [get]
+func (h *Handler) getSandboxNetwork(c *gin.Context) {
+	network, err := h.docker.GetNetwork(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, network)
+}
+
 // pullImage handles POST /v1/images/pull.
 // @Summary      Pull a Docker image
 // @Description  Downloads a Docker image from a registry to use in sandboxes.

@@ -16,6 +16,7 @@ type DockerClient interface {
 	Start(ctx context.Context, id string) (models.RestartResponse, error)
 	Stop(ctx context.Context, id string) error
 	Restart(ctx context.Context, id string) (models.RestartResponse, error)
+	GetNetwork(ctx context.Context, id string) (models.SandboxNetwork, error)
 	Remove(ctx context.Context, id string) error
 	Pause(ctx context.Context, id string) error
 	Resume(ctx context.Context, id string) error

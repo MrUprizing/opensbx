@@ -20,6 +20,7 @@ func (h *Handler) RegisterRoutes(v1 *gin.RouterGroup) {
 	sb.POST("/:id/pause", h.pauseSandbox)
 	sb.POST("/:id/resume", h.resumeSandbox)
 	sb.POST("/:id/renew-expiration", h.renewExpiration)
+	sb.GET("/:id/network", h.getSandboxNetwork)
 	sb.POST("/:id/cmd", h.execCommand)
 	sb.GET("/:id/cmd", h.listCommands)
 	sb.GET("/:id/cmd/:cmdId", h.getCommand)
