@@ -72,23 +72,24 @@ download() {
 }
 
 main() {
-  local os arch version archive url tmpdir extracted
+  local os arch release_tag version archive url tmpdir extracted
 
   os="$(detect_os)"
   arch="$(detect_arch)"
-  version="${OPENSBX_VERSION:-}"
-  if [[ -z "$version" ]]; then
-    version="$(fetch_latest_version)"
+  release_tag="${OPENSBX_VERSION:-}"
+  if [[ -z "$release_tag" ]]; then
+    release_tag="$(fetch_latest_version)"
   fi
-  if [[ "$version" != v* ]]; then
-    version="v${version}"
+  if [[ "$release_tag" != v* ]]; then
+    release_tag="v${release_tag}"
   fi
+  version="${release_tag#v}"
 
   archive="${BINARY_NAME}_${version}_${os}_${arch}.tar.gz"
-  url="https://github.com/${REPO}/releases/download/${version}/${archive}"
+  url="https://github.com/${REPO}/releases/download/${release_tag}/${archive}"
 
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  trap '[[ -n "${tmpdir:-}" ]] && rm -rf "${tmpdir}"' EXIT
 
   echo "Downloading ${url}"
   download "$url" "$tmpdir/$archive"
