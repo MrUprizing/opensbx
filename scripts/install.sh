@@ -4,6 +4,8 @@ set -euo pipefail
 BINARY_NAME="opensbx"
 REPO="${OPENSBX_REPO:-MrUprizing/opensbx}"
 INSTALL_DIR="${OPENSBX_INSTALL_DIR:-/usr/local/bin}"
+LIB_DIR="${OPENSBX_LIB_DIR:-/usr/local/lib/opensbx}"
+AUTO_INSTALL_DOCKER="${OPENSBX_AUTO_INSTALL_DOCKER:-1}"
 
 detect_os() {
   case "$(uname -s)" in
@@ -71,11 +73,86 @@ download() {
   exit 1
 }
 
+run_as_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+
+  echo "This operation requires root privileges but sudo is not available" >&2
+  exit 1
+}
+
+install_docker_linux() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "Installing Docker via apt-get"
+    run_as_root apt-get update
+    run_as_root apt-get install -y docker.io
+  else
+    echo "Automatic Docker installation is only supported on apt-based Linux distributions" >&2
+    echo "Install Docker manually and rerun this installer" >&2
+    exit 1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    run_as_root systemctl enable --now docker
+    return
+  fi
+
+  if command -v service >/dev/null 2>&1; then
+    run_as_root service docker start
+    return
+  fi
+
+  echo "Docker installed but could not start daemon automatically. Start it manually and rerun." >&2
+  exit 1
+}
+
+ensure_docker() {
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ "${AUTO_INSTALL_DOCKER}" != "1" ]]; then
+    echo "Docker is required but not ready. Install and start Docker, then rerun." >&2
+    exit 1
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    if [[ "$(uname -s)" != "Linux" ]]; then
+      echo "Docker is required. Install Docker manually on this OS, then rerun." >&2
+      exit 1
+    fi
+    install_docker_linux
+  elif command -v systemctl >/dev/null 2>&1; then
+    echo "Docker CLI detected but daemon is not running. Starting docker service"
+    run_as_root systemctl enable --now docker
+  elif command -v service >/dev/null 2>&1; then
+    echo "Docker CLI detected but daemon is not running. Starting docker service"
+    run_as_root service docker start
+  else
+    echo "Docker CLI detected but daemon is not running. Start Docker and rerun." >&2
+    exit 1
+  fi
+
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "Docker is still not available after setup. Verify docker daemon and permissions, then rerun." >&2
+    exit 1
+  fi
+}
+
 main() {
-  local os arch release_tag version archive url tmpdir extracted
+  local os arch release_tag version archive url tmpdir extracted binary_target wrapper
 
   os="$(detect_os)"
   arch="$(detect_arch)"
+  ensure_docker
+
   release_tag="${OPENSBX_VERSION:-}"
   if [[ -z "$release_tag" ]]; then
     release_tag="$(fetch_latest_version)"
@@ -101,15 +178,42 @@ main() {
     exit 1
   fi
 
-  if [[ -w "$INSTALL_DIR" ]]; then
-    install -m 0755 "$extracted" "$INSTALL_DIR/$BINARY_NAME"
-  else
-    echo "Installing to $INSTALL_DIR requires sudo"
-    sudo install -m 0755 "$extracted" "$INSTALL_DIR/$BINARY_NAME"
+  binary_target="$LIB_DIR/$BINARY_NAME"
+  wrapper="$tmpdir/$BINARY_NAME-wrapper"
+  cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_PATH="$binary_target"
+LOG_PATH="\${OPENSBX_LOG_FILE:-opensbx.log}"
+
+if [[ "\${OPENSBX_FOREGROUND:-0}" == "1" ]]; then
+  exec "\$BIN_PATH" "\$@"
+fi
+
+if pgrep -f "\$BIN_PATH" >/dev/null 2>&1; then
+  echo "opensbx is already running"
+  exit 0
+fi
+
+nohup "\$BIN_PATH" "\$@" >>"\$LOG_PATH" 2>&1 &
+pid="\$!"
+disown "\$pid" 2>/dev/null || true
+
+echo "opensbx started in background (pid: \$pid, log: \$LOG_PATH)"
+EOF
+
+  if ! mkdir -p "$LIB_DIR" 2>/dev/null || ! install -m 0755 "$extracted" "$binary_target" 2>/dev/null || ! install -m 0755 "$wrapper" "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null; then
+    echo "Installing to $INSTALL_DIR and $LIB_DIR requires sudo"
+    run_as_root mkdir -p "$LIB_DIR"
+    run_as_root install -m 0755 "$extracted" "$binary_target"
+    run_as_root install -m 0755 "$wrapper" "$INSTALL_DIR/$BINARY_NAME"
   fi
 
-  echo "Installed: $INSTALL_DIR/$BINARY_NAME"
-  echo "Run: $BINARY_NAME"
+  echo "Installed wrapper: $INSTALL_DIR/$BINARY_NAME"
+  echo "Installed binary: $binary_target"
+  echo "Run in background: $BINARY_NAME"
+  echo "Run in foreground: OPENSBX_FOREGROUND=1 $BINARY_NAME"
 }
 
 main "$@"
