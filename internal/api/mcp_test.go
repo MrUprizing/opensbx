@@ -14,6 +14,7 @@ import (
 type mcpDockerStub struct {
 	DockerClient
 	fail           bool
+	waitError      error
 	createRequest  models.CreateSandboxRequest
 	execSandboxID  string
 	execRequest    models.ExecCommandRequest
@@ -76,6 +77,9 @@ func (s *mcpDockerStub) GetCommandLogs(context.Context, string, string) (models.
 }
 func (s *mcpDockerStub) WaitCommand(_ context.Context, sandboxID, commandID string) (models.CommandDetail, error) {
 	s.waitSandboxID, s.waitCommandID = sandboxID, commandID
+	if s.waitError != nil {
+		return models.CommandDetail{}, s.waitError
+	}
 	return models.CommandDetail{ID: "cmd-1", Name: "done"}, s.maybeFail()
 }
 func (s *mcpDockerStub) Stats(context.Context, string) (models.SandboxStats, error) {
@@ -308,6 +312,85 @@ func TestMCPResourcesAndPromptExposeGuidance(t *testing.T) {
 	prompt, err = session.GetPrompt(context.Background(), &mcp.GetPromptParams{Name: "sandbox_workflow", Arguments: map[string]string{"goal": "inspect", "sandbox_id": "sb-7"}})
 	if err != nil || !containsAll(prompt.Messages[0].Content.(*mcp.TextContent).Text, "Sandbox ID: sb-7") {
 		t.Fatalf("prompt with sandbox id = %v, %v", prompt, err)
+	}
+}
+
+func TestMCPBackendFailuresAreToolErrorsNotSuccessfulPayloads(t *testing.T) {
+	// Each tool has its own handler: cover returned-value and mutation-only
+	// operations across sandbox lifecycle, commands, files and images.
+	session := newMCPTestSession(t, &mcpDockerStub{fail: true})
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"sandbox_create", map[string]any{"image": "alpine"}},
+		{"sandbox_get", map[string]any{"id": "sb-1"}},
+		{"sandbox_delete", map[string]any{"id": "sb-1"}},
+		{"sandbox_start", map[string]any{"id": "sb-1"}},
+		{"sandbox_stop", map[string]any{"id": "sb-1"}},
+		{"sandbox_restart", map[string]any{"id": "sb-1"}},
+		{"sandbox_pause", map[string]any{"id": "sb-1"}},
+		{"sandbox_resume", map[string]any{"id": "sb-1"}},
+		{"sandbox_renew_expiration", map[string]any{"id": "sb-1", "timeout": 60}},
+		{"sandbox_stats", map[string]any{"id": "sb-1"}},
+		{"sandbox_network_get", map[string]any{"id": "sb-1"}},
+		{"command_exec", map[string]any{"sandbox_id": "sb-1", "command": "echo"}},
+		{"command_get", map[string]any{"sandbox_id": "sb-1", "command_id": "cmd-1"}},
+		{"command_list", map[string]any{"id": "sb-1"}},
+		{"command_kill", map[string]any{"sandbox_id": "sb-1", "command_id": "cmd-1", "signal": 15}},
+		{"command_logs", map[string]any{"sandbox_id": "sb-1", "command_id": "cmd-1"}},
+		{"file_write", map[string]any{"sandbox_id": "sb-1", "path": "/work/file", "content": "text"}},
+		{"file_delete", map[string]any{"sandbox_id": "sb-1", "path": "/work/file"}},
+		{"file_list", map[string]any{"sandbox_id": "sb-1", "path": "/work"}},
+		{"image_get", map[string]any{"id": "alpine"}},
+		{"image_pull", map[string]any{"image": "alpine"}},
+		{"image_delete", map[string]any{"id": "alpine"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.name, Arguments: tc.args})
+			if err != nil {
+				t.Fatalf("backend failure became a protocol error: %v", err)
+			}
+			if !result.IsError || len(result.Content) != 1 {
+				t.Fatalf("expected one tool error, got %+v", result)
+			}
+			text, ok := result.Content[0].(*mcp.TextContent)
+			if !ok || !strings.Contains(text.Text, "docker fixture failure") {
+				t.Fatalf("tool error lost backend failure: %+v", result.Content)
+			}
+			if result.StructuredContent != nil {
+				t.Fatalf("failed operation returned a successful structured payload: %+v", result.StructuredContent)
+			}
+		})
+	}
+}
+
+func TestMCPWaitFailuresDoNotReturnAnUnfinishedCommandAsSuccess(t *testing.T) {
+	for _, tool := range []string{"command_exec", "command_get"} {
+		t.Run(tool, func(t *testing.T) {
+			d := &mcpDockerStub{waitError: errors.New("waiting interrupted")}
+			session := newMCPTestSession(t, d)
+			args := map[string]any{"sandbox_id": "sb-1", "wait": true}
+			if tool == "command_exec" {
+				args["command"] = "sleep"
+			} else {
+				args["command_id"] = "cmd-1"
+			}
+			result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: tool, Arguments: args})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError || len(result.Content) != 1 {
+				t.Fatalf("expected wait failure, got %+v", result)
+			}
+			text, ok := result.Content[0].(*mcp.TextContent)
+			if !ok || !strings.Contains(text.Text, "waiting interrupted") {
+				t.Fatalf("missing wait error: %+v", result.Content)
+			}
+			if d.waitSandboxID != "sb-1" || d.waitCommandID != "cmd-1" {
+				t.Fatalf("wait routed to %q/%q", d.waitSandboxID, d.waitCommandID)
+			}
+		})
 	}
 }
 

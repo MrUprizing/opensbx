@@ -21,8 +21,11 @@ import (
 )
 
 type dockerAPIFixture struct {
-	mu          sync.Mutex
-	fail        map[string]int
+	mu   sync.Mutex
+	fail map[string]int
+	// Sequential responses allow a preflight inspect to succeed and the
+	// post-mutation inspect to fail without changing state from a test goroutine.
+	responses   map[string][]int
 	requests    []string
 	execOptions []string
 	createBody  container.Config
@@ -78,6 +81,10 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requests = append(f.requests, key)
 	status := f.fail[key]
+	if sequence := f.responses[key]; len(sequence) > 0 {
+		status = sequence[0]
+		f.responses[key] = sequence[1:]
+	}
 	f.mu.Unlock()
 	if status != 0 {
 		w.Header().Set("Content-Type", "application/json")
