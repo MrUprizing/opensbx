@@ -131,3 +131,45 @@ func TestRepositoryCommandsCRUD(t *testing.T) {
 		t.Fatalf("expected 0 commands after delete, got %d", len(empty))
 	}
 }
+
+func TestRepositoryReturnsNilForMissingRecords(t *testing.T) {
+	repo := newTestRepo(t)
+	if got, err := repo.FindByName("missing"); err != nil || got != nil {
+		t.Fatalf("FindByName() missing = %v, %v; want nil, nil", got, err)
+	}
+	if got, err := repo.FindCommandByID("missing"); err != nil || got != nil {
+		t.Fatalf("FindCommandByID() missing = %v, %v; want nil, nil", got, err)
+	}
+	all, err := repo.FindAll()
+	if err != nil || len(all) != 0 {
+		t.Fatalf("FindAll() empty = %v, %v", all, err)
+	}
+}
+
+func TestRepositoryPropagatesClosedDatabaseErrors(t *testing.T) {
+	db := New(":memory:")
+	repo := NewRepository(db)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repo.FindByID("sb"); err == nil {
+		t.Fatal("FindByID() should return a database error when the pool is closed")
+	}
+	if _, err := repo.FindByName("demo"); err == nil {
+		t.Fatal("FindByName() should return a database error when the pool is closed")
+	}
+	if _, err := repo.FindAll(); err == nil {
+		t.Fatal("FindAll() should return a database error when the pool is closed")
+	}
+	if _, err := repo.FindCommandByID("cmd"); err == nil {
+		t.Fatal("FindCommandByID() should return a database error when the pool is closed")
+	}
+	if _, err := repo.FindCommandsBySandbox("sb"); err == nil {
+		t.Fatal("FindCommandsBySandbox() should return a database error when the pool is closed")
+	}
+}
