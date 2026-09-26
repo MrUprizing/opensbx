@@ -9,6 +9,7 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
+	Runtime                       string   // Empty selects interactively on macOS TTYs, otherwise Docker.
 	Addr                          string   // HTTP listen address, e.g. ":8080"
 	APIKey                        string   // API key for authentication (env API_KEY). Empty = auth disabled.
 	ProxyAddrs                    []string // Reverse proxy listen addresses, e.g. [":80", ":3000"]
@@ -31,11 +32,13 @@ func Load() *Config {
 	proxyAddr := flag.String("proxy-addr", envOrDefault("PROXY_ADDR", ":80,:3000"), "Comma-separated proxy listen addresses (first is used for URL generation)")
 	baseDomain := flag.String("base-domain", envOrDefault("BASE_DOMAIN", "localhost"), "Base domain for subdomain routing")
 	logFile := flag.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
+	runtime := flag.String("runtime", "", "Sandbox runtime: docker or container (default: Docker; prompt on macOS terminals)")
 	flag.Parse()
 
 	normalizedBaseDomain := normalizeBaseDomain(*baseDomain)
 
 	return &Config{
+		Runtime:                       *runtime,
 		Addr:                          *addr,
 		APIKey:                        os.Getenv("API_KEY"),
 		ProxyAddrs:                    parseAddrs(*proxyAddr),

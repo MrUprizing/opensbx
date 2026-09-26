@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- Docker
-- Go (recommended: latest stable)
+- Docker (default), or [Apple container on Apple Silicon macOS](apple-container.md)
+- Go when building from source (not required to run a release binary)
 - Optional for hardened runtime: gVisor (`runsc`)
 
 ## Quick install (recommended)
@@ -27,6 +27,10 @@ curl http://127.0.0.1:8080/v1/health
 ```
 
 ## Docker setup
+
+For the native Apple backend, use the requirements and launch instructions in
+[Apple container](apple-container.md). Opensbx never installs, upgrades, or
+starts that runtime automatically.
 
 ### macOS
 

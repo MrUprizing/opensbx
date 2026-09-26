@@ -5,19 +5,24 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"opensbx/internal/api"
+	"opensbx/internal/applecontainer"
 	"opensbx/internal/config"
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
 	"opensbx/internal/logging"
 	"opensbx/internal/proxy"
+	"opensbx/internal/runtimechoice"
 
 	"github.com/gin-gonic/gin"
+	"github.com/mattn/go-isatty"
 	swaggerfiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
@@ -48,9 +53,43 @@ func main() {
 		mcpLocalhostProtection = "disabled"
 	}
 
-	db := database.New("sandbox.db")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	choice, err := runtimechoice.Select(ctx, cfg.Runtime, runtime.GOOS, isatty.IsTerminal(os.Stdin.Fd()), os.Stdin, os.Stdout)
+	if err != nil {
+		log.Fatalf("runtime selection failed: %v", err)
+	}
+	dbPath := "sandbox.db"
+	var appleRunner applecontainer.Runner
+	if choice == "container" {
+		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		appleRunner, err = applecontainer.Resolve(checkCtx)
+		cancel()
+		if err != nil {
+			log.Fatalf("runtime validation failed: %v", err)
+		}
+		dbPath = "sandbox-container.db"
+	}
+	db := database.New(dbPath)
 	repo := database.NewRepository(db)
-	dc := docker.New(repo)
+	var dc interface {
+		api.DockerClient
+		SetCacheInvalidator(func(string))
+		Shutdown(context.Context)
+	}
+	if choice == "container" {
+		client := applecontainer.New(repo, appleRunner, nil)
+		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err = client.Ping(checkCtx)
+		cancel()
+		if err != nil {
+			log.Fatalf("runtime validation failed: %v", err)
+		}
+		dc = client
+	} else {
+		dc = docker.New(repo)
+	}
+	log.Printf("sandbox runtime: %s (database: %s)", choice, dbPath)
 
 	// --- Reverse proxy (multi-listen) ---
 	proxyServer := proxy.New(cfg.BaseDomain, repo)
@@ -100,9 +139,6 @@ func main() {
 	})
 
 	// Graceful shutdown: listen for SIGINT/SIGTERM, then stop tracked containers.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	srv := &http.Server{Addr: cfg.Addr, Handler: r}
 
 	go func() {

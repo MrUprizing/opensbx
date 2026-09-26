@@ -22,6 +22,50 @@ func TestMainProcessHelper(t *testing.T) {
 	main()
 }
 
+func TestMainRuntimePreflightFailureHelper(t *testing.T) {
+	if os.Getenv("OPENSBX_RUNTIME_PREFLIGHT_HELPER") != "1" {
+		return
+	}
+	os.Args = []string{"opensbx-main-helper", "-runtime", "container"}
+	flag.CommandLine = flag.NewFlagSet("opensbx-preflight-helper", flag.ExitOnError)
+	main()
+}
+
+func TestExplicitApplePreflightFailureOccursBeforeOpeningListeners(t *testing.T) {
+	workDir := t.TempDir()
+	apiAddr, proxyAddr := reserveTCPAddress(t), reserveTCPAddress(t)
+	pathWithoutRuntime := filepath.Join(workDir, "empty-path")
+	if err := os.Mkdir(pathWithoutRuntime, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainRuntimePreflightFailureHelper$")
+	cmd.Dir = workDir
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "ADDR=") || strings.HasPrefix(entry, "PROXY_ADDR=") || strings.HasPrefix(entry, "LOG_FILE=") || strings.HasPrefix(entry, "OPENSBX_RUNTIME_PREFLIGHT_HELPER=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	cmd.Env = append(env,
+		"OPENSBX_RUNTIME_PREFLIGHT_HELPER=1",
+		"PATH="+pathWithoutRuntime,
+		"ADDR="+apiAddr,
+		"PROXY_ADDR="+proxyAddr,
+		"LOG_FILE="+filepath.Join(workDir, "preflight.log"),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("explicit container runtime unexpectedly passed preflight; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String()+stderr.String(), "runtime validation failed") {
+		t.Fatalf("subprocess did not fail at runtime preflight: stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	assertListenerReleased(t, apiAddr)
+	assertListenerReleased(t, proxyAddr)
+}
+
 func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 	workDir := t.TempDir()
 	logPath := filepath.Join(workDir, "logs", "api.log")

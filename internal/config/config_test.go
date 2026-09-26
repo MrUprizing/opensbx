@@ -64,11 +64,14 @@ func TestLoadFlagsOverrideEnvironmentAndLocalDomainKeepsProtection(t *testing.T)
 	t.Setenv("BASE_DOMAIN", "api.example.test")
 	t.Setenv("LOG_FILE", "opensbx.log")
 	t.Setenv("API_KEY", "")
-	os.Args = []string{"config-test", "-addr", ":7777", "-base-domain", "dev.localhost"}
+	os.Args = []string{"config-test", "-addr", ":7777", "-base-domain", "dev.localhost", "-runtime", "container"}
 
 	got := Load()
 	if got.Addr != ":7777" || got.BaseDomain != "dev.localhost" {
 		t.Fatalf("Load() did not honor flags: %+v", got)
+	}
+	if got.Runtime != "container" {
+		t.Fatalf("Load() runtime = %q, want explicit flag container", got.Runtime)
 	}
 	if got.MCPDisableLocalhostProtection {
 		t.Fatal("Load() should keep localhost protection for local domains")

@@ -34,6 +34,10 @@ Opensbx is an API-first sandbox runtime for untrusted or AI-generated code. It c
 - Set resource limits and automatic expiration
 - Protect endpoints with optional Bearer API key auth
 
+Docker remains the default backend. Native Apple Silicon macOS can also use
+[Apple container](docs/apple-container.md), with the same REST/MCP contract and
+the runtime-specific limitations documented there.
+
 ## Quick start
 
 ```bash
@@ -88,6 +92,7 @@ Opensbx includes MCP endpoints so MCP clients can create sandboxes, execute comm
 | `BASE_DOMAIN` | `-base-domain` | `localhost` | Base domain for subdomain routing |
 | `LOG_FILE` | `-log-file` | `opensbx.log` | Log file path for API and MCP metadata |
 | `API_KEY` | — | *(empty, auth disabled)* | Bearer token for API authentication |
+| — | `-runtime` | Docker, or a menu on interactive macOS | `docker` or `container`; selected once at startup |
 
 ## Sandbox defaults
 
