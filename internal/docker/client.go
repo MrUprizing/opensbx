@@ -18,7 +18,8 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -86,9 +87,12 @@ func New(repo *database.Repository) *Client {
 		if err != nil {
 			panic(err)
 		}
+		if err := ValidateEndpoint(cli.DaemonHost()); err != nil {
+			panic(err)
+		}
 		mobyClient = cli
 	})
-	return &Client{cli: mobyClient, repo: repo}
+	return &Client{cli: mobyClient, repo: repo.NativeView()}
 }
 
 // SetCacheInvalidator registers a callback invoked when a sandbox's ports
@@ -116,14 +120,14 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // List returns all sandboxes tracked in the database, enriched with live
 // state from Docker. Stopped containers are always included.
-func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
+func (c *Client) List(ctx context.Context) ([]runtimeio.SandboxSummary, error) {
 	// Fetch all persisted sandboxes from the database.
 	dbSandboxes, err := c.repo.FindAll()
 	if err != nil {
 		return nil, err
 	}
 	if len(dbSandboxes) == 0 {
-		return []models.SandboxSummary{}, nil
+		return []runtimeio.SandboxSummary{}, nil
 	}
 
 	// Fetch all containers (including stopped) to build a lookup map.
@@ -156,9 +160,9 @@ func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
 		}
 	}
 
-	summaries := make([]models.SandboxSummary, 0, len(dbSandboxes))
+	summaries := make([]runtimeio.SandboxSummary, 0, len(dbSandboxes))
 	for _, db := range dbSandboxes {
-		s := models.SandboxSummary{
+		s := runtimeio.SandboxSummary{
 			ID:    db.ID,
 			Name:  db.Name,
 			Image: db.Image,
@@ -194,14 +198,14 @@ func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
 // Create creates and starts a sandbox. Docker assigns host ports automatically.
 // Applies optional resource limits and schedules auto-stop with a default TTL of 15 minutes.
 // Returns ErrImageNotFound if the image does not exist locally.
-func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (models.CreateSandboxResponse, error) {
+func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest) (response runtimeio.CreateSandboxResponse, createErr error) {
 	// Verify image exists locally
 	exists, err := c.ImageExists(ctx, req.Image)
 	if err != nil {
-		return models.CreateSandboxResponse{}, err
+		return runtimeio.CreateSandboxResponse{}, err
 	}
 	if !exists {
-		return models.CreateSandboxResponse{}, ErrImageNotFound
+		return runtimeio.CreateSandboxResponse{}, sandbox.ErrImageNotFound
 	}
 
 	ports := normalizePorts(req.Ports)
@@ -249,11 +253,25 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (m
 		Name:       name,
 	})
 	if err != nil {
-		return models.CreateSandboxResponse{}, err
+		return runtimeio.CreateSandboxResponse{}, err
 	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		c.cancelTimer(result.ID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := c.cli.ContainerRemove(cleanupCtx, result.ID, moby.ContainerRemoveOptions{Force: true}); err != nil {
+			// Retain ownership if a newly created resource could not be rolled back.
+			saveErr := c.repo.CreateOwnership(database.Sandbox{ID: sandbox.CreationID(ctx, result.ID), NativeID: result.ID, Name: name, Image: sandbox.CreationImage(ctx, req.Image), Port: mainPort})
+			createErr = errors.Join(createErr, fmt.Errorf("rollback sandbox %s: %w", result.ID, err), saveErr)
+		}
+	}()
 
 	if _, err := c.cli.ContainerStart(ctx, result.ID, moby.ContainerStartOptions{}); err != nil {
-		return models.CreateSandboxResponse{}, err
+		return runtimeio.CreateSandboxResponse{}, err
 	}
 
 	// Schedule auto-stop. Default 15 min if not specified.
@@ -266,23 +284,25 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (m
 	// Inspect to get Docker-assigned host ports.
 	info, err := c.cli.ContainerInspect(ctx, result.ID, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.CreateSandboxResponse{}, err
+		return runtimeio.CreateSandboxResponse{}, err
 	}
 
 	assignedPorts := extractPorts(info.Container.NetworkSettings.Ports)
 
-	// Persist sandbox (fire-and-forget: log errors, don't block).
-	if err := c.repo.Save(database.Sandbox{
-		ID:    result.ID,
-		Name:  name,
-		Image: req.Image,
-		Ports: database.JSONMap(assignedPorts),
-		Port:  mainPort,
+	// A successful create must have durable ownership metadata.
+	if err := c.repo.CreateOwnership(database.Sandbox{
+		ID:       sandbox.CreationID(ctx, result.ID),
+		NativeID: result.ID,
+		Name:     name,
+		Image:    sandbox.CreationImage(ctx, req.Image),
+		Ports:    database.JSONMap(assignedPorts),
+		Port:     mainPort,
 	}); err != nil {
-		log.Printf("database: failed to persist sandbox %s: %v", result.ID, err)
+		return runtimeio.CreateSandboxResponse{}, err
 	}
+	committed = true
 
-	return models.CreateSandboxResponse{
+	return runtimeio.CreateSandboxResponse{
 		ID:    result.ID,
 		Name:  name,
 		Ports: portKeys(assignedPorts),
@@ -290,21 +310,21 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (m
 }
 
 // Inspect returns a curated view of a sandbox.
-func (c *Client) Inspect(ctx context.Context, id string) (models.SandboxDetail, error) {
+func (c *Client) Inspect(ctx context.Context, id string) (runtimeio.SandboxDetail, error) {
 	result, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.SandboxDetail{}, wrapNotFound(err)
+		return runtimeio.SandboxDetail{}, wrapNotFound(err)
 	}
 
 	info := result.Container
-	detail := models.SandboxDetail{
+	detail := runtimeio.SandboxDetail{
 		ID:      info.ID,
 		Name:    strings.TrimPrefix(info.Name, "/"),
 		Image:   info.Config.Image,
 		Status:  string(info.State.Status),
 		Running: info.State.Running,
 		Ports:   portKeys(extractPorts(info.NetworkSettings.Ports)),
-		Resources: models.ResourceLimits{
+		Resources: runtimeio.ResourceLimits{
 			Memory: info.HostConfig.Memory / (1024 * 1024), // bytes to MB
 			CPUs:   float64(info.HostConfig.NanoCPUs) / 1e9,
 		},
@@ -321,18 +341,18 @@ func (c *Client) Inspect(ctx context.Context, id string) (models.SandboxDetail, 
 }
 
 // GetNetwork returns current exposed port mappings and selected main routing port.
-func (c *Client) GetNetwork(ctx context.Context, id string) (models.SandboxNetwork, error) {
+func (c *Client) GetNetwork(ctx context.Context, id string) (runtimeio.SandboxNetwork, error) {
 	sb, err := c.repo.FindByID(id)
 	if err != nil {
-		return models.SandboxNetwork{}, err
+		return runtimeio.SandboxNetwork{}, err
 	}
 	if sb == nil {
-		return models.SandboxNetwork{}, ErrNotFound
+		return runtimeio.SandboxNetwork{}, sandbox.ErrNotFound
 	}
 
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.SandboxNetwork{}, wrapNotFound(err)
+		return runtimeio.SandboxNetwork{}, wrapNotFound(err)
 	}
 
 	ports := extractPorts(info.Container.NetworkSettings.Ports)
@@ -343,30 +363,30 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (models.SandboxNetwo
 		}
 	}
 
-	return models.SandboxNetwork{MainPort: mainPort, PortsMap: ports}, nil
+	return runtimeio.SandboxNetwork{MainPort: mainPort, PortsMap: ports}, nil
 }
 
 // Start starts a stopped sandbox and re-schedules the auto-stop timer.
 // Returns ErrAlreadyRunning (409) if the sandbox is already running.
-func (c *Client) Start(ctx context.Context, id string) (models.RestartResponse, error) {
+func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	// Check current state to return a meaningful conflict error.
 	pre, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.RestartResponse{}, wrapNotFound(err)
+		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 	if pre.Container.State.Running {
-		return models.RestartResponse{}, ErrAlreadyRunning
+		return runtimeio.RestartResponse{}, sandbox.ErrAlreadyRunning
 	}
 
 	if _, err := c.cli.ContainerStart(ctx, id, moby.ContainerStartOptions{}); err != nil {
-		return models.RestartResponse{}, wrapNotFound(err)
+		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
 	c.scheduleStop(id, defaultTimeout)
 
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.RestartResponse{}, wrapNotFound(err)
+		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
 	var expiresAt *time.Time
@@ -382,7 +402,7 @@ func (c *Client) Start(ctx context.Context, id string) (models.RestartResponse, 
 	}
 	c.invalidateCache(id)
 
-	return models.RestartResponse{
+	return runtimeio.RestartResponse{
 		Status:    "started",
 		Ports:     portKeys(ports),
 		ExpiresAt: expiresAt,
@@ -397,7 +417,7 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 		return wrapNotFound(err)
 	}
 	if !info.Container.State.Running {
-		return ErrAlreadyStopped
+		return sandbox.ErrAlreadyStopped
 	}
 
 	c.cancelTimer(id)
@@ -408,11 +428,11 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 
 // Restart restarts a sandbox and returns the new port mappings.
 // It cancels any existing timer and schedules a fresh one with the default timeout.
-func (c *Client) Restart(ctx context.Context, id string) (models.RestartResponse, error) {
+func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	c.cancelTimer(id)
 
 	if _, err := c.cli.ContainerRestart(ctx, id, moby.ContainerRestartOptions{}); err != nil {
-		return models.RestartResponse{}, wrapNotFound(err)
+		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
 	// Re-schedule auto-stop with the default timeout.
@@ -421,7 +441,7 @@ func (c *Client) Restart(ctx context.Context, id string) (models.RestartResponse
 	// Inspect to get the new ports.
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.RestartResponse{}, wrapNotFound(err)
+		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
 	var expiresAt *time.Time
@@ -438,7 +458,7 @@ func (c *Client) Restart(ctx context.Context, id string) (models.RestartResponse
 	}
 	c.invalidateCache(id)
 
-	return models.RestartResponse{
+	return runtimeio.RestartResponse{
 		Status:    "restarted",
 		Ports:     portKeys(ports),
 		ExpiresAt: expiresAt,
@@ -485,10 +505,10 @@ func (c *Client) Pause(ctx context.Context, id string) error {
 		return wrapNotFound(err)
 	}
 	if info.Container.State.Paused {
-		return ErrAlreadyPaused
+		return sandbox.ErrAlreadyPaused
 	}
 	if !info.Container.State.Running {
-		return ErrNotRunning
+		return sandbox.ErrNotRunning
 	}
 
 	_, err = c.cli.ContainerPause(ctx, id, moby.ContainerPauseOptions{})
@@ -503,7 +523,7 @@ func (c *Client) Resume(ctx context.Context, id string) error {
 		return wrapNotFound(err)
 	}
 	if !info.Container.State.Paused {
-		return ErrNotPaused
+		return sandbox.ErrNotPaused
 	}
 
 	_, err = c.cli.ContainerUnpause(ctx, id, moby.ContainerUnpauseOptions{})
@@ -523,19 +543,19 @@ func (c *Client) RenewExpiration(ctx context.Context, id string, timeout int) er
 }
 
 // Stats returns a curated snapshot of container resource usage.
-func (c *Client) Stats(ctx context.Context, id string) (models.SandboxStats, error) {
+func (c *Client) Stats(ctx context.Context, id string) (runtimeio.SandboxStats, error) {
 	result, err := c.cli.ContainerStats(ctx, id, moby.ContainerStatsOptions{
 		Stream:                false,
 		IncludePreviousSample: true,
 	})
 	if err != nil {
-		return models.SandboxStats{}, wrapNotFound(err)
+		return runtimeio.SandboxStats{}, wrapNotFound(err)
 	}
 	defer result.Body.Close()
 
 	var raw container.StatsResponse
 	if err := json.NewDecoder(result.Body).Decode(&raw); err != nil {
-		return models.SandboxStats{}, fmt.Errorf("decode stats: %w", err)
+		return runtimeio.SandboxStats{}, fmt.Errorf("decode stats: %w", err)
 	}
 
 	// CPU % = (cpuDelta / systemDelta) * numCPUs * 100
@@ -551,9 +571,9 @@ func (c *Client) Stats(ctx context.Context, id string) (models.SandboxStats, err
 		memPercent = float64(raw.MemoryStats.Usage) / float64(raw.MemoryStats.Limit) * 100.0
 	}
 
-	return models.SandboxStats{
+	return runtimeio.SandboxStats{
 		CPU: math.Round(cpuPercent*100) / 100, // 2 decimal places
-		Memory: models.MemoryUsage{
+		Memory: runtimeio.MemoryUsage{
 			Usage:   raw.MemoryStats.Usage,
 			Limit:   raw.MemoryStats.Limit,
 			Percent: math.Round(memPercent*100) / 100,
@@ -573,14 +593,14 @@ func generateCmdID() string {
 
 // ExecCommand creates and starts a command asynchronously inside a sandbox.
 // Returns the CommandDetail immediately (no exit_code yet).
-func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req models.ExecCommandRequest) (models.CommandDetail, error) {
+func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimeio.ExecCommandRequest) (runtimeio.CommandDetail, error) {
 	// Verify sandbox is running.
 	info, err := c.cli.ContainerInspect(ctx, sandboxID, moby.ContainerInspectOptions{})
 	if err != nil {
-		return models.CommandDetail{}, wrapNotFound(err)
+		return runtimeio.CommandDetail{}, wrapNotFound(err)
 	}
 	if !info.Container.State.Running {
-		return models.CommandDetail{}, ErrNotRunning
+		return runtimeio.CommandDetail{}, sandbox.ErrNotRunning
 	}
 
 	cmdID := generateCmdID()
@@ -608,7 +628,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req models.E
 
 	execCfg, err := c.cli.ExecCreate(ctx, sandboxID, execOpts)
 	if err != nil {
-		return models.CommandDetail{}, wrapNotFound(err)
+		return runtimeio.CommandDetail{}, wrapNotFound(err)
 	}
 
 	// Persist command to DB.
@@ -621,7 +641,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req models.E
 		Cwd:       req.Cwd,
 		StartedAt: now,
 	}); err != nil {
-		return models.CommandDetail{}, fmt.Errorf("save command: %w", err)
+		return runtimeio.CommandDetail{}, fmt.Errorf("save command: %w", err)
 	}
 
 	// Set up ring buffers and tracking.
@@ -684,7 +704,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req models.E
 		c.repo.UpdateCommandFinished(cmdID, exitCode, finishedAt)
 	}()
 
-	return models.CommandDetail{
+	return runtimeio.CommandDetail{
 		ID:        cmdID,
 		Name:      req.Command,
 		Args:      req.Args,
@@ -695,23 +715,23 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req models.E
 }
 
 // GetCommand returns command details by ID.
-func (c *Client) GetCommand(ctx context.Context, sandboxID, cmdID string) (models.CommandDetail, error) {
+func (c *Client) GetCommand(ctx context.Context, sandboxID, cmdID string) (runtimeio.CommandDetail, error) {
 	dbCmd, err := c.repo.FindCommandByID(cmdID)
 	if err != nil {
-		return models.CommandDetail{}, err
+		return runtimeio.CommandDetail{}, err
 	}
 	if dbCmd == nil {
-		return models.CommandDetail{}, ErrCommandNotFound
+		return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 	}
 	if dbCmd.SandboxID != sandboxID {
-		return models.CommandDetail{}, ErrCommandNotFound
+		return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 	}
 
 	return c.dbCommandToDetail(*dbCmd), nil
 }
 
 // ListCommands returns all commands for a sandbox.
-func (c *Client) ListCommands(ctx context.Context, sandboxID string) ([]models.CommandDetail, error) {
+func (c *Client) ListCommands(ctx context.Context, sandboxID string) ([]runtimeio.CommandDetail, error) {
 	// Verify sandbox exists.
 	if _, err := c.cli.ContainerInspect(ctx, sandboxID, moby.ContainerInspectOptions{}); err != nil {
 		return nil, wrapNotFound(err)
@@ -722,7 +742,7 @@ func (c *Client) ListCommands(ctx context.Context, sandboxID string) ([]models.C
 		return nil, err
 	}
 
-	details := make([]models.CommandDetail, 0, len(dbCmds))
+	details := make([]runtimeio.CommandDetail, 0, len(dbCmds))
 	for _, cmd := range dbCmds {
 		details = append(details, c.dbCommandToDetail(cmd))
 	}
@@ -730,30 +750,30 @@ func (c *Client) ListCommands(ctx context.Context, sandboxID string) ([]models.C
 }
 
 // KillCommand sends a signal to a running command.
-func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signal int) (models.CommandDetail, error) {
+func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signal int) (runtimeio.CommandDetail, error) {
 	// Look up running command.
 	v, ok := c.commands.Load(cmdID)
 	if !ok {
 		// Check if it exists in DB.
 		dbCmd, err := c.repo.FindCommandByID(cmdID)
 		if err != nil {
-			return models.CommandDetail{}, err
+			return runtimeio.CommandDetail{}, err
 		}
 		if dbCmd == nil {
-			return models.CommandDetail{}, ErrCommandNotFound
+			return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 		}
-		return models.CommandDetail{}, ErrCommandFinished
+		return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
 	}
 
 	rc := v.(*runningCommand)
 	rc.mu.Lock()
 	if rc.finished {
 		rc.mu.Unlock()
-		return models.CommandDetail{}, ErrCommandFinished
+		return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
 	}
 	if rc.sandboxID != sandboxID {
 		rc.mu.Unlock()
-		return models.CommandDetail{}, ErrCommandNotFound
+		return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 	}
 	cmd := rc.cmd
 	rc.mu.Unlock()
@@ -777,27 +797,27 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signa
 func (c *Client) StreamCommandLogs(ctx context.Context, sandboxID, cmdID string) (io.ReadCloser, io.ReadCloser, error) {
 	v, ok := c.commands.Load(cmdID)
 	if !ok {
-		return nil, nil, ErrCommandNotFound
+		return nil, nil, sandbox.ErrCommandNotFound
 	}
 
 	rc := v.(*runningCommand)
 	if rc.sandboxID != sandboxID {
-		return nil, nil, ErrCommandNotFound
+		return nil, nil, sandbox.ErrCommandNotFound
 	}
 
 	return rc.stdout.NewReader(), rc.stderr.NewReader(), nil
 }
 
 // GetCommandLogs returns a snapshot of stdout and stderr for a command without streaming.
-func (c *Client) GetCommandLogs(ctx context.Context, sandboxID, cmdID string) (models.CommandLogsResponse, error) {
+func (c *Client) GetCommandLogs(ctx context.Context, sandboxID, cmdID string) (runtimeio.CommandLogsResponse, error) {
 	v, ok := c.commands.Load(cmdID)
 	if !ok {
-		return models.CommandLogsResponse{}, ErrCommandNotFound
+		return runtimeio.CommandLogsResponse{}, sandbox.ErrCommandNotFound
 	}
 
 	rc := v.(*runningCommand)
 	if rc.sandboxID != sandboxID {
-		return models.CommandLogsResponse{}, ErrCommandNotFound
+		return runtimeio.CommandLogsResponse{}, sandbox.ErrCommandNotFound
 	}
 
 	rc.mu.Lock()
@@ -808,7 +828,7 @@ func (c *Client) GetCommandLogs(ctx context.Context, sandboxID, cmdID string) (m
 	}
 	rc.mu.Unlock()
 
-	return models.CommandLogsResponse{
+	return runtimeio.CommandLogsResponse{
 		Stdout:   string(rc.stdout.Bytes()),
 		Stderr:   string(rc.stderr.Bytes()),
 		ExitCode: exitCode,
@@ -816,7 +836,7 @@ func (c *Client) GetCommandLogs(ctx context.Context, sandboxID, cmdID string) (m
 }
 
 // WaitCommand blocks until a command finishes and returns the updated detail.
-func (c *Client) WaitCommand(ctx context.Context, sandboxID, cmdID string) (models.CommandDetail, error) {
+func (c *Client) WaitCommand(ctx context.Context, sandboxID, cmdID string) (runtimeio.CommandDetail, error) {
 	v, ok := c.commands.Load(cmdID)
 	if !ok {
 		// Already finished and cleaned up, or doesn't exist.
@@ -827,20 +847,20 @@ func (c *Client) WaitCommand(ctx context.Context, sandboxID, cmdID string) (mode
 	select {
 	case <-rc.done:
 	case <-ctx.Done():
-		return models.CommandDetail{}, ctx.Err()
+		return runtimeio.CommandDetail{}, ctx.Err()
 	}
 
 	return c.GetCommand(ctx, sandboxID, cmdID)
 }
 
-// dbCommandToDetail converts a database.Command to models.CommandDetail.
-func (c *Client) dbCommandToDetail(cmd database.Command) models.CommandDetail {
+// dbCommandToDetail reconstructs an adapter-local command record.
+func (c *Client) dbCommandToDetail(cmd database.Command) runtimeio.CommandDetail {
 	var args []string
 	if cmd.Args != "" {
 		json.Unmarshal([]byte(cmd.Args), &args)
 	}
 
-	detail := models.CommandDetail{
+	detail := runtimeio.CommandDetail{
 		ID:         cmd.ID,
 		Name:       cmd.Name,
 		Args:       args,
@@ -896,82 +916,6 @@ func (c *Client) ListDir(ctx context.Context, id, path string) (string, error) {
 		return "", err
 	}
 	return result.stdout, nil
-}
-
-// PullImage pulls a Docker image from a registry and waits for completion.
-// It reads the JSON message stream to detect errors that the Docker daemon
-// reports inline (e.g. "no matching manifest for linux/amd64").
-func (c *Client) PullImage(ctx context.Context, image string) error {
-	resp, err := c.cli.ImagePull(ctx, image, moby.ImagePullOptions{})
-	if err != nil {
-		return err
-	}
-	defer resp.Close()
-
-	for msg, err := range resp.JSONMessages(ctx) {
-		if err != nil {
-			return err
-		}
-		if msg.Error != nil {
-			return fmt.Errorf("pull %s: %s", image, msg.Error.Message)
-		}
-	}
-
-	// Verify the image actually exists locally after pull.
-	if exists, err := c.ImageExists(ctx, image); err != nil {
-		return err
-	} else if !exists {
-		return fmt.Errorf("pull %s: image not available after pull", image)
-	}
-
-	return nil
-}
-
-// RemoveImage removes a local Docker image. Use force=true to remove even if containers reference it.
-func (c *Client) RemoveImage(ctx context.Context, id string, force bool) error {
-	_, err := c.cli.ImageRemove(ctx, id, moby.ImageRemoveOptions{
-		Force:         force,
-		PruneChildren: true,
-	})
-	if err != nil {
-		return wrapNotFound(err)
-	}
-	return nil
-}
-
-// InspectImage returns curated details for a single Docker image.
-func (c *Client) InspectImage(ctx context.Context, id string) (models.ImageDetail, error) {
-	result, err := c.cli.ImageInspect(ctx, id)
-	if err != nil {
-		return models.ImageDetail{}, wrapNotFound(err)
-	}
-
-	return models.ImageDetail{
-		ID:           result.ID,
-		Tags:         result.RepoTags,
-		Size:         result.Size,
-		Created:      result.Created,
-		Architecture: result.Architecture,
-		OS:           result.Os,
-	}, nil
-}
-
-// ListImages returns all locally available Docker images.
-func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) {
-	result, err := c.cli.ImageList(ctx, moby.ImageListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	images := make([]models.ImageSummary, 0, len(result.Items))
-	for _, item := range result.Items {
-		images = append(images, models.ImageSummary{
-			ID:   item.ID,
-			Tags: item.RepoTags,
-			Size: item.Size,
-		})
-	}
-	return images, nil
 }
 
 // ImageExists checks if an image exists locally.
@@ -1130,7 +1074,7 @@ func wrapNotFound(err error) error {
 		return nil
 	}
 	if errdefs.IsNotFound(err) {
-		return ErrNotFound
+		return sandbox.ErrNotFound
 	}
 	return err
 }

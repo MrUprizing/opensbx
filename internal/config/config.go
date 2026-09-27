@@ -2,62 +2,69 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-// Config holds all application configuration.
 type Config struct {
-	Runtime                       string   // Empty selects interactively on macOS TTYs, otherwise Docker.
-	Addr                          string   // HTTP listen address, e.g. ":8080"
-	APIKey                        string   // API key for authentication (env API_KEY). Empty = auth disabled.
-	ProxyAddrs                    []string // Reverse proxy listen addresses, e.g. [":80", ":3000"]
-	BaseDomain                    string   // Base domain for subdomain routing, e.g. "localhost"
-	LogFile                       string   // Path to .log file where API/MCP logs are written.
-	MCPDisableLocalhostProtection bool     // Disable MCP SDK localhost Host-header guard for non-local domains.
+	Runtime  string
+	Addr     string
+	APIKey   string
+	LogFile  string
+	DataDir  string
+	LegacyDB string
 }
 
-// PrimaryProxyAddr returns the first proxy address, used for generating URLs.
-func (c *Config) PrimaryProxyAddr() string {
-	if len(c.ProxyAddrs) == 0 {
-		return ":80"
+func DefaultDataDir() string {
+	if v := os.Getenv("OPENSBX_DATA_DIR"); v != "" {
+		return v
 	}
-	return c.ProxyAddrs[0]
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Join(home, ".local", "share", "opensbx")
 }
 
-// Load parses flags and env vars. Flags take precedence over env vars.
 func Load() *Config {
-	addr := flag.String("addr", envOrDefault("ADDR", ":8080"), "HTTP listen address")
-	proxyAddr := flag.String("proxy-addr", envOrDefault("PROXY_ADDR", ":80,:3000"), "Comma-separated proxy listen addresses (first is used for URL generation)")
-	baseDomain := flag.String("base-domain", envOrDefault("BASE_DOMAIN", "localhost"), "Base domain for subdomain routing")
-	logFile := flag.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
-	runtime := flag.String("runtime", "", "Sandbox runtime: docker or container (default: Docker; prompt on macOS terminals)")
-	flag.Parse()
-
-	normalizedBaseDomain := normalizeBaseDomain(*baseDomain)
-
-	return &Config{
-		Runtime:                       *runtime,
-		Addr:                          *addr,
-		APIKey:                        os.Getenv("API_KEY"),
-		ProxyAddrs:                    parseAddrs(*proxyAddr),
-		BaseDomain:                    normalizedBaseDomain,
-		LogFile:                       normalizeLogFile(*logFile),
-		MCPDisableLocalhostProtection: !isLocalBaseDomain(normalizedBaseDomain),
-	}
-}
-
-// parseAddrs splits a comma-separated list of addresses and trims whitespace.
-func parseAddrs(raw string) []string {
-	parts := strings.Split(raw, ",")
-	addrs := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if a := strings.TrimSpace(p); a != "" {
-			addrs = append(addrs, a)
+	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
+		if _, set := os.LookupEnv(key); set {
+			panic(key + " is no longer supported: use ADDR=127.0.0.1:8080; sandbox URLs share that port")
 		}
 	}
-	return addrs
+	addr := flag.String("addr", envOrDefault("ADDR", "127.0.0.1:8080"), "Loopback HTTP address for API, MCP and sandbox URLs")
+	logFile := flag.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
+	runtime := flag.String("runtime", "", "Sandbox runtime: docker or container")
+	dataDir := flag.String("data-dir", DefaultDataDir(), "OpenSBX local data directory")
+	legacyDB := flag.String("legacy-db", "", "Explicit legacy execution database path; back it up first and select its original runtime")
+	for _, arg := range os.Args[1:] {
+		key := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
+		if key == "proxy-addr" || key == "base-domain" {
+			panic("legacy proxy/domain options were removed: use -addr 127.0.0.1:8080")
+		}
+	}
+	flag.Parse()
+	if err := ValidateAddr(*addr); err != nil {
+		panic(err)
+	}
+	return &Config{Runtime: *runtime, Addr: *addr, APIKey: os.Getenv("API_KEY"), LogFile: normalizeLogFile(*logFile), DataDir: *dataDir, LegacyDB: *legacyDB}
+}
+
+func ValidateAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("listen address must be a loopback IP and port: %w", err)
+	}
+	ip := net.ParseIP(host)
+	n, err := strconv.Atoi(port)
+	if ip == nil || (host != "127.0.0.1" && host != "::1") || err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("listen address %q must use 127.0.0.1 or ::1 and port 0..65535 for localhost routing", addr)
+	}
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -66,28 +73,9 @@ func envOrDefault(key, fallback string) string {
 	}
 	return fallback
 }
-
-func normalizeBaseDomain(raw string) string {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return "localhost"
-	}
-	return v
-}
-
 func normalizeLogFile(raw string) string {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return "opensbx.log"
+	if v := strings.TrimSpace(raw); v != "" {
+		return v
 	}
-	return v
-}
-
-func isLocalBaseDomain(raw string) bool {
-	host := strings.Trim(strings.TrimSpace(raw), "[]")
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return "opensbx.log"
 }

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
+	"opensbx/internal/sandbox"
 )
 
 func TestLifecycleTransitionsInvalidateCacheAndNeverRecreateOnRestart(t *testing.T) {
@@ -106,11 +106,11 @@ func TestLifecycleErrorsAndUnsupportedPauseResumeDoNotMutateRuntime(t *testing.T
 		_, _ = io.WriteString(out, listJSON(id, state, "[]"))
 		return nil
 	}
-	if err := c.Stop(context.Background(), id); !errors.Is(err, docker.ErrAlreadyStopped) {
+	if err := c.Stop(context.Background(), id); !errors.Is(err, sandbox.ErrAlreadyStopped) {
 		t.Fatalf("already stopped error = %v", err)
 	}
 	state = "running"
-	if _, err := c.Start(context.Background(), id); !errors.Is(err, docker.ErrAlreadyRunning) {
+	if _, err := c.Start(context.Background(), id); !errors.Is(err, sandbox.ErrAlreadyRunning) {
 		t.Fatalf("already running error = %v", err)
 	}
 }

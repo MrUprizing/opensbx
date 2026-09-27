@@ -6,14 +6,14 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"opensbx/internal/docker"
+	"opensbx/internal/sandbox"
 )
 
 // ErrorResponse is the standard error body returned by all API endpoints.
 type ErrorResponse struct {
 	Code    string `json:"code" example:"BAD_REQUEST"`
 	Message string `json:"message" example:"image is required"`
-}
+} // @name internal_api.ErrorResponse
 
 // badRequest writes a 400 response with code BAD_REQUEST and the provided message.
 func badRequest(c *gin.Context, msg string) {
@@ -44,39 +44,43 @@ func rateLimited(c *gin.Context, msg string) {
 // internalError writes a 500 response with code INTERNAL_ERROR.
 // It first checks for well-known sentinel errors and downgrades to the appropriate status code.
 func internalError(c *gin.Context, err error) {
-	if errors.Is(err, docker.ErrNotFound) {
+	if errors.Is(err, sandbox.ErrUnsupported) || errors.Is(err, sandbox.ErrInvalidInput) {
+		badRequest(c, err.Error())
+		return
+	}
+	if errors.Is(err, sandbox.ErrNotFound) {
 		notFound(c, "sandbox")
 		return
 	}
-	if errors.Is(err, docker.ErrImageNotFound) {
+	if errors.Is(err, sandbox.ErrImageNotFound) {
 		badRequest(c, "image not found locally, use POST /v1/images/pull to download it first")
 		return
 	}
-	if errors.Is(err, docker.ErrAlreadyRunning) {
+	if errors.Is(err, sandbox.ErrAlreadyRunning) {
 		conflict(c, err.Error())
 		return
 	}
-	if errors.Is(err, docker.ErrAlreadyStopped) {
+	if errors.Is(err, sandbox.ErrAlreadyStopped) {
 		conflict(c, err.Error())
 		return
 	}
-	if errors.Is(err, docker.ErrAlreadyPaused) {
+	if errors.Is(err, sandbox.ErrAlreadyPaused) {
 		conflict(c, err.Error())
 		return
 	}
-	if errors.Is(err, docker.ErrNotPaused) {
+	if errors.Is(err, sandbox.ErrNotPaused) {
 		conflict(c, err.Error())
 		return
 	}
-	if errors.Is(err, docker.ErrNotRunning) {
+	if errors.Is(err, sandbox.ErrNotRunning) {
 		conflict(c, err.Error())
 		return
 	}
-	if errors.Is(err, docker.ErrCommandNotFound) {
+	if errors.Is(err, sandbox.ErrCommandNotFound) {
 		notFound(c, "command")
 		return
 	}
-	if errors.Is(err, docker.ErrCommandFinished) {
+	if errors.Is(err, sandbox.ErrCommandFinished) {
 		conflict(c, err.Error())
 		return
 	}

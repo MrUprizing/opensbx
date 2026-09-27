@@ -172,4 +172,11 @@ func TestRepositoryPropagatesClosedDatabaseErrors(t *testing.T) {
 	if _, err := repo.FindCommandsBySandbox("sb"); err == nil {
 		t.Fatal("FindCommandsBySandbox() should return a database error when the pool is closed")
 	}
+	if err := repo.Save(Sandbox{ID: "sb"}); err == nil { t.Fatal("Save() should return a database error when the pool is closed") }
+	if err := repo.CreateOwnership(Sandbox{ID: "sbx-public", NativeID: "native"}); err == nil { t.Fatal("CreateOwnership() should return a database error when the pool is closed") }
+	if err := repo.UpdatePorts("sb", JSONMap{"3000/tcp": "39001"}); err == nil { t.Fatal("UpdatePorts() should return a database error when the pool is closed") }
+	if err := repo.Delete("sb"); err == nil { t.Fatal("Delete() should return a database error when the pool is closed") }
+	if err := repo.SaveCommand(Command{ID: "cmd", SandboxID: "sb"}); err == nil { t.Fatal("SaveCommand() should return a database error when the pool is closed") }
+	if err := repo.UpdateCommandFinished("cmd", 0, 1); err == nil { t.Fatal("UpdateCommandFinished() should return a database error when the pool is closed") }
+	if err := repo.DeleteCommandsBySandbox("sb"); err == nil { t.Fatal("DeleteCommandsBySandbox() should return a database error when the pool is closed") }
 }

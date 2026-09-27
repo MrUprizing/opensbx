@@ -287,7 +287,7 @@ definitions:
       ports_map:
         additionalProperties:
           type: string
-        description: map of container port -> docker host port
+        description: map of guest port -> loopback host port
         type: object
     type: object
   models.SandboxStats:
@@ -312,7 +312,7 @@ info:
 paths:
   /health:
     get:
-      description: Returns the health status of the API and its Docker daemon connection.
+      description: Returns the health status of the API and its selected local runtime.
       produces:
       - application/json
       responses:
@@ -333,7 +333,7 @@ paths:
       - system
   /images:
     get:
-      description: Returns all Docker images available locally.
+      description: Returns OpenSBX-managed images, not the native runtime inventory.
       produces:
       - application/json
       responses:
@@ -353,15 +353,16 @@ paths:
       - images
   /images/{id}:
     delete:
-      description: Removes a Docker image from the local store. Use force=true if
-        containers reference it.
+      description: Unreference a managed image without deleting native images or pinned
+        blobs. Force ignores a missing reference.
       parameters:
       - description: Image ID or name:tag
         in: path
         name: id
         required: true
         type: string
-      - description: Force removal even if referenced by containers
+      - description: Ignore a missing catalog reference; retain native images and
+          pinned blobs
         in: query
         name: force
         type: boolean
@@ -382,7 +383,8 @@ paths:
       tags:
       - images
     get:
-      description: Returns details for a single local Docker image.
+      description: Returns a managed image with its canonical OCI root descriptor
+        digest as ID.
       parameters:
       - description: Image ID or name:tag
         in: path
@@ -413,7 +415,8 @@ paths:
     post:
       consumes:
       - application/json
-      description: Downloads a Docker image from a registry to use in sandboxes.
+      description: Explicitly prepare the native platform in the OpenSBX-owned OCI
+        catalog.
       parameters:
       - description: Image to pull
         in: body
@@ -438,7 +441,7 @@ paths:
             $ref: '#/definitions/internal_api.ErrorResponse'
       security:
       - ApiKeyAuth: []
-      summary: Pull a Docker image
+      summary: Pull an OCI image
       tags:
       - images
   /sandboxes:
@@ -464,8 +467,8 @@ paths:
     post:
       consumes:
       - application/json
-      description: Create and start a new Docker container. Returns its ID and assigned
-        host ports.
+      description: Create an owned sandbox from a prepared local OCI image. Returns
+        its ID and assigned host ports.
       parameters:
       - description: Sandbox configuration
         in: body

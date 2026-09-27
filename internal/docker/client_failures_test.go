@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 func TestLifecycleReportsPostMutationInspectFailure(t *testing.T) {
@@ -28,7 +28,7 @@ func TestLifecycleReportsPostMutationInspectFailure(t *testing.T) {
 			var err error
 			switch operation {
 			case "create":
-				_, err = dc.Create(ctx, models.CreateSandboxRequest{Image: "alpine"})
+				_, err = dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "alpine"})
 			case "start":
 				_, err = dc.Start(ctx, "container-1")
 			case "restart":
@@ -41,7 +41,7 @@ func TestLifecycleReportsPostMutationInspectFailure(t *testing.T) {
 			var expected []string
 			switch operation {
 			case "create":
-				expected = []string{"GET /images/alpine/json", "POST /containers/create", "POST /containers/container-1/start", "GET /containers/container-1/json"}
+				expected = []string{"GET /images/alpine/json", "POST /containers/create", "POST /containers/container-1/start", "GET /containers/container-1/json", "DELETE /containers/container-1"}
 			case "start":
 				expected = []string{"GET /containers/container-1/json", "POST /containers/container-1/start", "GET /containers/container-1/json"}
 			case "restart":

@@ -11,6 +11,9 @@ import (
 
 	"opensbx/internal/applecontainer"
 	"opensbx/internal/database"
+	"opensbx/internal/images"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/service"
 	"opensbx/models"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +24,8 @@ type appleContractRunner struct{ t *testing.T }
 
 func (r *appleContractRunner) Run(_ context.Context, args []string, _ io.Reader, out, _ io.Writer) error {
 	switch {
+	case reflect.DeepEqual(args, []string{"system", "status", "--format", "json"}):
+		_, _ = io.WriteString(out, `{"Status":"running","Client":{"Version":"1.4.1"},"Server":{"Version":"1.4.1"}}`)
 	case reflect.DeepEqual(args, []string{"list", "--all", "--format", "json"}):
 		_, _ = io.WriteString(out, `[{"Configuration":{"ID":"opensbx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Labels":{"io.opensbx.managed":"opensbx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"Resources":{"CPUs":1,"MemoryInBytes":1073741824},"PublishedPorts":[]},"Status":{"State":"running"}}]`)
 	case len(args) == 8 && args[0] == "exec" && args[1] == "--interactive" && args[2] == "opensbx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" && args[3] == "/bin/sh" && args[4] == "-c" && args[5] == `case "$1" in /*) ;; *) set -- "./$1";; esac; exec cat "$1"` && args[6] == "opensbx-file" && args[7] == "/tmp/contract.txt":
@@ -50,7 +55,16 @@ func TestInjectedAppleBackendKeepsRESTAndMCPFileReadContracts(t *testing.T) {
 	}
 	backend := applecontainer.New(repo, &appleContractRunner{t: t}, nil)
 	router := gin.New()
-	handler := New(backend, "localhost", ":3000")
+	store, err := images.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := runtimeio.New(backend, backend, repo)
+	app, err := service.New(context.Background(), adapter, adapter, store, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(app)
 	handler.RegisterRoutes(router.Group("/v1"))
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/"+id+"/files?path=%2Ftmp%2Fcontract.txt", nil)
 	response := httptest.NewRecorder()
@@ -63,7 +77,7 @@ func TestInjectedAppleBackendKeepsRESTAndMCPFileReadContracts(t *testing.T) {
 		t.Fatalf("REST file response=%+v decode=%v", rest, err)
 	}
 
-	session := newMCPTestSession(t, backend)
+	session := newMCPTestSession(t, app)
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "file_read", Arguments: map[string]any{"sandbox_id": id, "path": "/tmp/contract.txt"}})
 	if err != nil || result.IsError || len(result.Content) != 1 {
 		t.Fatalf("MCP file_read result=%+v err=%v", result, err)

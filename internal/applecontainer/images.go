@@ -6,8 +6,7 @@ import (
 	"errors"
 	"strings"
 
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/sandbox"
 
 	"github.com/distribution/reference"
 )
@@ -85,7 +84,7 @@ func (c *Client) findImage(ctx context.Context, id string) (imageInfo, error) {
 	if len(matches) == 1 {
 		return matches[0], nil
 	}
-	return zero, docker.ErrImageNotFound
+	return zero, sandbox.ErrImageNotFound
 }
 func nativeVariant(im imageInfo) (imageVariant, error) {
 	for _, v := range im.Variants {
@@ -94,72 +93,4 @@ func nativeVariant(im imageInfo) (imageVariant, error) {
 		}
 	}
 	return imageVariant{}, errors.New("image has no locally available linux/arm64 variant; pull it before creating a sandbox")
-}
-func (c *Client) PullImage(ctx context.Context, image string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	name, err := imageRef(image)
-	if err != nil {
-		return err
-	}
-	_, err = c.run(ctx, nil, "image", "pull", "--platform", "linux/arm64", name)
-	return err
-}
-func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) {
-	all, err := c.images(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]models.ImageSummary, 0, len(all))
-	for _, im := range all {
-		var size int64
-		for _, v := range im.Variants {
-			size += v.Size
-		}
-		out = append(out, models.ImageSummary{ID: im.Configuration.Descriptor.Digest, Tags: []string{im.Configuration.Name}, Size: size})
-	}
-	return out, nil
-}
-func (c *Client) InspectImage(ctx context.Context, id string) (models.ImageDetail, error) {
-	im, err := c.findImage(ctx, id)
-	if err != nil {
-		return models.ImageDetail{}, err
-	}
-	b, err := c.run(ctx, nil, "image", "inspect", im.Configuration.Name)
-	if err != nil {
-		return models.ImageDetail{}, err
-	}
-	var result []imageInfo
-	if err := json.Unmarshal(b, &result); err != nil || len(result) != 1 {
-		return models.ImageDetail{}, errors.New("invalid Apple image inspect JSON")
-	}
-	im = result[0]
-	v, err := nativeVariant(im)
-	if err != nil {
-		if len(im.Variants) == 0 {
-			return models.ImageDetail{}, err
-		}
-		v = im.Variants[0]
-	}
-	return models.ImageDetail{ID: im.Configuration.Descriptor.Digest, Tags: []string{im.Configuration.Name}, Size: v.Size, Created: v.Config.Created, Architecture: v.Platform.Architecture, OS: v.Platform.OS}, nil
-}
-func (c *Client) RemoveImage(ctx context.Context, id string, force bool) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	im, err := c.findImage(ctx, id)
-	if force && errors.Is(err, docker.ErrImageNotFound) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	// Apple --force only ignores a missing reference. Never emulate Docker's
-	// force semantics by removing dependent containers or other image tags.
-	args := []string{"image", "delete"}
-	if force {
-		args = append(args, "--force")
-	}
-	args = append(args, im.Configuration.Name)
-	_, err = c.run(ctx, nil, args...)
-	return err
 }

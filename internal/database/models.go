@@ -36,11 +36,17 @@ func (j *JSONMap) Scan(src any) error {
 
 // Sandbox persists the container ID, metadata, and its assigned host ports.
 type Sandbox struct {
-	ID    string `gorm:"primaryKey"` // Docker container ID
-	Name  string
-	Image string
-	Ports JSONMap `gorm:"type:json"` // e.g. {"3000/tcp": "32768"}
-	Port  string  // container port exposed, e.g. "3000/tcp"
+	ID            string `gorm:"primaryKey"` // Stable public ID; legacy IDs are retained.
+	NativeID      string // Private backend reference; empty on legacy rows means ID.
+	ImageRoot     string // Canonical OCI root, empty for unadopted legacy images.
+	ImageManifest string // Selected platform manifest, distinct from native image ID.
+	NativeImage   string // Verified private cache handle.
+	CacheVersion  string // Runtime version and cache translation provenance.
+	RecoveryError string // Private post-create compensation failure; never a public DTO.
+	Name          string
+	Image         string
+	Ports         JSONMap `gorm:"type:json"` // e.g. {"3000/tcp": "32768"}
+	Port          string  // container port exposed, e.g. "3000/tcp"
 }
 
 // Command persists an executed command's metadata and result.

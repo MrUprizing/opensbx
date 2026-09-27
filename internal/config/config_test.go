@@ -3,159 +3,99 @@ package config
 import (
 	"flag"
 	"os"
-	"reflect"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestParseAddrsTrimsAndSkipsEmptyEntries(t *testing.T) {
-	got := parseAddrs(" :80, ,127.0.0.1:3000 ")
-	want := []string{":80", "127.0.0.1:3000"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("parseAddrs() = %v, want %v", got, want)
-	}
-	if got := parseAddrs(" , "); len(got) != 0 {
-		t.Fatalf("parseAddrs() for empty entries = %v, want empty", got)
-	}
-}
-
-func TestPrimaryProxyAddrUsesFirstConfiguredAddressOrDefault(t *testing.T) {
-	if got := (&Config{}).PrimaryProxyAddr(); got != ":80" {
-		t.Fatalf("PrimaryProxyAddr() with no addresses = %q, want :80", got)
-	}
-	if got := (&Config{ProxyAddrs: []string{":443", ":8080"}}).PrimaryProxyAddr(); got != ":443" {
-		t.Fatalf("PrimaryProxyAddr() = %q, want :443", got)
-	}
-}
-
-func TestLoadUsesEnvironmentDefaultsAndNormalizesValues(t *testing.T) {
-	oldCommandLine, oldArgs := flag.CommandLine, os.Args
-	defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
-	flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
-
-	t.Setenv("ADDR", "127.0.0.1:9090")
-	t.Setenv("API_KEY", "secret")
-	t.Setenv("PROXY_ADDR", " :8443, :3000 ")
-	t.Setenv("BASE_DOMAIN", "  api.example.test  ")
-	t.Setenv("LOG_FILE", "  /tmp/opensbx-test.log  ")
-	os.Args = []string{"config-test"}
-
-	got := Load()
-	if got.Addr != "127.0.0.1:9090" || got.APIKey != "secret" {
-		t.Fatalf("Load() address/key = %q/%q", got.Addr, got.APIKey)
-	}
-	if !reflect.DeepEqual(got.ProxyAddrs, []string{":8443", ":3000"}) {
-		t.Fatalf("Load() ProxyAddrs = %v", got.ProxyAddrs)
-	}
-	if got.BaseDomain != "api.example.test" || got.LogFile != "/tmp/opensbx-test.log" {
-		t.Fatalf("Load() normalized fields = domain %q log %q", got.BaseDomain, got.LogFile)
-	}
-	if !got.MCPDisableLocalhostProtection {
-		t.Fatal("Load() should disable MCP localhost protection for a public domain")
-	}
-}
-
-func TestLoadFlagsOverrideEnvironmentAndLocalDomainKeepsProtection(t *testing.T) {
-	oldCommandLine, oldArgs := flag.CommandLine, os.Args
-	defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
-	flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
-
-	t.Setenv("ADDR", ":9000")
-	t.Setenv("PROXY_ADDR", ":80,:3000")
-	t.Setenv("BASE_DOMAIN", "api.example.test")
-	t.Setenv("LOG_FILE", "opensbx.log")
-	t.Setenv("API_KEY", "")
-	os.Args = []string{"config-test", "-addr", ":7777", "-base-domain", "dev.localhost", "-runtime", "container"}
-
-	got := Load()
-	if got.Addr != ":7777" || got.BaseDomain != "dev.localhost" {
-		t.Fatalf("Load() did not honor flags: %+v", got)
-	}
-	if got.Runtime != "container" {
-		t.Fatalf("Load() runtime = %q, want explicit flag container", got.Runtime)
-	}
-	if got.MCPDisableLocalhostProtection {
-		t.Fatal("Load() should keep localhost protection for local domains")
-	}
-}
-
-func TestLoadUsesDefaultsWhenEnvironmentIsUnset(t *testing.T) {
-	oldCommandLine, oldArgs := flag.CommandLine, os.Args
-	defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
-	flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
-	os.Args = []string{"config-test"}
-	for _, key := range []string{"ADDR", "API_KEY", "PROXY_ADDR", "BASE_DOMAIN", "LOG_FILE"} {
-		t.Setenv(key, "")
-	}
-	got := Load()
-	if got.Addr != ":8080" || got.BaseDomain != "localhost" || got.LogFile != "opensbx.log" || got.APIKey != "" {
-		t.Fatalf("Load() default fields = %+v", got)
-	}
-	if !reflect.DeepEqual(got.ProxyAddrs, []string{":80", ":3000"}) || got.MCPDisableLocalhostProtection {
-		t.Fatalf("Load() default proxy/protection fields = %+v", got)
-	}
-}
-
-func TestNormalizeBaseDomain(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
+func TestValidateAddrRequiresLoopbackIPAndValidPort(t *testing.T) {
+	for _, tc := range []struct {
+		addr  string
+		valid bool
 	}{
-		{name: "empty", in: "", want: "localhost"},
-		{name: "whitespace", in: "   ", want: "localhost"},
-		{name: "keeps domain", in: "opensbx.run", want: "opensbx.run"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeBaseDomain(tt.in)
-			if got != tt.want {
-				t.Fatalf("normalizeBaseDomain(%q) = %q, want %q", tt.in, got, tt.want)
+		{"127.0.0.1:8080", true}, {"[::1]:0", true}, {"localhost:8080", false},
+		{"0.0.0.0:8080", false}, {"192.168.1.2:8080", false}, {"127.0.0.1:65536", false},
+		{"127.0.0.1", false},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			err := ValidateAddr(tc.addr)
+			if (err == nil) != tc.valid {
+				t.Fatalf("ValidateAddr(%q) error = %v, want valid=%v", tc.addr, err, tc.valid)
 			}
 		})
 	}
 }
 
-func TestIsLocalBaseDomain(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want bool
-	}{
-		{name: "localhost", in: "localhost", want: true},
-		{name: "sub localhost", in: "dev.localhost", want: true},
-		{name: "ipv4 loopback", in: "127.0.0.1", want: true},
-		{name: "ipv6 loopback", in: "::1", want: true},
-		{name: "public domain", in: "opensbx.run", want: false},
+func TestLoadAppliesExplicitFlagsAndEnvironmentDefaults(t *testing.T) {
+	oldCommandLine, oldArgs := flag.CommandLine, os.Args
+	defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
+	flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
+	os.Args = []string{"config-test", "-addr", "127.0.0.1:9099", "-runtime", "docker", "-data-dir", filepath.Join(t.TempDir(), "explicit"), "-legacy-db", filepath.Join(t.TempDir(), "sandbox.db"), "-log-file", "custom.log"}
+	t.Setenv("ADDR", "127.0.0.1:8088")
+	t.Setenv("LOG_FILE", "env.log")
+	t.Setenv("API_KEY", "local-secret")
+	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
+		old, had := os.LookupEnv(key)
+		_ = os.Unsetenv(key)
+		t.Cleanup(func() { if had { _ = os.Setenv(key, old) } else { _ = os.Unsetenv(key) } })
 	}
+	got := Load()
+	if got.Addr != "127.0.0.1:9099" || got.Runtime != "docker" || got.LegacyDB == "" || got.LogFile != "custom.log" || got.APIKey != "local-secret" { t.Fatalf("explicit config=%+v", got) }
+	if got.DataDir != filepath.Join(filepath.Dir(got.LegacyDB), "explicit") && !strings.HasSuffix(got.DataDir, "explicit") { t.Fatalf("data directory flag ignored: %q", got.DataDir) }
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isLocalBaseDomain(tt.in)
-			if got != tt.want {
-				t.Fatalf("isLocalBaseDomain(%q) = %v, want %v", tt.in, got, tt.want)
+func TestDefaultDataDirUsesExplicitLocalOverride(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "user-owned-state")
+	t.Setenv("OPENSBX_DATA_DIR", custom)
+	if got := DefaultDataDir(); got != custom { t.Fatalf("DefaultDataDir()=%q want %q", got, custom) }
+}
+
+func TestLoadUsesLoopbackDefaultsAndNormalizedLogFile(t *testing.T) {
+	oldCommandLine, oldArgs := flag.CommandLine, os.Args
+	defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
+	flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
+	os.Args = []string{"config-test"}
+	for _, key := range []string{"ADDR", "API_KEY", "LOG_FILE", "OPENSBX_DATA_DIR", "PROXY_ADDR", "BASE_DOMAIN"} {
+		previous, existed := os.LookupEnv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if existed {
+				_ = os.Setenv(key, previous)
+			} else {
+				_ = os.Unsetenv(key)
 			}
+		})
+	}
+	got := Load()
+	if got.Addr != "127.0.0.1:8080" || got.APIKey != "" || got.LogFile != "opensbx.log" {
+		t.Fatalf("unexpected defaults: %+v", got)
+	}
+}
+
+func TestLoadRejectsRetiredProxyAndDomainEnvironment(t *testing.T) {
+	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
+		t.Run(key, func(t *testing.T) {
+			oldCommandLine, oldArgs := flag.CommandLine, os.Args
+			defer func() { flag.CommandLine, os.Args = oldCommandLine, oldArgs }()
+			flag.CommandLine = flag.NewFlagSet("config-test", flag.ContinueOnError)
+			os.Args = []string{"config-test"}
+			t.Setenv(key, "legacy-value")
+			defer func() {
+				if recover() == nil {
+					t.Fatal("Load() did not reject retired setting")
+				}
+			}()
+			Load()
 		})
 	}
 }
 
 func TestNormalizeLogFile(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "empty", in: "", want: "opensbx.log"},
-		{name: "whitespace", in: "   ", want: "opensbx.log"},
-		{name: "keeps custom path", in: "logs/server.log", want: "logs/server.log"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeLogFile(tt.in)
-			if got != tt.want {
-				t.Fatalf("normalizeLogFile(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
+	for _, tc := range []struct{ in, want string }{{"", "opensbx.log"}, {"   ", "opensbx.log"}, {" logs/server.log ", "logs/server.log"}} {
+		if got := normalizeLogFile(tc.in); got != tc.want {
+			t.Errorf("normalizeLogFile(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

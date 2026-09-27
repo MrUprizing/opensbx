@@ -1,97 +1,39 @@
-# Reverse Proxy
+# One local HTTP listener
 
-Access sandbox services via subdomain (`my-app.localhost`) instead of raw Docker ports.
+The management API and sandbox applications share `127.0.0.1:8080` by default.
+There is no second proxy listener or configurable public domain.
 
-Container ports are bound to `127.0.0.1` only — they are **not** accessible directly. All traffic must go through the reverse proxy.
+| Original request Host | Destination |
+| --- | --- |
+| `localhost:<port>` or `127.0.0.1:<port>` | REST/MCP, health, Swagger |
+| `[::1]:<port>` when bound to IPv6 loopback | Management |
+| `<sandbox>.localhost:<port>` | Owned sandbox's published main TCP port |
+| Other, nested, malformed, or mismatched-port Host | Rejected |
 
-## Configuration
+Host dispatch happens before path routing. `/v1/sandboxes`, `/v1/mcp`,
+`/swagger/index.html` and every other path on a sandbox host go to the sandbox,
+never to management. Unknown sandbox names fail without management fallback.
+`X-Forwarded-Host` is not trusted. WebSocket upgrades, SSE and relative application
+URLs use the existing streaming reverse proxy. Apps receive the original Host.
 
-| Env Variable  | Flag           | Default       | Description                                          |
-|---------------|----------------|---------------|------------------------------------------------------|
-| `PROXY_ADDR`  | `-proxy-addr`  | `:80,:3000`   | Comma-separated proxy listen addresses               |
-| `BASE_DOMAIN` | `-base-domain` | `localhost`   | Base domain for subdomain routing                    |
+On control hosts, browser requests with an Origin must match the canonical
+request host, HTTP scheme and actual port exactly. Foreign, sandbox and `null`
+origins are rejected with 403 before body parsing, including simple HTML forms.
+Cross-site/same-site Fetch Metadata is also rejected. Origin-less CLI/MCP clients
+continue to work; Bearer authentication, when configured, is still required.
+This is server-side CSRF protection, not a CORS-only restriction. Sandbox app
+traffic and its WebSocket/SSE connections keep their own origin semantics.
 
-The **first** address in `PROXY_ADDR` is used to generate sandbox URLs. If it's `:80` or `:443`, the URL omits the port (e.g. `http://my-app.localhost`). Otherwise the port is included (e.g. `http://my-app.localhost:3000`).
-
-## Creating a Sandbox with Proxy
-
-Include `ports` in the create request. The first port becomes the default for proxy routing:
-
-```bash
-curl -X POST localhost:8080/v1/sandboxes \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image": "node:22",
-    "ports": ["3000", "8080"]
-  }'
+```sh
+opensbx -addr 127.0.0.1:8080 -runtime docker
+curl http://localhost:8080/v1/health
+curl http://<sandbox>.localhost:8080/
 ```
 
-Response includes the auto-generated name and proxy URL:
+The returned URL uses the actual bound port, including when `-addr 127.0.0.1:0`
+selects a free port. Native sandbox publications remain on `127.0.0.1`; the first
+requested port is the main route, and a UDP-only/non-published main port does not
+produce an HTTP URL. Local hostname resolution must support `*.localhost` (as
+modern browsers do); for diagnostics use curl's `--resolve` for the chosen host.
 
-```json
-{
-  "id": "a1b2c3d4...",
-  "name": "eager-turing",
-  "ports": ["3000/tcp", "8080/tcp"],
-  "url": "http://eager-turing.localhost"
-}
-```
-
-Sandboxes can also be created without any ports — the proxy URL is omitted in that case.
-
-## Local Development
-
-`*.localhost` resolves to `127.0.0.1` in modern browsers (RFC 6761). No DNS setup needed.
-
-```bash
-# Default: proxy listens on :80 and :3000
-go run ./cmd/api
-
-# API   → localhost:8080
-# Proxy → *.localhost (port 80) and *.localhost:3000
-```
-
-Open `http://eager-turing.localhost` in your browser (use the name from the create response).
-
-> **Note:** Port 80 requires root/sudo. For development without elevated privileges:
->
-> ```bash
-> PROXY_ADDR=:3000 go run ./cmd/api
-> ```
-
-### If `*.localhost` doesn't resolve
-
-Use dnsmasq for automatic wildcard resolution:
-
-```bash
-brew install dnsmasq
-echo "address=/localhost/127.0.0.1" >> $(brew --prefix)/etc/dnsmasq.conf
-sudo brew services start dnsmasq
-sudo mkdir -p /etc/resolver
-echo "nameserver 127.0.0.1" | sudo tee /etc/resolver/localhost
-```
-
-## Production
-
-### 1. DNS
-
-Create a wildcard A record pointing to your server:
-
-```
-*.sandbox.example.com  →  A  →  YOUR_SERVER_IP
-```
-
-### 2. Run
-
-```bash
-PROXY_ADDR=:80 \
-BASE_DOMAIN=sandbox.example.com \
-API_KEY=your-secret \
-go run ./cmd/api
-```
-
-Sandboxes are now accessible at `http://<name>.sandbox.example.com`.
-
-### 3. HTTPS (optional)
-
-Place a TLS-terminating reverse proxy in front of the proxy server with a wildcard certificate for `*.sandbox.example.com`. The opensbx proxy handles plain HTTP behind it.
+Old proxy/domain options now fail explicitly. See [migration](deployment.md).

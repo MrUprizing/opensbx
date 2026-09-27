@@ -3,6 +3,8 @@ package proxy
 import (
 	"fmt"
 	"net/url"
+	"strconv"
+	"strings"
 
 	"opensbx/internal/database"
 )
@@ -42,19 +44,33 @@ func (s *Server) resolve(name string) (*url.URL, error) {
 // If Port is not set but there is exactly one port in the map, it uses that.
 func resolveHostPort(sb *database.Sandbox) (string, error) {
 	if sb.Port != "" {
+		if !strings.HasSuffix(sb.Port, "/tcp") {
+			return "", fmt.Errorf("main port is not TCP")
+		}
 		hp, ok := sb.Ports[sb.Port]
 		if !ok {
 			return "", fmt.Errorf("port %q not found in port map %v", sb.Port, sb.Ports)
 		}
-		return hp, nil
+		return checkedHostPort(hp)
 	}
 
 	// Fallback: use the only port if there is exactly one.
 	if len(sb.Ports) == 1 {
-		for _, hp := range sb.Ports {
-			return hp, nil
+		for port, hp := range sb.Ports {
+			if !strings.HasSuffix(port, "/tcp") {
+				return "", fmt.Errorf("main port is not TCP")
+			}
+			return checkedHostPort(hp)
 		}
 	}
 
 	return "", fmt.Errorf("no port configured and sandbox has %d ports", len(sb.Ports))
+}
+
+func checkedHostPort(port string) (string, error) {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("invalid published port")
+	}
+	return strconv.Itoa(n), nil
 }

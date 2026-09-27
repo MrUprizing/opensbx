@@ -66,7 +66,7 @@ func TestWaitCommandStreamsInitialAndFinalStatus(t *testing.T) {
 }
 
 func TestMCPHandlerCanBeConstructedWithoutDockerIO(t *testing.T) {
-	h := api.NewMCPHandler(&stub{}, "localhost", ":3000", false)
+	h := api.NewMCPHandler(&domainStub{dto: &stub{}})
 	if h == nil {
 		t.Fatal("NewMCPHandler() returned nil")
 	}

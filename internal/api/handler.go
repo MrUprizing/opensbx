@@ -8,38 +8,30 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"opensbx/internal/sandbox"
 	"opensbx/models"
 )
 
 // Handler holds dependencies for all API handlers.
 type Handler struct {
-	docker     DockerClient
-	baseDomain string // base domain for proxy URLs (e.g. "localhost")
-	proxyAddr  string // proxy listen address (e.g. ":3000")
+	app *facade
 }
 
-// New creates a Handler with the given Docker client and proxy config.
-func New(d DockerClient, baseDomain, proxyAddr string) *Handler {
-	return &Handler{docker: d, baseDomain: baseDomain, proxyAddr: proxyAddr}
-}
-
-// proxyURL builds the public URL for a named sandbox.
-// Local domains return http URLs and keep the proxy port when needed.
-// Public domains return https URLs without exposing internal proxy ports.
-func (h *Handler) proxyURL(name string) string {
-	return buildSandboxURL(name, h.baseDomain, h.proxyAddr)
+// New creates a transport backed by the application facade.
+func New(d sandbox.Application) *Handler {
+	return &Handler{app: &facade{app: d}}
 }
 
 // healthCheck handles GET /health.
 // @Summary      Health check
-// @Description  Returns the health status of the API and its Docker daemon connection.
+// @Description  Returns the health status of the API and its selected local runtime.
 // @Tags         system
 // @Produce      json
 // @Success      200  {object}  map[string]string  "status: healthy"
 // @Failure      503  {object}  map[string]string  "status: unhealthy"
 // @Router       /health [get]
 func (h *Handler) healthCheck(c *gin.Context) {
-	if err := h.docker.Ping(c.Request.Context()); err != nil {
+	if err := h.app.Ping(c.Request.Context()); err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"status": "unhealthy",
 			"error":  err.Error(),
@@ -59,14 +51,10 @@ func (h *Handler) healthCheck(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes [get]
 func (h *Handler) listSandboxes(c *gin.Context) {
-	items, err := h.docker.List(c.Request.Context())
+	items, err := h.app.List(c.Request.Context())
 	if err != nil {
 		internalError(c, err)
 		return
-	}
-
-	for i := range items {
-		items[i].URL = h.proxyURL(items[i].Name)
 	}
 
 	if len(items) == 0 {
@@ -79,7 +67,7 @@ func (h *Handler) listSandboxes(c *gin.Context) {
 
 // createSandbox handles POST /v1/sandboxes.
 // @Summary      Create a sandbox
-// @Description  Create and start a new Docker container. Returns its ID and assigned host ports.
+// @Description  Create an owned sandbox from a prepared local OCI image. Returns its ID and assigned host ports.
 // @Tags         sandboxes
 // @Accept       json
 // @Produce      json
@@ -119,13 +107,12 @@ func (h *Handler) createSandbox(c *gin.Context) {
 		}
 	}
 
-	result, err := h.docker.Create(c.Request.Context(), req)
+	result, err := h.app.Create(c.Request.Context(), req)
 	if err != nil {
 		internalError(c, err)
 		return
 	}
 
-	result.URL = h.proxyURL(result.Name)
 	c.JSON(http.StatusCreated, result)
 }
 
@@ -141,13 +128,12 @@ func (h *Handler) createSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id} [get]
 func (h *Handler) getSandbox(c *gin.Context) {
-	info, err := h.docker.Inspect(c.Request.Context(), c.Param("id"))
+	info, err := h.app.Inspect(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
 	}
 
-	info.URL = h.proxyURL(info.Name)
 	c.JSON(http.StatusOK, info)
 }
 
@@ -163,7 +149,7 @@ func (h *Handler) getSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/start [post]
 func (h *Handler) startSandbox(c *gin.Context) {
-	result, err := h.docker.Start(c.Request.Context(), c.Param("id"))
+	result, err := h.app.Start(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -184,7 +170,7 @@ func (h *Handler) startSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/stop [post]
 func (h *Handler) stopSandbox(c *gin.Context) {
-	if err := h.docker.Stop(c.Request.Context(), c.Param("id")); err != nil {
+	if err := h.app.Stop(c.Request.Context(), c.Param("id")); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -204,7 +190,7 @@ func (h *Handler) stopSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/restart [post]
 func (h *Handler) restartSandbox(c *gin.Context) {
-	result, err := h.docker.Restart(c.Request.Context(), c.Param("id"))
+	result, err := h.app.Restart(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -224,7 +210,7 @@ func (h *Handler) restartSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id} [delete]
 func (h *Handler) deleteSandbox(c *gin.Context) {
-	if err := h.docker.Remove(c.Request.Context(), c.Param("id")); err != nil {
+	if err := h.app.Remove(c.Request.Context(), c.Param("id")); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -244,7 +230,7 @@ func (h *Handler) deleteSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/stats [get]
 func (h *Handler) getStats(c *gin.Context) {
-	stats, err := h.docker.Stats(c.Request.Context(), c.Param("id"))
+	stats, err := h.app.Stats(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -276,7 +262,7 @@ func (h *Handler) execCommand(c *gin.Context) {
 		return
 	}
 
-	cmd, err := h.docker.ExecCommand(c.Request.Context(), c.Param("id"), req)
+	cmd, err := h.app.ExecCommand(c.Request.Context(), c.Param("id"), req)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -303,7 +289,7 @@ func (h *Handler) execCommand(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/cmd [get]
 func (h *Handler) listCommands(c *gin.Context) {
-	cmds, err := h.docker.ListCommands(c.Request.Context(), c.Param("id"))
+	cmds, err := h.app.ListCommands(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -325,7 +311,7 @@ func (h *Handler) listCommands(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/cmd/{cmdId} [get]
 func (h *Handler) getCommand(c *gin.Context) {
-	cmd, err := h.docker.GetCommand(c.Request.Context(), c.Param("id"), c.Param("cmdId"))
+	cmd, err := h.app.GetCommand(c.Request.Context(), c.Param("id"), c.Param("cmdId"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -363,7 +349,7 @@ func (h *Handler) killCommand(c *gin.Context) {
 		return
 	}
 
-	cmd, err := h.docker.KillCommand(c.Request.Context(), c.Param("id"), c.Param("cmdId"), req.Signal)
+	cmd, err := h.app.KillCommand(c.Request.Context(), c.Param("id"), c.Param("cmdId"), req.Signal)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -397,7 +383,7 @@ func (h *Handler) getCommandLogs(c *gin.Context) {
 	}
 
 	// Default: JSON snapshot.
-	logs, err := h.docker.GetCommandLogs(c.Request.Context(), sandboxID, cmdID)
+	logs, err := h.app.GetCommandLogs(c.Request.Context(), sandboxID, cmdID)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -408,7 +394,7 @@ func (h *Handler) getCommandLogs(c *gin.Context) {
 
 // streamLogs streams stdout/stderr as ND-JSON lines until the command finishes.
 func (h *Handler) streamLogs(c *gin.Context, sandboxID, cmdID string) {
-	stdoutR, stderrR, err := h.docker.StreamCommandLogs(
+	stdoutR, stderrR, err := h.app.StreamCommandLogs(
 		c.Request.Context(), sandboxID, cmdID,
 	)
 	if err != nil {
@@ -462,7 +448,7 @@ func (h *Handler) streamWait(c *gin.Context, sandboxID, cmdID string) {
 	enc := json.NewEncoder(c.Writer)
 
 	// Emit initial status.
-	cmd, err := h.docker.GetCommand(c.Request.Context(), sandboxID, cmdID)
+	cmd, err := h.app.GetCommand(c.Request.Context(), sandboxID, cmdID)
 	if err != nil {
 		return
 	}
@@ -472,7 +458,7 @@ func (h *Handler) streamWait(c *gin.Context, sandboxID, cmdID string) {
 	}
 
 	// Wait for completion.
-	cmd, err = h.docker.WaitCommand(c.Request.Context(), sandboxID, cmdID)
+	cmd, err = h.app.WaitCommand(c.Request.Context(), sandboxID, cmdID)
 	if err != nil {
 		return
 	}
@@ -502,7 +488,7 @@ func (h *Handler) readFile(c *gin.Context) {
 		return
 	}
 
-	content, err := h.docker.ReadFile(c.Request.Context(), c.Param("id"), path)
+	content, err := h.app.ReadFile(c.Request.Context(), c.Param("id"), path)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -539,7 +525,7 @@ func (h *Handler) writeFile(c *gin.Context) {
 		return
 	}
 
-	if err := h.docker.WriteFile(c.Request.Context(), c.Param("id"), path, req.Content); err != nil {
+	if err := h.app.WriteFile(c.Request.Context(), c.Param("id"), path, req.Content); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -566,7 +552,7 @@ func (h *Handler) deleteFile(c *gin.Context) {
 		return
 	}
 
-	if err := h.docker.DeleteFile(c.Request.Context(), c.Param("id"), path); err != nil {
+	if err := h.app.DeleteFile(c.Request.Context(), c.Param("id"), path); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -589,7 +575,7 @@ func (h *Handler) deleteFile(c *gin.Context) {
 func (h *Handler) listDir(c *gin.Context) {
 	path := c.DefaultQuery("path", "/")
 
-	output, err := h.docker.ListDir(c.Request.Context(), c.Param("id"), path)
+	output, err := h.app.ListDir(c.Request.Context(), c.Param("id"), path)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -610,7 +596,7 @@ func (h *Handler) listDir(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/pause [post]
 func (h *Handler) pauseSandbox(c *gin.Context) {
-	if err := h.docker.Pause(c.Request.Context(), c.Param("id")); err != nil {
+	if err := h.app.Pause(c.Request.Context(), c.Param("id")); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -630,7 +616,7 @@ func (h *Handler) pauseSandbox(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/resume [post]
 func (h *Handler) resumeSandbox(c *gin.Context) {
-	if err := h.docker.Resume(c.Request.Context(), c.Param("id")); err != nil {
+	if err := h.app.Resume(c.Request.Context(), c.Param("id")); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -664,7 +650,7 @@ func (h *Handler) renewExpiration(c *gin.Context) {
 		return
 	}
 
-	if err := h.docker.RenewExpiration(c.Request.Context(), c.Param("id"), req.Timeout); err != nil {
+	if err := h.app.RenewExpiration(c.Request.Context(), c.Param("id"), req.Timeout); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -684,7 +670,7 @@ func (h *Handler) renewExpiration(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /sandboxes/{id}/network [get]
 func (h *Handler) getSandboxNetwork(c *gin.Context) {
-	network, err := h.docker.GetNetwork(c.Request.Context(), c.Param("id"))
+	network, err := h.app.GetNetwork(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -694,8 +680,8 @@ func (h *Handler) getSandboxNetwork(c *gin.Context) {
 }
 
 // pullImage handles POST /v1/images/pull.
-// @Summary      Pull a Docker image
-// @Description  Downloads a Docker image from a registry to use in sandboxes.
+// @Summary      Pull an OCI image
+// @Description  Explicitly prepare the native platform in the OpenSBX-owned OCI catalog.
 // @Tags         images
 // @Accept       json
 // @Produce      json
@@ -712,7 +698,7 @@ func (h *Handler) pullImage(c *gin.Context) {
 		return
 	}
 
-	if err := h.docker.PullImage(c.Request.Context(), req.Image); err != nil {
+	if err := h.app.PullImage(c.Request.Context(), req.Image); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -722,10 +708,10 @@ func (h *Handler) pullImage(c *gin.Context) {
 
 // deleteImage handles DELETE /v1/images/:id.
 // @Summary      Delete a local image
-// @Description  Removes a Docker image from the local store. Use force=true if containers reference it.
+// @Description  Unreference a managed image without deleting native images or pinned blobs. Force ignores a missing reference.
 // @Tags         images
 // @Param        id     path      string  true   "Image ID or name:tag"
-// @Param        force  query     bool    false  "Force removal even if referenced by containers"
+// @Param        force  query     bool    false  "Ignore a missing catalog reference; retain native images and pinned blobs"
 // @Success      204  "No Content"
 // @Failure      404  {object}  ErrorResponse
 // @Failure      500  {object}  ErrorResponse
@@ -733,7 +719,7 @@ func (h *Handler) pullImage(c *gin.Context) {
 // @Router       /images/{id} [delete]
 func (h *Handler) deleteImage(c *gin.Context) {
 	force := c.Query("force") == "true"
-	if err := h.docker.RemoveImage(c.Request.Context(), c.Param("id"), force); err != nil {
+	if err := h.app.RemoveImage(c.Request.Context(), c.Param("id"), force); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -743,7 +729,7 @@ func (h *Handler) deleteImage(c *gin.Context) {
 
 // getImage handles GET /v1/images/:id.
 // @Summary      Inspect an image
-// @Description  Returns details for a single local Docker image.
+// @Description  Returns a managed image with its canonical OCI root descriptor digest as ID.
 // @Tags         images
 // @Produce      json
 // @Param        id   path      string  true  "Image ID or name:tag"
@@ -753,7 +739,7 @@ func (h *Handler) deleteImage(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /images/{id} [get]
 func (h *Handler) getImage(c *gin.Context) {
-	detail, err := h.docker.InspectImage(c.Request.Context(), c.Param("id"))
+	detail, err := h.app.InspectImage(c.Request.Context(), c.Param("id"))
 	if err != nil {
 		internalError(c, err)
 		return
@@ -764,7 +750,7 @@ func (h *Handler) getImage(c *gin.Context) {
 
 // listImages handles GET /v1/images.
 // @Summary      List local images
-// @Description  Returns all Docker images available locally.
+// @Description  Returns OpenSBX-managed images, not the native runtime inventory.
 // @Tags         images
 // @Produce      json
 // @Success      200  {object}  map[string]interface{}  "List of images"
@@ -772,7 +758,7 @@ func (h *Handler) getImage(c *gin.Context) {
 // @Security     ApiKeyAuth
 // @Router       /images [get]
 func (h *Handler) listImages(c *gin.Context) {
-	images, err := h.docker.ListImages(c.Request.Context())
+	images, err := h.app.ListImages(c.Request.Context())
 	if err != nil {
 		internalError(c, err)
 		return

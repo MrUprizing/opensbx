@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"opensbx/internal/api"
-	"opensbx/internal/docker"
+	"opensbx/internal/sandbox"
 	"opensbx/models"
 )
 
@@ -35,7 +35,7 @@ func TestFileHandlersPropagateBackendErrors(t *testing.T) {
 			status              int
 		}{
 			{"daemon", "INTERNAL_ERROR", "daemon unavailable", errors.New("daemon unavailable"), http.StatusInternalServerError},
-			{"missing sandbox", "NOT_FOUND", "sandbox not found", fmt.Errorf("lookup: %w", docker.ErrNotFound), http.StatusNotFound},
+			{"missing sandbox", "NOT_FOUND", "sandbox not found", fmt.Errorf("lookup: %w", sandbox.ErrNotFound), http.StatusNotFound},
 			{"deadline", "TIMEOUT", "operation timed out", fmt.Errorf("execution: %w", context.DeadlineExceeded), http.StatusRequestTimeout},
 		} {
 			t.Run(operation.name+"/"+failure.name, func(t *testing.T) {

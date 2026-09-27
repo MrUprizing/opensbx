@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
+	"opensbx/internal/sandbox"
 )
 
 func TestDeleteAndListFileOperationsUseFixedScriptsAndReturnGuestErrors(t *testing.T) {
@@ -163,7 +163,7 @@ func TestStatsRevalidatesSandboxStateAfterSampling(t *testing.T) {
 		name string
 		want error
 	}{
-		{name: "stopped while sampling", want: docker.ErrNotRunning},
+		{name: "stopped while sampling", want: sandbox.ErrNotRunning},
 		{name: "restarted while sampling"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

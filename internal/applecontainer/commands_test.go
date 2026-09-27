@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 type controlledProcess struct {
@@ -95,11 +95,11 @@ func TestKillCommandTargetsOnlySelectedIdenticalCommandAndUsesGuestIdentity(t *t
 	if err := repo.Save(database.Sandbox{ID: sandbox, Name: sandbox, Image: "node:24"}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "sleep", Args: []string{"same argument"}})
+	first, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "sleep", Args: []string{"same argument"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "sleep", Args: []string{"same argument"}})
+	second, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "sleep", Args: []string{"same argument"}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,7 @@ const docTemplate = `{
     "paths": {
         "/health": {
             "get": {
-                "description": "Returns the health status of the API and its Docker daemon connection.",
+                "description": "Returns the health status of the API and its selected local runtime.",
                 "produces": [
                     "application/json"
                 ],
@@ -54,7 +54,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Returns all Docker images available locally.",
+                "description": "Returns OpenSBX-managed images, not the native runtime inventory.",
                 "produces": [
                     "application/json"
                 ],
@@ -86,7 +86,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Downloads a Docker image from a registry to use in sandboxes.",
+                "description": "Explicitly prepare the native platform in the OpenSBX-owned OCI catalog.",
                 "consumes": [
                     "application/json"
                 ],
@@ -96,7 +96,7 @@ const docTemplate = `{
                 "tags": [
                     "images"
                 ],
-                "summary": "Pull a Docker image",
+                "summary": "Pull an OCI image",
                 "parameters": [
                     {
                         "description": "Image to pull",
@@ -137,7 +137,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Returns details for a single local Docker image.",
+                "description": "Returns a managed image with its canonical OCI root descriptor digest as ID.",
                 "produces": [
                     "application/json"
                 ],
@@ -181,7 +181,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Removes a Docker image from the local store. Use force=true if containers reference it.",
+                "description": "Unreference a managed image without deleting native images or pinned blobs. Force ignores a missing reference.",
                 "tags": [
                     "images"
                 ],
@@ -196,7 +196,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "boolean",
-                        "description": "Force removal even if referenced by containers",
+                        "description": "Ignore a missing catalog reference; retain native images and pinned blobs",
                         "name": "force",
                         "in": "query"
                     }
@@ -257,7 +257,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Create and start a new Docker container. Returns its ID and assigned host ports.",
+                "description": "Create an owned sandbox from a prepared local OCI image. Returns its ID and assigned host ports.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1745,7 +1745,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "ports_map": {
-                    "description": "map of container port -\u003e docker host port",
+                    "description": "map of guest port -\u003e loopback host port",
                     "type": "object",
                     "additionalProperties": {
                         "type": "string"

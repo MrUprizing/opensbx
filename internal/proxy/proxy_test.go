@@ -15,50 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestExtractSubdomain_Localhost(t *testing.T) {
-	s := &Server{baseDomain: "localhost"}
-
-	tests := []struct {
-		host string
-		want string
-	}{
-		{"mi-app.localhost:3000", "mi-app"},
-		{"mi-app.localhost", "mi-app"},
-		{"localhost:3000", ""},
-		{"localhost", ""},
-		{"nested.sub.localhost", ""},
-		{"mi-app.other.com", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.host, func(t *testing.T) {
-			got := s.extractSubdomain(tt.host)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestExtractSubdomain_Production(t *testing.T) {
-	s := &Server{baseDomain: "sandbox.example.com"}
-
-	tests := []struct {
-		host string
-		want string
-	}{
-		{"mi-app.sandbox.example.com", "mi-app"},
-		{"mi-app.sandbox.example.com:80", "mi-app"},
-		{"sandbox.example.com", ""},
-		{"mi-app.localhost", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.host, func(t *testing.T) {
-			got := s.extractSubdomain(tt.host)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
 func TestResolveHostPort(t *testing.T) {
 	// port set and present in port map
 	sb := &database.Sandbox{
@@ -129,7 +85,7 @@ func TestRouteCache(t *testing.T) {
 }
 
 func TestProxy_NoSubdomain(t *testing.T) {
-	s := New("localhost", nil)
+	s := New(nil)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -147,7 +103,7 @@ func TestProxy_SandboxNotFound(t *testing.T) {
 	db := database.New(":memory:")
 	repo := database.NewRepository(db)
 
-	s := New("localhost", repo)
+	s := New(repo)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -183,7 +139,7 @@ func TestProxy_EndToEnd(t *testing.T) {
 	})
 
 	// Create proxy server.
-	s := New("localhost", repo)
+	s := New(repo)
 	proxySrv := httptest.NewServer(s.Handler())
 	defer proxySrv.Close()
 
@@ -225,7 +181,7 @@ func TestProxy_CacheInvalidation(t *testing.T) {
 		Port:  "3000/tcp",
 	})
 
-	s := New("localhost", repo)
+	s := New(repo)
 	proxySrv := httptest.NewServer(s.Handler())
 	defer proxySrv.Close()
 
@@ -279,7 +235,7 @@ func TestProxy_UpgradeHeaderForwarding(t *testing.T) {
 		Port:  "3000/tcp",
 	})
 
-	s := New("localhost", repo)
+	s := New(repo)
 	proxySrv := httptest.NewServer(s.Handler())
 	defer proxySrv.Close()
 

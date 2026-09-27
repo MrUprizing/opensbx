@@ -1,4 +1,4 @@
-package docker
+package sandbox
 
 import "errors"
 
@@ -28,3 +28,6 @@ var ErrCommandNotFound = errors.New("command not found")
 
 // ErrCommandFinished is returned when trying to kill a command that has already exited.
 var ErrCommandFinished = errors.New("command has already finished")
+
+var ErrUnsupported = errors.New("runtime capability is unsupported")
+var ErrInvalidInput = errors.New("invalid input")

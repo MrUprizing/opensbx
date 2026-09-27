@@ -2,93 +2,37 @@
 
 ## Prerequisites
 
-- Docker (default), or [Apple container on Apple Silicon macOS](apple-container.md)
-- Go when building from source (not required to run a release binary)
-- Optional for hardened runtime: gVisor (`runsc`)
+- Go **1.25.6 or newer** to build from source; not needed for release binaries.
+- A running local Docker daemon, or [Apple container 1.4.1](apple-container.md)
+  on supported Apple Silicon macOS. OpenSBX does not install/start a runtime.
+- Image catalog/import/export commands require neither runtime.
 
-## Quick install (recommended)
+Install the release binary:
 
-Install latest release binary:
-
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
 ```
 
-Run locally:
+Or build this checkout (release binaries may predate the redesign):
 
-```bash
-opensbx
+```sh
+go build -o opensbx ./cmd/api
+./opensbx image help
+./opensbx -runtime docker -addr 127.0.0.1:8080
 ```
 
-Health check:
+Read-only prerequisite checks:
 
-```bash
-curl http://127.0.0.1:8080/v1/health
-```
-
-## Docker setup
-
-For the native Apple backend, use the requirements and launch instructions in
-[Apple container](apple-container.md). Opensbx never installs, upgrades, or
-starts that runtime automatically.
-
-### macOS
-
-Install Docker Desktop, then verify:
-
-```bash
-docker --version
+```sh
+docker version
 docker info
+# On the Apple backend:
+container system status --format json
 ```
 
-### Ubuntu
+Obtain the host runtime separately from its official distribution. OpenSBX only
+accepts local Docker endpoints, not remote daemon URLs. There is no gVisor backend
+or automatic runtime configuration. Only Docker and Apple container are in scope.
 
-```bash
-sudo apt update
-sudo apt install -y docker.io
-sudo systemctl enable docker
-sudo systemctl start docker
-docker --version
-```
-
-## gVisor setup (optional, Ubuntu)
-
-Use this if you want stronger isolation for untrusted workloads.
-
-```bash
-curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
-sudo apt update
-sudo apt install -y runsc
-```
-
-Configure Docker runtime:
-
-```bash
-RUNSC_PATH=$(command -v runsc)
-sudo mkdir -p /etc/docker
-cat <<EOF | sudo tee /etc/docker/daemon.json
-{
-  "default-runtime": "runsc",
-  "runtimes": {
-    "runsc": {
-      "path": "${RUNSC_PATH}"
-    }
-  }
-}
-EOF
-sudo systemctl restart docker
-```
-
-Validate:
-
-```bash
-docker info | grep "Default Runtime"
-docker run --rm hello-world
-```
-
-## Next docs
-
-- Deployment with Cloudflare Tunnel: [deployment.md](deployment.md)
-- Releases and tags: [releases.md](releases.md)
-- Testing: [testing.md](testing.md)
+Next: [local usage/migration](deployment.md), [images](images.md),
+[releases](releases.md), [testing](testing.md).

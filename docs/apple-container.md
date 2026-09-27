@@ -24,7 +24,17 @@ Apple requirements:
   a different version fails validation instead of guessing its schema.
 - `container` available on the launching process's PATH. Its absolute executable
   is resolved once. Opensbx does not install/upgrade it or start global services.
-- Locally pulled `linux/arm64` images. Use the existing image-pull API first.
+- Managed `linux/arm64` OCI images. Use the image-pull API or runtime-independent
+  `opensbx image import` first. Native cache images are not automatically adopted.
+- The configured **vminit image must already be available locally**, in addition
+  to the workload. For the validated default configuration this is
+  `ghcr.io/apple/containerization/vminit:0.45.0`. Prepare this trusted runtime
+  dependency explicitly; OpenSBX never downloads it implicitly during Create.
+- A compatible default kernel must already be configured and available locally.
+  Kernel installation/configuration is an explicit Apple runtime setup operation,
+  not an automatic OpenSBX download. Use the runtime's `container system kernel set`
+  workflow with a trusted kernel/archive; consult `container system kernel set --help`
+  for the pinned version's options before preparing the host for offline use.
 - Guest images must provide `/bin/sh`, Linux `/proc`, `sleep infinity`, and basic
   utilities (`mkdir`, `dirname`, `mv`, `cat`, `rm`, `rmdir`, `ls`, and shell `kill`). There is
   no guest agent, host SDK, or runtime compiler requirement.
@@ -52,16 +62,18 @@ gain support from these instructions.
 
 ## Ownership and persistence
 
-Docker continues to use `sandbox.db`. Apple uses `sandbox-container.db` in the
-working directory. Do not rename/copy one database over the other. Use one
-opensbx instance per database; simultaneous instances sharing it are unsupported.
+New execution state uses separate Docker/Apple databases under the common data
+directory. Existing working-directory databases require explicit compatibility
+mode and a backup; see [migration](deployment.md). Public IDs and command history
+are retained. An exclusive DB lock prevents simultaneous service instances.
 
 Sandbox IDs are random `opensbx-<32 hex>` names, also recorded in an ownership
 label. Operations require both the selected repository record and matching live
 ownership label. Listing does not adopt unrelated containers. Shutdown and TTL
 stop only recorded, owned sandboxes. No prune, global stop, or `--all` mutation is
-used. Image operations address the explicit requested image in the user's image
-store, as with Docker; listing images is not restricted to sandbox-owned images.
+used. Image operations use the independent OpenSBX OCI catalog, not the user's
+native image inventory. Native cache import touches only private content-derived
+OpenSBX references; image unreference never deletes native cache images.
 
 TTL defaults to 900 seconds and stops rather than deletes a sandbox. Start and
 restart establish a fresh default TTL; renewal replaces it. Timers and observed
@@ -74,8 +86,8 @@ than being fabricated.
 
 - CPUs default to 1 and must be **whole numbers from 1 through 4**. Fractional
   CPUs are rejected, never rounded. Memory defaults to 1024 MiB, maximum 8192 MiB.
-- **Pause/resume are unsupported**. They return clear backend errors using the
-  existing handler mapping (`500 INTERNAL_ERROR`), not new 501/400 mappings.
+- **Pause/resume and fractional CPUs are unsupported**. The application checks
+  neutral runtime capabilities and returns `400 BAD_REQUEST`, without rounding.
 - Published guest ports must be 2–65535, TCP or UDP, maximum 128 per sandbox.
   Every host publication explicitly binds `127.0.0.1`, never `0.0.0.0`.
 - Host ports are dynamically selected while temporary loopback sockets are held.
@@ -86,15 +98,22 @@ than being fabricated.
 - Start/restart of an existing sandbox never deletes/recreates its filesystem to
   repair a port collision. Such failures are returned to the caller. Proxy
   mappings preserve `guest-port/protocol -> localhost host port`.
-- Images are checked locally before creation; a missing image returns the same
-  image-not-found sentinel as Docker. Apple offers no create `--pull=never`
-  switch: external CLI image deletion between the check and create cannot be
-  coordinated by opensbx. Do not mutate managed resources concurrently outside
-  opensbx. API image deletion and creation are serialized.
-- Apple's image `--force` only ignores missing references; it is not Docker's
-  force-removal behavior. No dependent container or other image tag is deleted
-  to emulate it. A digest with multiple matching references requires an exact
-  tag, avoiding ambiguous deletion. Execution targets the native ARM64 variant.
+- Creation resolves a managed platform manifest before loading its complete local
+  OCI archive. A local `image save` roundtrip verifies manifest/config identity;
+  an import-generated native index is not treated as the source root digest.
+- Apple 1.4.1 has no `--pull=never`, so creation passes
+  `--max-concurrent-downloads 0`. In this pinned version, `ClientImage.fetch`
+  returns verified local content first, and `ClientImage.pull` rejects zero before
+  any registry request: “maximum number of concurrent downloads must be greater
+  than 0”. `Flags.ImageFetch` has no earlier validation. A cache miss therefore
+  fails closed, not with a silent download. This version-specific behavior needs
+  live regression verification whenever the supported Apple version changes.
+- The archive is loaded under the exact content-derived named-digest reference,
+  not a tag later augmented with a digest (which 1.4.1 does not resolve locally).
+  Do not externally mutate owned cache references during creation.
+
+Source contracts: [ClientImage.swift 1.4.1](https://github.com/apple/container/blob/1.4.1/Sources/Services/ContainerAPIService/Client/ClientImage.swift),
+[Flags.swift 1.4.1](https://github.com/apple/container/blob/1.4.1/Sources/Services/ContainerAPIService/Client/Flags.swift).
 
 ## Commands, signals, files, and resource statistics
 
@@ -181,9 +200,8 @@ missing resources remain listed as removed without deleting their history.
 
 ## Testing and validation status
 
-Hermetic tests cover the Apple backend, injected REST/MCP contracts, startup
-preflight, ownership, bounded output, command lifecycle, file scripts, and
-stats/list regressions. Run them without installing or starting a runtime:
+Hermetic tests cover typed domain/adapter boundaries, ownership and recovery,
+bounded output, command lifecycle, file scripts and stats/list regressions:
 
 ```sh
 go test ./... -count=1
@@ -196,30 +214,43 @@ and clock. `runtimechoice.Select` accepts OS, terminal state, context, input and
 output. These permit hermetic JSON, argv, output-bound, time-delta, and lifecycle
 tests without a local daemon. They do **not** prove real CLI/daemon behavior.
 
-**Real Apple runtime validation has not been performed:** the validation host
-has no Apple CLI available, and its Docker daemon is also unavailable. The
-automated Apple smoke test is explicitly opt-in and is not part of the commands
-above. On Apple Silicon macOS 26 or later, with CLI/server **1.4.1** already
-installed and running and `node:25-alpine` already available locally as a
-`linux/arm64` image, run:
+**The Apple 1.4.1 live smoke passed in 36.24 seconds.** The previously missing
+configured vminit was prepared explicitly before the run:
 
 ```sh
-OPENSBX_APPLE_INTEGRATION=1 OPENSBX_APPLE_TEST_IMAGE=node:25-alpine go test -tags appleintegration ./internal/applecontainer -run '^TestAppleRuntimeEndToEnd$' -count=1 -v
+container image pull --platform linux/arm64 --progress plain \
+  ghcr.io/apple/containerization/vminit:0.45.0
 ```
 
-The test does not install software, pull images, or start services. It uses a
-temporary database, generates its own sandbox IDs, and cleans up only those
-exact IDs. It checks prerequisites before creating resources; use a dedicated
-test environment and do not concurrently modify its image or generated
-sandboxes through external tools. This live test has **not** been run on the
-current validation host. Do not treat the backend as production-proven until
-it passes on the supported runtime.
+This runtime infrastructure image is separate from the OpenSBX workload catalog.
+For fully offline creation, both workload data and runtime init/kernel assets must
+already be local. A trusted OCI archive can also supply vminit under the configured
+reference. Missing prerequisites fail safely; do not remove
+`--max-concurrent-downloads 0` to make Create download them implicitly.
 
-Required live checks use only generated disposable IDs: identical sibling
-commands with distinct outputs, SIGTERM and SIGKILL affecting only the selected
-command, early exit/handshake failure, file argv injection attempts, localhost
-port allocation/collision rollback, filesystem-preserving restart, TTL, and
-cleanup of precisely those IDs. Never run a global prune or service stop.
+The opt-in smoke can reuse an isolated store with a prepared `linux/arm64` image:
+
+```sh
+OPENSBX_APPLE_INTEGRATION=1 \
+OPENSBX_APPLE_TEST_IMAGE=node:25-alpine \
+OPENSBX_APPLE_TEST_DATA_DIR=/absolute/path/to/prepared-isolated-data \
+go test -tags=appleintegration ./internal/applecontainer \
+  -run '^TestAppleRuntimeEndToEnd$' -count=1 -v
+```
+
+Without a supplied data directory, the test uses a temporary store. If the named
+artifact is missing, it explicitly pulls that workload into the manager; it never
+installs software, starts services, or silently downloads runtime prerequisites.
+It uses a fresh execution database and cleans up only generated sandbox IDs and
+the exact workload cache reference. Do not concurrently modify those resources.
+
+The successful run verified managed OCI materialization, exact sibling SIGTERM
+and SIGKILL isolation, files, TTL/lifecycle, same-port hostname/control routing,
+and cache-loss reimport without additional manager registry requests. The trusted
+vminit remained installed in the native image store (service count 1, visible
+workload image list empty), outside the OpenSBX workload catalog. These results do
+not certify Docker live behavior or full browser compatibility. See
+[testing](testing.md) for current commands and the bounds of the last full suite.
 
 Contract references: [tag 1.4.1](https://github.com/apple/container/tree/1.4.1),
 [inspection](https://github.com/apple/container/blob/1.4.1/docs/container-inspection.md),

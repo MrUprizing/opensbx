@@ -5,24 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"opensbx/internal/api"
-	"opensbx/internal/docker"
+	"opensbx/internal/sandbox"
 	"opensbx/models"
 )
 
-// Compile-time check that stub implements api.DockerClient.
-var _ api.DockerClient = (*stub)(nil)
-
 func init() { gin.SetMode(gin.TestMode) }
 
-// stub implements api.DockerClient for testing without a real Docker daemon.
+// stub implements sandbox.Application for testing without a native runtime.
 // Each field is an optional function — set only what the test needs, leave the rest nil.
 // If a nil method is called unexpectedly the test will panic, making the gap obvious.
 type stub struct {
@@ -176,19 +175,192 @@ func (s *stub) ListImages(_ context.Context) ([]models.ImageSummary, error) {
 	return []models.ImageSummary{}, nil
 }
 
+// domainStub keeps REST contract fixtures at the DTO edge while the handler
+// itself consumes only the runtime-neutral application port.
+type domainStub struct {
+	dto  *stub
+	wait func(context.Context, sandbox.SandboxID, sandbox.CommandID) (sandbox.Command, error)
+}
+
+func parseDomainPorts(raw []string) []sandbox.Port {
+	ports, err := sandbox.ParsePorts(raw)
+	if err != nil {
+		panic(err)
+	}
+	return ports
+}
+func (s *domainStub) Ping(ctx context.Context) error { return s.dto.Ping(ctx) }
+func (s *domainStub) Create(ctx context.Context, opts sandbox.CreateOptions) (sandbox.Created, error) {
+	request := models.CreateSandboxRequest{Image: opts.Image, Ports: sandbox.PortStrings(opts.Ports), Timeout: int(opts.Timeout / time.Second), Env: opts.Env}
+	if opts.Resources != (sandbox.ResourceLimits{}) {
+		request.Resources = &models.ResourceLimits{Memory: opts.Resources.MemoryMB, CPUs: opts.Resources.CPUs}
+	}
+	x, err := s.dto.Create(ctx, request)
+	return sandbox.Created{ID: sandbox.SandboxID(x.ID), Name: x.Name, Ports: parseDomainPorts(x.Ports), URL: x.URL}, err
+}
+func (s *domainStub) List(ctx context.Context) ([]sandbox.Summary, error) {
+	items, err := s.dto.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sandbox.Summary, 0, len(items))
+	for _, x := range items {
+		out = append(out, sandbox.Summary{ID: sandbox.SandboxID(x.ID), Name: x.Name, Image: sandbox.ImageID(x.Image), Status: x.Status, State: x.State, Ports: parseDomainPorts(x.Ports), ExpiresAt: x.ExpiresAt, URL: x.URL})
+	}
+	return out, nil
+}
+func (s *domainStub) Inspect(ctx context.Context, id sandbox.SandboxID) (sandbox.Detail, error) {
+	x, err := s.dto.Inspect(ctx, string(id))
+	return sandbox.Detail{Summary: sandbox.Summary{ID: sandbox.SandboxID(x.ID), Name: x.Name, Image: sandbox.ImageID(x.Image), Status: x.Status, State: x.Status, Ports: parseDomainPorts(x.Ports), ExpiresAt: x.ExpiresAt, URL: x.URL}, Running: x.Running, Resources: sandbox.ResourceLimits{MemoryMB: x.Resources.Memory, CPUs: x.Resources.CPUs}, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+}
+func (s *domainStub) Start(ctx context.Context, id sandbox.SandboxID) (sandbox.Started, error) {
+	x, err := s.dto.Start(ctx, string(id))
+	return sandbox.Started{Status: x.Status, Ports: parseDomainPorts(x.Ports), ExpiresAt: x.ExpiresAt}, err
+}
+func (s *domainStub) Stop(ctx context.Context, id sandbox.SandboxID) error {
+	return s.dto.Stop(ctx, string(id))
+}
+func (s *domainStub) Restart(ctx context.Context, id sandbox.SandboxID) (sandbox.Started, error) {
+	x, err := s.dto.Restart(ctx, string(id))
+	return sandbox.Started{Status: x.Status, Ports: parseDomainPorts(x.Ports), ExpiresAt: x.ExpiresAt}, err
+}
+func (s *domainStub) GetNetwork(ctx context.Context, id sandbox.SandboxID) (sandbox.Network, error) {
+	x, err := s.dto.GetNetwork(ctx, string(id))
+	if err != nil {
+		return sandbox.Network{}, err
+	}
+	main, err := sandbox.ParsePort(x.MainPort)
+	if err != nil {
+		return sandbox.Network{}, err
+	}
+	out := sandbox.Network{Main: main}
+	for guest, host := range x.PortsMap {
+		p, e := sandbox.ParsePort(guest)
+		if e != nil {
+			return sandbox.Network{}, e
+		}
+		var n uint16
+		if _, e = fmt.Sscanf(host, "%d", &n); e != nil {
+			return sandbox.Network{}, e
+		}
+		out.Ports = append(out.Ports, sandbox.PublishedPort{Guest: p, Host: n})
+	}
+	return out, nil
+}
+func (s *domainStub) Remove(ctx context.Context, id sandbox.SandboxID) error {
+	return s.dto.Remove(ctx, string(id))
+}
+func (s *domainStub) Pause(ctx context.Context, id sandbox.SandboxID) error {
+	return s.dto.Pause(ctx, string(id))
+}
+func (s *domainStub) Resume(ctx context.Context, id sandbox.SandboxID) error {
+	return s.dto.Resume(ctx, string(id))
+}
+func (s *domainStub) RenewExpiration(ctx context.Context, id sandbox.SandboxID, d time.Duration) error {
+	return s.dto.RenewExpiration(ctx, string(id), int(d/time.Second))
+}
+func (s *domainStub) Stats(ctx context.Context, id sandbox.SandboxID) (sandbox.Stats, error) {
+	x, err := s.dto.Stats(ctx, string(id))
+	return sandbox.Stats{CPU: x.CPU, Memory: sandbox.MemoryUsage{Usage: x.Memory.Usage, Limit: x.Memory.Limit, Percent: x.Memory.Percent}, PIDs: x.PIDs}, err
+}
+func (s *domainStub) ExecCommand(ctx context.Context, id sandbox.SandboxID, r sandbox.ProcessRequest) (sandbox.Command, error) {
+	x, err := s.dto.ExecCommand(ctx, string(id), models.ExecCommandRequest{Command: r.Command, Args: r.Args, Cwd: r.Cwd, Env: r.Env})
+	return sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+}
+func (s *domainStub) GetCommand(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID) (sandbox.Command, error) {
+	x, err := s.dto.GetCommand(ctx, string(id), string(cmd))
+	return sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+}
+func (s *domainStub) ListCommands(ctx context.Context, id sandbox.SandboxID) ([]sandbox.Command, error) {
+	xs, err := s.dto.ListCommands(ctx, string(id))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sandbox.Command, 0, len(xs))
+	for _, x := range xs {
+		out = append(out, sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt})
+	}
+	return out, nil
+}
+func (s *domainStub) KillCommand(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID, signal int) (sandbox.Command, error) {
+	x, err := s.dto.KillCommand(ctx, string(id), string(cmd), signal)
+	return sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+}
+func (s *domainStub) WaitCommand(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID) (sandbox.Command, error) {
+	if s.wait != nil {
+		return s.wait(ctx, id, cmd)
+	}
+	x, err := s.dto.WaitCommand(ctx, string(id), string(cmd))
+	return sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+}
+func (s *domainStub) StreamCommandLogs(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID) (io.ReadCloser, io.ReadCloser, error) {
+	return s.dto.StreamCommandLogs(ctx, string(id), string(cmd))
+}
+func (s *domainStub) GetCommandLogs(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID) (sandbox.Logs, error) {
+	x, err := s.dto.GetCommandLogs(ctx, string(id), string(cmd))
+	return sandbox.Logs{Stdout: x.Stdout, Stderr: x.Stderr, ExitCode: x.ExitCode}, err
+}
+func (s *domainStub) ReadFile(ctx context.Context, id sandbox.SandboxID, path string) (string, error) {
+	return s.dto.ReadFile(ctx, string(id), path)
+}
+func (s *domainStub) WriteFile(ctx context.Context, id sandbox.SandboxID, path, content string) error {
+	return s.dto.WriteFile(ctx, string(id), path, content)
+}
+func (s *domainStub) DeleteFile(ctx context.Context, id sandbox.SandboxID, path string) error {
+	return s.dto.DeleteFile(ctx, string(id), path)
+}
+func (s *domainStub) ListDir(ctx context.Context, id sandbox.SandboxID, path string) (string, error) {
+	return s.dto.ListDir(ctx, string(id), path)
+}
+func (s *domainStub) PullImage(ctx context.Context, ref string) error {
+	return s.dto.PullImage(ctx, ref)
+}
+func (s *domainStub) RemoveImage(ctx context.Context, ref string, force bool) error {
+	return s.dto.RemoveImage(ctx, ref, force)
+}
+func (s *domainStub) InspectImage(ctx context.Context, ref string) (sandbox.ImageDetail, error) {
+	x, err := s.dto.InspectImage(ctx, ref)
+	return sandbox.ImageDetail{ImageSummary: sandbox.ImageSummary{ID: sandbox.ImageID(x.ID), Tags: x.Tags, Size: x.Size}, Created: x.Created, Architecture: x.Architecture, OS: x.OS}, err
+}
+func (s *domainStub) ListImages(ctx context.Context) ([]sandbox.ImageSummary, error) {
+	xs, err := s.dto.ListImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sandbox.ImageSummary, 0, len(xs))
+	for _, x := range xs {
+		out = append(out, sandbox.ImageSummary{ID: sandbox.ImageID(x.ID), Tags: x.Tags, Size: x.Size})
+	}
+	return out, nil
+}
+
+var _ sandbox.Application = (*domainStub)(nil)
+
 // newRouter builds a Gin engine with all sandbox routes registered for the given client.
-func newRouter(d api.DockerClient) *gin.Engine {
+func newRouter(fixture any) *gin.Engine {
 	r := gin.New()
-	h := api.New(d, "localhost", ":3000")
+	var app sandbox.Application
+	switch value := fixture.(type) {
+	case *stub:
+		app = &domainStub{dto: value}
+	case *cancelableWaitStub:
+		app = &domainStub{dto: value.stub, wait: func(ctx context.Context, id sandbox.SandboxID, cmd sandbox.CommandID) (sandbox.Command, error) {
+			x, err := value.WaitCommand(ctx, string(id), string(cmd))
+			return sandbox.Command{ID: sandbox.CommandID(x.ID), SandboxID: sandbox.SandboxID(x.SandboxID), Name: x.Name, Args: x.Args, Cwd: x.Cwd, ExitCode: x.ExitCode, StartedAt: x.StartedAt, FinishedAt: x.FinishedAt}, err
+		}}
+	default:
+		panic("unsupported API test fixture")
+	}
+	h := api.New(app)
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(r.Group("/v1"))
 	return r
 }
 
 // newAuthRouter builds a Gin engine with API key auth enabled on /v1.
-func newAuthRouter(d api.DockerClient, key string) *gin.Engine {
+func newAuthRouter(d *stub, key string) *gin.Engine {
 	r := gin.New()
-	h := api.New(d, "localhost", ":3000")
+	h := api.New(&domainStub{dto: d})
 	h.RegisterHealthCheck(r)
 	v1 := r.Group("/v1")
 	v1.Use(api.APIKeyAuth(key))
@@ -244,6 +416,7 @@ func TestCreateSandbox(t *testing.T) {
 			return models.CreateSandboxResponse{
 				ID:    "abc123",
 				Name:  "eager-turing",
+				URL:   "http://eager-turing.localhost:9090",
 				Ports: []string{"3000/tcp"},
 			}, nil
 		},
@@ -254,7 +427,7 @@ func TestCreateSandbox(t *testing.T) {
 	body := w.Body.String()
 	assert.Contains(t, body, "abc123")
 	assert.Contains(t, body, "eager-turing")
-	assert.Contains(t, body, "http://eager-turing.localhost:3000")
+	assert.Contains(t, body, "http://eager-turing.localhost:9090")
 }
 
 func TestCreateSandbox_MissingImage(t *testing.T) {
@@ -268,7 +441,7 @@ func TestCreateSandbox_MissingImage(t *testing.T) {
 func TestGetSandbox_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		inspect: func(string) (models.SandboxDetail, error) {
-			return models.SandboxDetail{}, docker.ErrNotFound
+			return models.SandboxDetail{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -347,7 +520,7 @@ func TestRestartSandbox(t *testing.T) {
 func TestRestartSandbox_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		restart: func(string) (models.RestartResponse, error) {
-			return models.RestartResponse{}, docker.ErrNotFound
+			return models.RestartResponse{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -397,7 +570,7 @@ func TestExecCommand_MissingCommand(t *testing.T) {
 func TestExecCommand_SandboxNotRunning(t *testing.T) {
 	r := newRouter(&stub{
 		execCommand: func(string, models.ExecCommandRequest) (models.CommandDetail, error) {
-			return models.CommandDetail{}, docker.ErrNotRunning
+			return models.CommandDetail{}, sandbox.ErrNotRunning
 		},
 	})
 
@@ -409,7 +582,7 @@ func TestExecCommand_SandboxNotRunning(t *testing.T) {
 func TestExecCommand_SandboxNotFound(t *testing.T) {
 	r := newRouter(&stub{
 		execCommand: func(string, models.ExecCommandRequest) (models.CommandDetail, error) {
-			return models.CommandDetail{}, docker.ErrNotFound
+			return models.CommandDetail{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -473,7 +646,7 @@ func TestGetCommand_OK(t *testing.T) {
 func TestGetCommand_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		getCommand: func(string, string) (models.CommandDetail, error) {
-			return models.CommandDetail{}, docker.ErrCommandNotFound
+			return models.CommandDetail{}, sandbox.ErrCommandNotFound
 		},
 	})
 
@@ -507,7 +680,7 @@ func TestKillCommand_OK(t *testing.T) {
 func TestKillCommand_AlreadyFinished(t *testing.T) {
 	r := newRouter(&stub{
 		killCommand: func(string, string, int) (models.CommandDetail, error) {
-			return models.CommandDetail{}, docker.ErrCommandFinished
+			return models.CommandDetail{}, sandbox.ErrCommandFinished
 		},
 	})
 
@@ -519,7 +692,7 @@ func TestKillCommand_AlreadyFinished(t *testing.T) {
 func TestKillCommand_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		killCommand: func(string, string, int) (models.CommandDetail, error) {
-			return models.CommandDetail{}, docker.ErrCommandNotFound
+			return models.CommandDetail{}, sandbox.ErrCommandNotFound
 		},
 	})
 
@@ -562,7 +735,7 @@ func TestGetCommandLogs_Snapshot(t *testing.T) {
 func TestGetCommandLogs_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		getCommandLogs: func(sandboxID, cmdID string) (models.CommandLogsResponse, error) {
-			return models.CommandLogsResponse{}, docker.ErrCommandNotFound
+			return models.CommandLogsResponse{}, sandbox.ErrCommandNotFound
 		},
 	})
 
@@ -760,7 +933,7 @@ func TestPauseSandbox(t *testing.T) {
 
 func TestPauseSandbox_NotFound(t *testing.T) {
 	r := newRouter(&stub{
-		pause: func(string) error { return docker.ErrNotFound },
+		pause: func(string) error { return sandbox.ErrNotFound },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/nope/pause", nil)
@@ -780,7 +953,7 @@ func TestResumeSandbox(t *testing.T) {
 
 func TestResumeSandbox_NotFound(t *testing.T) {
 	r := newRouter(&stub{
-		resume: func(string) error { return docker.ErrNotFound },
+		resume: func(string) error { return sandbox.ErrNotFound },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/nope/resume", nil)
@@ -809,7 +982,7 @@ func TestRenewExpiration(t *testing.T) {
 
 func TestRenewExpiration_NotFound(t *testing.T) {
 	r := newRouter(&stub{
-		renewExpiration: func(string, int) error { return docker.ErrNotFound },
+		renewExpiration: func(string, int) error { return sandbox.ErrNotFound },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/nope/renew-expiration", map[string]any{"timeout": 3600})
@@ -986,7 +1159,7 @@ func TestPullImage_Error(t *testing.T) {
 func TestCreateSandbox_ImageNotFound(t *testing.T) {
 	r := newRouter(&stub{
 		create: func(models.CreateSandboxRequest) (models.CreateSandboxResponse, error) {
-			return models.CreateSandboxResponse{}, docker.ErrImageNotFound
+			return models.CreateSandboxResponse{}, sandbox.ErrImageNotFound
 		},
 	})
 
@@ -1027,7 +1200,7 @@ func TestGetStats_OK(t *testing.T) {
 func TestGetStats_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		stats: func(string) (models.SandboxStats, error) {
-			return models.SandboxStats{}, docker.ErrNotFound
+			return models.SandboxStats{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -1070,7 +1243,7 @@ func TestStartSandbox(t *testing.T) {
 func TestStartSandbox_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		start: func(string) (models.RestartResponse, error) {
-			return models.RestartResponse{}, docker.ErrNotFound
+			return models.RestartResponse{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -1115,7 +1288,7 @@ func TestDeleteImage_Force(t *testing.T) {
 func TestDeleteImage_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		removeImage: func(string, bool) error {
-			return docker.ErrNotFound
+			return sandbox.ErrNotFound
 		},
 	})
 
@@ -1151,7 +1324,7 @@ func TestGetImage(t *testing.T) {
 func TestGetImage_NotFound(t *testing.T) {
 	r := newRouter(&stub{
 		inspectImage: func(string) (models.ImageDetail, error) {
-			return models.ImageDetail{}, docker.ErrNotFound
+			return models.ImageDetail{}, sandbox.ErrNotFound
 		},
 	})
 
@@ -1165,7 +1338,7 @@ func TestGetImage_NotFound(t *testing.T) {
 func TestStartSandbox_AlreadyRunning(t *testing.T) {
 	r := newRouter(&stub{
 		start: func(string) (models.RestartResponse, error) {
-			return models.RestartResponse{}, docker.ErrAlreadyRunning
+			return models.RestartResponse{}, sandbox.ErrAlreadyRunning
 		},
 	})
 
@@ -1177,7 +1350,7 @@ func TestStartSandbox_AlreadyRunning(t *testing.T) {
 
 func TestStopSandbox_AlreadyStopped(t *testing.T) {
 	r := newRouter(&stub{
-		stop: func(string) error { return docker.ErrAlreadyStopped },
+		stop: func(string) error { return sandbox.ErrAlreadyStopped },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/abc123/stop", nil)
@@ -1188,7 +1361,7 @@ func TestStopSandbox_AlreadyStopped(t *testing.T) {
 
 func TestPauseSandbox_AlreadyPaused(t *testing.T) {
 	r := newRouter(&stub{
-		pause: func(string) error { return docker.ErrAlreadyPaused },
+		pause: func(string) error { return sandbox.ErrAlreadyPaused },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/abc123/pause", nil)
@@ -1199,7 +1372,7 @@ func TestPauseSandbox_AlreadyPaused(t *testing.T) {
 
 func TestPauseSandbox_NotRunning(t *testing.T) {
 	r := newRouter(&stub{
-		pause: func(string) error { return docker.ErrNotRunning },
+		pause: func(string) error { return sandbox.ErrNotRunning },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/abc123/pause", nil)
@@ -1210,7 +1383,7 @@ func TestPauseSandbox_NotRunning(t *testing.T) {
 
 func TestResumeSandbox_NotPaused(t *testing.T) {
 	r := newRouter(&stub{
-		resume: func(string) error { return docker.ErrNotPaused },
+		resume: func(string) error { return sandbox.ErrNotPaused },
 	})
 
 	w := do(r, "POST", "/v1/sandboxes/abc123/resume", nil)

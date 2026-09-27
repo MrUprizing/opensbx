@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 )
 
 func (c *Client) running(ctx context.Context, id string) error {
@@ -17,7 +17,7 @@ func (c *Client) running(ctx context.Context, id string) error {
 		return err
 	}
 	if info.Status.State != "running" {
-		return docker.ErrNotRunning
+		return sandbox.ErrNotRunning
 	}
 	return nil
 }
@@ -83,14 +83,14 @@ func (c *Client) sample(ctx context.Context, id string) (statsSample, time.Time,
 	}
 	return s, at, nil
 }
-func (c *Client) Stats(ctx context.Context, id string) (models.SandboxStats, error) {
-	var result models.SandboxStats
+func (c *Client) Stats(ctx context.Context, id string) (runtimeio.SandboxStats, error) {
+	var result runtimeio.SandboxStats
 	initial, err := c.lookup(ctx, id)
 	if err != nil {
 		return result, err
 	}
 	if initial.Status.State != "running" {
-		return result, docker.ErrNotRunning
+		return result, sandbox.ErrNotRunning
 	}
 	// Each CLI invocation sleeps internally and only exposes its last sample.
 	// Take two independent observations; never present cumulative CPU as a
@@ -114,13 +114,13 @@ func (c *Client) Stats(ctx context.Context, id string) (models.SandboxStats, err
 		return result, err
 	}
 	if current.Status.State != "running" {
-		return result, docker.ErrNotRunning
+		return result, sandbox.ErrNotRunning
 	}
 	if string(current.Status.StartedDate) != string(initial.Status.StartedDate) {
 		return result, errors.New("sandbox restarted during Apple stats sampling")
 	}
 	result.CPU = float64(*b.CPU-*a.CPU) / elapsed * 100
-	result.Memory = models.MemoryUsage{Usage: *b.Memory, Limit: *b.Limit, Percent: float64(*b.Memory) / float64(*b.Limit) * 100}
+	result.Memory = runtimeio.MemoryUsage{Usage: *b.Memory, Limit: *b.Limit, Percent: float64(*b.Memory) / float64(*b.Limit) * 100}
 	result.PIDs = *b.PIDs
 	return result, nil
 }

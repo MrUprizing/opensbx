@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 // synchronizedRunner records argv safely across concurrent backend operations.
@@ -247,9 +247,9 @@ func TestCommandTrackingRejects129thActiveCommand(t *testing.T) {
 	}
 	for n := 0; n < maxTrackedCommands; n++ {
 		commandID := fmt.Sprintf("cmd_%03d", n)
-		c.commands[commandID] = &runningCommand{sandboxID: id, done: make(chan struct{}), detail: models.CommandDetail{ID: commandID, StartedAt: int64(n)}}
+		c.commands[commandID] = &runningCommand{sandboxID: id, done: make(chan struct{}), detail: runtimeio.CommandDetail{ID: commandID, StartedAt: int64(n)}}
 	}
-	if _, err := c.ExecCommand(context.Background(), id, models.ExecCommandRequest{Command: "echo"}); err == nil || !strings.Contains(err.Error(), "maximum 128") {
+	if _, err := c.ExecCommand(context.Background(), id, runtimeio.ExecCommandRequest{Command: "echo"}); err == nil || !strings.Contains(err.Error(), "maximum 128") {
 		t.Fatalf("129th active command error = %v", err)
 	}
 	if len(c.commands) != maxTrackedCommands {
@@ -273,7 +273,7 @@ func TestCommandLogAPIReturnsNewest256KiBPerStream(t *testing.T) {
 	_, _ = io.WriteString(stderr, "discarded"+strings.Repeat("e", commandLogLimit-4)+"LAST")
 	done := make(chan struct{})
 	close(done)
-	c.commands[commandID] = &runningCommand{sandboxID: id, detail: models.CommandDetail{ID: commandID}, stdout: stdout, stderr: stderr, done: done}
+	c.commands[commandID] = &runningCommand{sandboxID: id, detail: runtimeio.CommandDetail{ID: commandID}, stdout: stdout, stderr: stderr, done: done}
 	logs, err := c.GetCommandLogs(context.Background(), id, commandID)
 	wantOut := strings.Repeat("o", commandLogLimit-4) + "TAIL"
 	wantErr := strings.Repeat("e", commandLogLimit-4) + "LAST"
@@ -303,7 +303,7 @@ func TestRemoveKillsAttachedCLIWaitAndDoesNotRunGuestCleanupAfterSandboxDeletion
 	if err := repo.Save(database.Sandbox{ID: sandbox, Name: sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	command, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "sleep"})
+	command, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "sleep"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestShutdownStopsSandboxKillsAttachedCLIAndWaitCleanupCompletes(t *testing.
 	if err := repo.Save(database.Sandbox{ID: sandbox, Name: sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	command, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "sleep"})
+	command, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "sleep"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestExecCommandRejectsInvalidGuestIdentity(t *testing.T) {
 	if err := repo.Save(database.Sandbox{ID: sandbox, Name: sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "echo"}); err == nil || !strings.Contains(err.Error(), "invalid guest command identity") {
+	if _, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "echo"}); err == nil || !strings.Contains(err.Error(), "invalid guest command identity") {
 		t.Fatalf("invalid handshake identity error = %v", err)
 	}
 	_ = process.Kill()
@@ -488,7 +488,7 @@ func TestExecCommandReturnsEarlyGuestExitWithoutWaitingForHandshakeTimeout(t *te
 		t.Fatal(err)
 	}
 	started := time.Now()
-	detail, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "exit"})
+	detail, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "exit"})
 	if err != nil || detail.ExitCode == nil || *detail.ExitCode != 17 {
 		t.Fatalf("early exit result=%+v err=%v", detail, err)
 	}
@@ -506,7 +506,7 @@ func TestExecCommandHandshakeTimeoutKillsAttachedCLIWithoutReleasingPayload(t *t
 	}
 	errDone := make(chan error, 1)
 	go func() {
-		_, err := c.ExecCommand(context.Background(), sandbox, models.ExecCommandRequest{Command: "sleep"})
+		_, err := c.ExecCommand(context.Background(), sandbox, runtimeio.ExecCommandRequest{Command: "sleep"})
 		errDone <- err
 	}()
 	select {

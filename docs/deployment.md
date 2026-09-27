@@ -1,146 +1,66 @@
-# Deployment (Cloudflare Tunnel)
+# Local usage and state migration
 
-Goal:
+OpenSBX runs locally. REST, MCP, health, Swagger and friendly sandbox URLs share
+one HTTP server. Bind to `127.0.0.1:<port>` or `[::1]:<port>`; port `0` selects a
+free port. Other bind addresses, including wildcard `:8080`, are rejected.
+Docker endpoints must be a local Unix socket, Windows named pipe or
+loopback TCP endpoint. OpenSBX does not provision runtimes or global services.
 
-- API at `your-domain.com`
-- Sandboxes at `*.your-domain.com`
-
-Cloudflare handles TLS. `cloudflared` forwards traffic to local Opensbx ports.
-
-## Fast setup (macOS)
-
-### 1) Install `cloudflared`
-
-```bash
-brew install cloudflared
-cloudflared --version
+```sh
+opensbx -runtime docker -addr 127.0.0.1:8080
+# Apple Silicon, with container CLI/server 1.4.1 already running:
+opensbx -runtime container -addr 127.0.0.1:8080
 ```
 
-### 2) Authenticate
+Management: `http://localhost:8080/v1/mcp`, `/v1/health`, and
+`/swagger/index.html`. Use `API_KEY` for optional Bearer auth on `/v1`.
+MCP localhost protection remains enabled. Friendly app URLs use
+`http://<sandbox>.localhost:8080`. See [routing](reverse-proxy.md).
 
-```bash
-cloudflared tunnel login
-```
+## Existing installations
 
-This creates `~/.cloudflared/cert.pem`.
+1. Stop the old OpenSBX process cleanly. Do not delete any sandbox or image.
+2. Make a consistent SQLite backup of the old execution DB. With all writers
+   stopped, copy the DB and any `-wal`/`-shm` sidecars as a set; alternatively use
+   SQLite's online backup facility. Keep the backup outside the active path.
+3. Remove legacy `PROXY_ADDR`, `BASE_DOMAIN`, `-proxy-addr`, and `-base-domain`
+   options. Replace wildcard `-addr :8080` with `-addr 127.0.0.1:8080`.
+4. Explicitly select the original backend and original database:
 
-### 3) Create tunnel (this command gives you the tunnel ID)
+   ```sh
+   opensbx -runtime docker -legacy-db /absolute/old/path/sandbox.db
+   opensbx -runtime container -legacy-db /absolute/old/path/sandbox-container.db
+   ```
 
-```bash
-cloudflared tunnel create opensbx-local
-```
+These are alternatives, not two commands to run for the same database. Legacy
+mode opens the original DB in place and adds metadata columns without changing
+public IDs or command backreferences. The basename must match the selected
+runtime. Never rename an execution DB to switch runtimes. One process holds an
+exclusive execution DB lock. Before reverting to an older release, stop all
+writers and restore the backup as a set; do not overwrite a running database.
 
-Look at the command output for:
+If either legacy filename is detected in the working directory without explicit
+legacy mode, startup fails rather than silently creating an empty installation.
+There is no automatic copy, resource deletion, image adoption, or tag-to-digest
+guessing. Existing sandboxes keep working through their recorded backend IDs.
+Legacy image-root/manifest columns remain empty: a historical tag or Docker
+config ID is not proof of the OCI artifact originally used.
 
-```text
-Created tunnel opensbx-local with id <TUNNEL_ID>
-Tunnel credentials written to ~/.cloudflared/<TUNNEL_ID>.json
-```
+New installations use `~/.local/share/opensbx` (override with `-data-dir` or
+`OPENSBX_DATA_DIR`):
 
-Use that `<TUNNEL_ID>` in the config below.
+- `images/`: shared OCI blobs, layout index and authoritative locked catalog.
+- `runtimes/docker/sandbox.db`: Docker execution metadata.
+- `runtimes/container/sandbox.db`: Apple execution metadata.
 
-### 4) Add DNS routes
+The image CLI uses the same data directory without selecting or connecting a
+runtime. Native images are adopted only by explicitly producing an OCI archive
+and importing it; do not point the manager at native cache directories. A Docker
+`save` archive is not necessarily an OCI archive. For a registry image, an explicit
+OpenSBX pull is the simplest preparation path.
 
-```bash
-cloudflared tunnel route dns opensbx-local your-domain.com
-cloudflared tunnel route dns opensbx-local '*.your-domain.com'
-```
-
-### 5) Create `~/.cloudflared/config.yml`
-
-```yaml
-tunnel: <TUNNEL_ID>
-credentials-file: /Users/<YOUR_USER>/.cloudflared/<TUNNEL_ID>.json
-
-ingress:
-  - hostname: your-domain.com
-    service: http://127.0.0.1:8080
-  - hostname: "*.your-domain.com"
-    service: http://127.0.0.1:3000
-  - service: http_status:404
-```
-
-Note: ingress order matters (API first, wildcard second).
-
-### 6) Validate + run tunnel
-
-```bash
-cloudflared tunnel ingress validate
-cloudflared tunnel run opensbx-local
-```
-
-## Run Opensbx
-
-### Install binary from script
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/install.sh | bash
-```
-
-### Run for deployment
-
-```bash
-opensbx -addr :8080 -proxy-addr :3000 -base-domain your-domain.com
-```
-
-## Verify
-
-```bash
-curl https://your-domain.com/v1/health
-```
-
-```bash
-curl -X POST https://your-domain.com/v1/sandboxes \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-secret-key" \
-  -d '{"image":"nginx:alpine","ports":["80"]}'
-```
-
-Sandbox URL should be:
-
-```text
-https://<sandbox-name>.your-domain.com
-```
-
-## MCP
-
-With `-base-domain your-domain.com`, MCP works without `MCPGODEBUG`.
-
-Quick check:
-
-```bash
-curl -i https://your-domain.com/v1/mcp \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
-```
-
-## Ubuntu notes (VPS)
-
-Install `cloudflared`:
-
-```bash
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg
-echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared jammy main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
-sudo apt update
-sudo apt install -y cloudflared
-```
-
-Run as service:
-
-```bash
-sudo cloudflared service install
-sudo systemctl enable cloudflared
-sudo systemctl restart cloudflared
-sudo journalctl -u cloudflared --no-pager -n 50
-```
-
-Keep only SSH exposed publicly:
-
-```bash
-sudo ufw allow 22/tcp
-sudo ufw enable
-```
-
-Do not expose `8080` or `3000`.
+OpenSBX's data directory should be private to the local user and on a local
+filesystem with working OS file locks and atomic renames. Do not share it over a
+network filesystem. Back up the catalog, layout, blobs and execution DBs together
+with writers stopped. Image unreference retains blobs, including execution pins;
+there is deliberately no automatic garbage collection.

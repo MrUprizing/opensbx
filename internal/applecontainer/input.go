@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 const (
@@ -36,7 +36,7 @@ func (b *inputBudget) add(parts ...string) error {
 	return nil
 }
 
-func validateCommandBudget(req models.ExecCommandRequest) error {
+func validateCommandBudget(req runtimeio.ExecCommandRequest) error {
 	var budget inputBudget
 	if err := budget.add(req.Command); err != nil {
 		return err
@@ -61,7 +61,7 @@ func validateCommandBudget(req models.ExecCommandRequest) error {
 
 // Validate caller input before runtime access, persistence, or eviction of
 // retained commands. Keep the budget first to bound subsequent validation work.
-func validateCommandInput(req models.ExecCommandRequest) error {
+func validateCommandInput(req runtimeio.ExecCommandRequest) error {
 	if err := validateCommandBudget(req); err != nil {
 		return err
 	}

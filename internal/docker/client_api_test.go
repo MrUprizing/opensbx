@@ -17,7 +17,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	moby "github.com/moby/moby/client"
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 type dockerAPIFixture struct {
@@ -25,20 +25,25 @@ type dockerAPIFixture struct {
 	fail map[string]int
 	// Sequential responses allow a preflight inspect to succeed and the
 	// post-mutation inspect to fail without changing state from a test goroutine.
-	responses   map[string][]int
-	requests    []string
-	execOptions []string
-	createBody  container.Config
-	createHost  container.HostConfig
-	containerID string
-	running     bool
-	paused      bool
-	stdin       []byte
-	execStdin   bool
-	statsBody   string
-	pullBody    string
-	attachBody  string
-	stopDone    chan struct{}
+	responses      map[string][]int
+	requests       []string
+	execOptions    []string
+	createBody     container.Config
+	createHost     container.HostConfig
+	containerID    string
+	running        bool
+	paused         bool
+	stdin          []byte
+	execStdin      bool
+	statsBody      string
+	pullBody       string
+	attachBody     string
+	stopDone       chan struct{}
+	cacheDigest    string
+	cacheLoaded    bool
+	loadedArchive  []byte
+	cacheLoadBody  string
+	cacheInspectID string
 }
 
 func newDockerFixture(t *testing.T) (*Client, *dockerAPIFixture) {
@@ -96,10 +101,37 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && path == "/_ping":
 		_, _ = w.Write([]byte("OK"))
+	case r.Method == http.MethodGet && path == "/info":
+		_, _ = w.Write([]byte(`{"OSType":"linux","Architecture":"aarch64","ServerVersion":"27.1.2"}`))
 	case r.Method == http.MethodGet && path == "/images/json":
 		_, _ = w.Write([]byte(`[{"Id":"sha256:image-1","RepoTags":["alpine:latest"],"Size":123}]`))
 	case r.Method == http.MethodGet && (path == "/images/alpine/json" || path == "/images/alpine:latest/json"):
 		_, _ = w.Write([]byte(`{"Id":"sha256:image-1","RepoTags":["alpine:latest"],"Size":123,"Created":"2026-01-01T00:00:00Z","Architecture":"amd64","Os":"linux"}`))
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/json")
+		f.mu.Lock()
+		loaded, digest := f.cacheLoaded, f.cacheDigest
+		f.mu.Unlock()
+		if id != digest || !loaded {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+			break
+		}
+		if f.cacheInspectID != "" {
+			digest = f.cacheInspectID
+		}
+		_, _ = fmt.Fprintf(w, `{"Id":%q,"Architecture":"amd64","Os":"linux"}`, digest)
+	case r.Method == http.MethodPost && path == "/images/load":
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.cacheLoaded, f.loadedArchive = true, body
+		loadBody := f.cacheLoadBody
+		f.mu.Unlock()
+		if loadBody != "" {
+			_, _ = io.WriteString(w, loadBody)
+			break
+		}
+		_, _ = w.Write([]byte("{\"stream\":\"Loaded image\"}\n"))
 	case r.Method == http.MethodPost && path == "/containers/create":
 		var payload struct {
 			container.Config
@@ -266,9 +298,9 @@ func TestDockerAPIFixtureRejectsUnknownResourceIDsAndMutationPaths(t *testing.T)
 func TestDockerClientCreateInspectListAndLifecycle(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
 	ctx := context.Background()
-	created, err := dc.Create(ctx, models.CreateSandboxRequest{
+	created, err := dc.Create(ctx, runtimeio.CreateSandboxRequest{
 		Image: "alpine:latest", Ports: []string{"3000"}, Timeout: 600,
-		Resources: &models.ResourceLimits{Memory: 512, CPUs: 1.5}, Env: []string{"MODE=test"},
+		Resources: &runtimeio.ResourceLimits{Memory: 512, CPUs: 1.5}, Env: []string{"MODE=test"},
 	})
 	if err != nil {
 		t.Fatalf("Create() error: %v", err)
@@ -352,7 +384,7 @@ func TestDockerClientMapsDaemonErrorsAndInvalidImage(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
 	ctx := context.Background()
 	fixture.fail["GET /images/missing/json"] = http.StatusNotFound
-	if _, err := dc.Create(ctx, models.CreateSandboxRequest{Image: "missing"}); err != ErrImageNotFound {
+	if _, err := dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "missing"}); err != ErrImageNotFound {
 		t.Fatalf("Create() missing image error = %v, want ErrImageNotFound", err)
 	}
 	fixture.fail["GET /containers/missing/json"] = http.StatusNotFound
@@ -368,25 +400,6 @@ func TestDockerClientMapsDaemonErrorsAndInvalidImage(t *testing.T) {
 	fixture.fail["GET /images/broken/json"] = http.StatusInternalServerError
 	if _, err := dc.ImageExists(ctx, "broken"); err == nil {
 		t.Fatal("ImageExists() should preserve non-not-found daemon errors")
-	}
-}
-
-func TestDockerClientImageOperations(t *testing.T) {
-	dc, _ := newDockerFixture(t)
-	ctx := context.Background()
-	image, err := dc.InspectImage(ctx, "alpine:latest")
-	if err != nil || image.ID != "sha256:image-1" || image.Architecture != "amd64" || image.OS != "linux" {
-		t.Fatalf("InspectImage() = %+v, %v", image, err)
-	}
-	images, err := dc.ListImages(ctx)
-	if err != nil || len(images) != 1 || images[0].ID != "sha256:image-1" {
-		t.Fatalf("ListImages() = %+v, %v", images, err)
-	}
-	if exists, err := dc.ImageExists(ctx, "alpine:latest"); err != nil || !exists {
-		t.Fatalf("ImageExists() = %v, %v; want true", exists, err)
-	}
-	if err := dc.RemoveImage(ctx, "alpine:latest", true); err != nil {
-		t.Fatalf("RemoveImage() error: %v", err)
 	}
 }
 
@@ -436,7 +449,7 @@ func TestDockerClientExecWaitLogsAndFileOperations(t *testing.T) {
 	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
 		t.Fatal(err)
 	}
-	started, err := dc.ExecCommand(ctx, "container-1", models.ExecCommandRequest{Command: "echo", Args: []string{"hello"}, Cwd: "/work", Env: map[string]string{"K": "V"}})
+	started, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo", Args: []string{"hello"}, Cwd: "/work", Env: map[string]string{"K": "V"}})
 	if err != nil || started.ID == "" || started.Name != "echo" {
 		t.Fatalf("ExecCommand() = %+v, %v", started, err)
 	}
@@ -488,7 +501,7 @@ func TestDockerClientCommandStateErrorsAndContextCancellation(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
 	ctx := context.Background()
 	fixture.running = false
-	if _, err := dc.ExecCommand(ctx, "container-1", models.ExecCommandRequest{Command: "echo"}); err != ErrNotRunning {
+	if _, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo"}); err != ErrNotRunning {
 		t.Fatalf("ExecCommand() stopped sandbox error = %v", err)
 	}
 	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
@@ -543,34 +556,8 @@ func TestDockerClientCommandStateErrorsAndContextCancellation(t *testing.T) {
 	fixture.mu.Lock()
 	fixture.fail["GET /containers/container-1/json"] = http.StatusNotFound
 	fixture.mu.Unlock()
-	if _, err := dc.ExecCommand(ctx, "container-1", models.ExecCommandRequest{Command: "echo"}); err != ErrNotFound {
+	if _, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo"}); err != ErrNotFound {
 		t.Fatalf("ExecCommand() missing sandbox error = %v", err)
-	}
-}
-
-func TestDockerClientPullImageAndOperationFailures(t *testing.T) {
-	dc, fixture := newDockerFixture(t)
-	ctx := context.Background()
-	if err := dc.PullImage(ctx, "alpine:latest"); err != nil {
-		t.Fatalf("PullImage() error: %v", err)
-	}
-	fixture.mu.Lock()
-	fixture.fail["GET /images/bad/json"] = http.StatusInternalServerError
-	fixture.fail["GET /containers/container-1/stats"] = http.StatusInternalServerError
-	fixture.fail["POST /containers/container-1/start"] = http.StatusInternalServerError
-	fixture.fail["DELETE /images/alpine:latest"] = http.StatusNotFound
-	fixture.mu.Unlock()
-	if err := dc.PullImage(ctx, "bad"); err == nil {
-		t.Fatal("PullImage() should propagate local image verification failures")
-	}
-	if _, err := dc.Stats(ctx, "container-1"); err == nil {
-		t.Fatal("Stats() should propagate Docker API errors")
-	}
-	if _, err := dc.Start(ctx, "container-1"); err == nil {
-		t.Fatal("Start() should propagate Docker API errors")
-	}
-	if err := dc.RemoveImage(ctx, "alpine:latest", false); err != ErrNotFound {
-		t.Fatalf("RemoveImage() not-found error = %v", err)
 	}
 }
 
@@ -648,19 +635,19 @@ func TestDockerClientCreateAndLifecycleSurfaceDockerFailures(t *testing.T) {
 	fixture.fail["POST /containers/create"] = http.StatusInternalServerError
 	fixture.fail["POST /containers/container-1/start"] = http.StatusInternalServerError
 	fixture.mu.Unlock()
-	if _, err := dc.Create(ctx, models.CreateSandboxRequest{Image: "broken"}); err == nil {
+	if _, err := dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "broken"}); err == nil {
 		t.Fatal("Create() should return image-inspect failures")
 	}
 	fixture.mu.Lock()
 	delete(fixture.fail, "GET /images/broken/json")
 	fixture.mu.Unlock()
-	if _, err := dc.Create(ctx, models.CreateSandboxRequest{Image: "alpine"}); err == nil {
+	if _, err := dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "alpine"}); err == nil {
 		t.Fatal("Create() should return container-create failures")
 	}
 	fixture.mu.Lock()
 	delete(fixture.fail, "POST /containers/create")
 	fixture.mu.Unlock()
-	if _, err := dc.Create(ctx, models.CreateSandboxRequest{Image: "alpine"}); err == nil {
+	if _, err := dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "alpine"}); err == nil {
 		t.Fatal("Create() should return container-start failures")
 	}
 
@@ -706,21 +693,9 @@ func TestDockerClientRemoveAndImageInspectionErrorBranches(t *testing.T) {
 	fixture.mu.Lock()
 	delete(fixture.fail, "DELETE /containers/container-1")
 	fixture.fail["DELETE /containers/container-1"] = http.StatusNotFound
-	fixture.fail["GET /images/missing/json"] = http.StatusNotFound
-	fixture.fail["GET /images/broken/json"] = http.StatusInternalServerError
-	fixture.fail["GET /images/json"] = http.StatusInternalServerError
 	fixture.mu.Unlock()
 	if err := dc.Remove(ctx, "container-1"); err != nil {
 		t.Fatalf("Remove() should treat Docker not-found as already removed: %v", err)
-	}
-	if _, err := dc.InspectImage(ctx, "missing"); err != ErrNotFound {
-		t.Fatalf("InspectImage() not-found error = %v", err)
-	}
-	if _, err := dc.InspectImage(ctx, "broken"); err == nil {
-		t.Fatal("InspectImage() should preserve non-not-found errors")
-	}
-	if _, err := dc.ListImages(ctx); err == nil {
-		t.Fatal("ListImages() should surface Docker errors")
 	}
 }
 
@@ -738,14 +713,14 @@ func TestDockerClientStatsAndExecErrorBranches(t *testing.T) {
 	fixture.running = true
 	fixture.fail["POST /containers/container-1/exec"] = http.StatusInternalServerError
 	fixture.mu.Unlock()
-	if _, err := dc.ExecCommand(ctx, "container-1", models.ExecCommandRequest{Command: "echo"}); err == nil {
+	if _, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo"}); err == nil {
 		t.Fatal("ExecCommand() should surface exec-create failures")
 	}
 	fixture.mu.Lock()
 	delete(fixture.fail, "POST /containers/container-1/exec")
 	fixture.fail["POST /exec/exec-1/start"] = http.StatusInternalServerError
 	fixture.mu.Unlock()
-	command, err := dc.ExecCommand(ctx, "container-1", models.ExecCommandRequest{Command: "echo"})
+	command, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo"})
 	if err != nil {
 		t.Fatalf("ExecCommand() should return a command even if attach fails asynchronously: %v", err)
 	}
@@ -758,8 +733,8 @@ func TestDockerClientStatsAndExecErrorBranches(t *testing.T) {
 	}
 }
 
-func TestDockerClientKillRunningCommandAndPullStreamErrors(t *testing.T) {
-	dc, fixture := newDockerFixture(t)
+func TestDockerClientKillRunningCommand(t *testing.T) {
+	dc, _ := newDockerFixture(t)
 	ctx := context.Background()
 	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
 		t.Fatal(err)
@@ -771,18 +746,6 @@ func TestDockerClientKillRunningCommandAndPullStreamErrors(t *testing.T) {
 	dc.commands.Store("cmd-live", &runningCommand{execID: "exec-1", sandboxID: "container-1", cmd: []string{"sleep", "30"}, cancel: func() {}, stdout: stdout, stderr: stderr, done: make(chan struct{})})
 	if _, err := dc.KillCommand(ctx, "container-1", "cmd-live", 15); err != nil {
 		t.Fatalf("KillCommand() running command error: %v", err)
-	}
-	fixture.mu.Lock()
-	fixture.pullBody = "{\"errorDetail\":{\"message\":\"registry denied\"}}\n"
-	fixture.mu.Unlock()
-	if err := dc.PullImage(ctx, "private/image"); err == nil || !strings.Contains(err.Error(), "registry denied") {
-		t.Fatalf("PullImage() inline registry error = %v", err)
-	}
-	fixture.mu.Lock()
-	fixture.pullBody = "invalid-json\n"
-	fixture.mu.Unlock()
-	if err := dc.PullImage(ctx, "invalid-stream"); err == nil {
-		t.Fatal("PullImage() should return malformed stream errors")
 	}
 }
 

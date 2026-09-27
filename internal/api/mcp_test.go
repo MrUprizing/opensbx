@@ -6,18 +6,20 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"opensbx/internal/sandbox"
 	"opensbx/models"
 )
 
 type mcpDockerStub struct {
-	DockerClient
+	sandbox.Application
 	fail           bool
 	waitError      error
-	createRequest  models.CreateSandboxRequest
+	createRequest  sandbox.CreateOptions
 	execSandboxID  string
-	execRequest    models.ExecCommandRequest
+	execRequest    sandbox.ProcessRequest
 	waitSandboxID  string
 	waitCommandID  string
 	readSandboxID  string
@@ -35,81 +37,85 @@ func (s *mcpDockerStub) maybeFail() error {
 }
 
 func (s *mcpDockerStub) Ping(context.Context) error { return s.maybeFail() }
-func (s *mcpDockerStub) List(context.Context) ([]models.SandboxSummary, error) {
-	return []models.SandboxSummary{{ID: "sb-1", Name: "demo"}}, s.maybeFail()
+func (s *mcpDockerStub) List(context.Context) ([]sandbox.Summary, error) {
+	return []sandbox.Summary{{ID: "sb-1", Name: "demo"}}, s.maybeFail()
 }
-func (s *mcpDockerStub) Create(_ context.Context, req models.CreateSandboxRequest) (models.CreateSandboxResponse, error) {
+func (s *mcpDockerStub) Create(_ context.Context, req sandbox.CreateOptions) (sandbox.Created, error) {
 	s.createRequest = req
-	return models.CreateSandboxResponse{ID: "sb-1", Name: "demo"}, s.maybeFail()
+	return sandbox.Created{ID: "sb-1", Name: "demo", URL: "http://demo.localhost:3000"}, s.maybeFail()
 }
-func (s *mcpDockerStub) Inspect(context.Context, string) (models.SandboxDetail, error) {
-	return models.SandboxDetail{ID: "sb-1", Name: "demo"}, s.maybeFail()
+func (s *mcpDockerStub) Inspect(context.Context, sandbox.SandboxID) (sandbox.Detail, error) {
+	return sandbox.Detail{Summary: sandbox.Summary{ID: "sb-1", Name: "demo"}}, s.maybeFail()
 }
-func (s *mcpDockerStub) Start(context.Context, string) (models.RestartResponse, error) {
-	return models.RestartResponse{Status: "started"}, s.maybeFail()
+func (s *mcpDockerStub) Start(context.Context, sandbox.SandboxID) (sandbox.Started, error) {
+	return sandbox.Started{Status: "started"}, s.maybeFail()
 }
-func (s *mcpDockerStub) Stop(context.Context, string) error { return s.maybeFail() }
-func (s *mcpDockerStub) Restart(context.Context, string) (models.RestartResponse, error) {
-	return models.RestartResponse{Status: "restarted"}, s.maybeFail()
+func (s *mcpDockerStub) Stop(context.Context, sandbox.SandboxID) error { return s.maybeFail() }
+func (s *mcpDockerStub) Restart(context.Context, sandbox.SandboxID) (sandbox.Started, error) {
+	return sandbox.Started{Status: "restarted"}, s.maybeFail()
 }
-func (s *mcpDockerStub) GetNetwork(context.Context, string) (models.SandboxNetwork, error) {
-	return models.SandboxNetwork{MainPort: "3000/tcp"}, s.maybeFail()
+func (s *mcpDockerStub) GetNetwork(context.Context, sandbox.SandboxID) (sandbox.Network, error) {
+	return sandbox.Network{Main: sandbox.Port{Number: 3000, Protocol: "tcp"}}, s.maybeFail()
 }
-func (s *mcpDockerStub) Remove(context.Context, string) error               { return s.maybeFail() }
-func (s *mcpDockerStub) Pause(context.Context, string) error                { return s.maybeFail() }
-func (s *mcpDockerStub) Resume(context.Context, string) error               { return s.maybeFail() }
-func (s *mcpDockerStub) RenewExpiration(context.Context, string, int) error { return s.maybeFail() }
-func (s *mcpDockerStub) ExecCommand(_ context.Context, sandboxID string, req models.ExecCommandRequest) (models.CommandDetail, error) {
-	s.execSandboxID, s.execRequest = sandboxID, req
-	return models.CommandDetail{ID: "cmd-1", Name: req.Command, SandboxID: sandboxID}, s.maybeFail()
-}
-func (s *mcpDockerStub) GetCommand(context.Context, string, string) (models.CommandDetail, error) {
-	return models.CommandDetail{ID: "cmd-1"}, s.maybeFail()
-}
-func (s *mcpDockerStub) ListCommands(context.Context, string) ([]models.CommandDetail, error) {
-	return []models.CommandDetail{{ID: "cmd-1"}}, s.maybeFail()
-}
-func (s *mcpDockerStub) KillCommand(context.Context, string, string, int) (models.CommandDetail, error) {
-	return models.CommandDetail{ID: "cmd-1"}, s.maybeFail()
-}
-func (s *mcpDockerStub) GetCommandLogs(context.Context, string, string) (models.CommandLogsResponse, error) {
-	return models.CommandLogsResponse{Stdout: "hello"}, s.maybeFail()
-}
-func (s *mcpDockerStub) WaitCommand(_ context.Context, sandboxID, commandID string) (models.CommandDetail, error) {
-	s.waitSandboxID, s.waitCommandID = sandboxID, commandID
-	if s.waitError != nil {
-		return models.CommandDetail{}, s.waitError
-	}
-	return models.CommandDetail{ID: "cmd-1", Name: "done"}, s.maybeFail()
-}
-func (s *mcpDockerStub) Stats(context.Context, string) (models.SandboxStats, error) {
-	return models.SandboxStats{CPU: 1.5}, s.maybeFail()
-}
-func (s *mcpDockerStub) ReadFile(_ context.Context, sandboxID, path string) (string, error) {
-	s.readSandboxID, s.readPath = sandboxID, path
-	return "contents", s.maybeFail()
-}
-func (s *mcpDockerStub) WriteFile(_ context.Context, sandboxID, path, content string) error {
-	s.writeSandboxID, s.writePath, s.writeContent = sandboxID, path, content
+func (s *mcpDockerStub) Remove(context.Context, sandbox.SandboxID) error { return s.maybeFail() }
+func (s *mcpDockerStub) Pause(context.Context, sandbox.SandboxID) error  { return s.maybeFail() }
+func (s *mcpDockerStub) Resume(context.Context, sandbox.SandboxID) error { return s.maybeFail() }
+func (s *mcpDockerStub) RenewExpiration(context.Context, sandbox.SandboxID, time.Duration) error {
 	return s.maybeFail()
 }
-func (s *mcpDockerStub) DeleteFile(context.Context, string, string) error { return s.maybeFail() }
-func (s *mcpDockerStub) ListDir(_ context.Context, _ string, path string) (string, error) {
+func (s *mcpDockerStub) ExecCommand(_ context.Context, sandboxID sandbox.SandboxID, req sandbox.ProcessRequest) (sandbox.Command, error) {
+	s.execSandboxID, s.execRequest = string(sandboxID), req
+	return sandbox.Command{ID: "cmd-1", Name: req.Command, SandboxID: sandboxID}, s.maybeFail()
+}
+func (s *mcpDockerStub) GetCommand(context.Context, sandbox.SandboxID, sandbox.CommandID) (sandbox.Command, error) {
+	return sandbox.Command{ID: "cmd-1"}, s.maybeFail()
+}
+func (s *mcpDockerStub) ListCommands(context.Context, sandbox.SandboxID) ([]sandbox.Command, error) {
+	return []sandbox.Command{{ID: "cmd-1"}}, s.maybeFail()
+}
+func (s *mcpDockerStub) KillCommand(context.Context, sandbox.SandboxID, sandbox.CommandID, int) (sandbox.Command, error) {
+	return sandbox.Command{ID: "cmd-1"}, s.maybeFail()
+}
+func (s *mcpDockerStub) GetCommandLogs(context.Context, sandbox.SandboxID, sandbox.CommandID) (sandbox.Logs, error) {
+	return sandbox.Logs{Stdout: "hello"}, s.maybeFail()
+}
+func (s *mcpDockerStub) WaitCommand(_ context.Context, sandboxID sandbox.SandboxID, commandID sandbox.CommandID) (sandbox.Command, error) {
+	s.waitSandboxID, s.waitCommandID = string(sandboxID), string(commandID)
+	if s.waitError != nil {
+		return sandbox.Command{}, s.waitError
+	}
+	return sandbox.Command{ID: "cmd-1", Name: "done"}, s.maybeFail()
+}
+func (s *mcpDockerStub) Stats(context.Context, sandbox.SandboxID) (sandbox.Stats, error) {
+	return sandbox.Stats{CPU: 1.5}, s.maybeFail()
+}
+func (s *mcpDockerStub) ReadFile(_ context.Context, sandboxID sandbox.SandboxID, path string) (string, error) {
+	s.readSandboxID, s.readPath = string(sandboxID), path
+	return "contents", s.maybeFail()
+}
+func (s *mcpDockerStub) WriteFile(_ context.Context, sandboxID sandbox.SandboxID, path, content string) error {
+	s.writeSandboxID, s.writePath, s.writeContent = string(sandboxID), path, content
+	return s.maybeFail()
+}
+func (s *mcpDockerStub) DeleteFile(context.Context, sandbox.SandboxID, string) error {
+	return s.maybeFail()
+}
+func (s *mcpDockerStub) ListDir(_ context.Context, _ sandbox.SandboxID, path string) (string, error) {
 	return path, s.maybeFail()
 }
 func (s *mcpDockerStub) PullImage(context.Context, string) error         { return s.maybeFail() }
 func (s *mcpDockerStub) RemoveImage(context.Context, string, bool) error { return s.maybeFail() }
-func (s *mcpDockerStub) InspectImage(context.Context, string) (models.ImageDetail, error) {
-	return models.ImageDetail{ID: "image-1"}, s.maybeFail()
+func (s *mcpDockerStub) InspectImage(context.Context, string) (sandbox.ImageDetail, error) {
+	return sandbox.ImageDetail{ImageSummary: sandbox.ImageSummary{ID: "image-1"}}, s.maybeFail()
 }
-func (s *mcpDockerStub) ListImages(context.Context) ([]models.ImageSummary, error) {
-	return []models.ImageSummary{{ID: "image-1"}}, s.maybeFail()
+func (s *mcpDockerStub) ListImages(context.Context) ([]sandbox.ImageSummary, error) {
+	return []sandbox.ImageSummary{{ID: "image-1"}}, s.maybeFail()
 }
 
-func newMCPTestSession(t *testing.T, d DockerClient) *mcp.ClientSession {
+func newMCPTestSession(t *testing.T, d sandbox.Application) *mcp.ClientSession {
 	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "1"}, nil)
-	addMCPTools(server, d, "localhost", ":3000")
+	addMCPTools(server, &facade{app: d})
 	addMCPContext(server)
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(context.Background(), serverTransport, nil); err != nil {
@@ -179,10 +185,10 @@ func TestMCPToolsExposeAndExecutePublicOperations(t *testing.T) {
 			}
 		})
 	}
-	if got := d.createRequest; got.Image != "alpine" || got.Timeout != 60 || len(got.Ports) != 1 || got.Ports[0] != "3000" || len(got.Env) != 1 || got.Env[0] != "A=B" {
+	if got := d.createRequest; got.Image != "alpine" || got.Timeout != 60*time.Second || len(got.Ports) != 1 || got.Ports[0].String() != "3000/tcp" || len(got.Env) != 1 || got.Env[0] != "A=B" {
 		t.Fatalf("sandbox_create() request mapping = %+v", got)
 	}
-	if got := d.createRequest.Resources; got != nil {
+	if got := d.createRequest.Resources; got != (sandbox.ResourceLimits{}) {
 		t.Fatalf("sandbox_create() unexpectedly passed unspecified resources: %+v", got)
 	}
 	if d.execSandboxID != "sb-1" || d.execRequest.Command != "echo" || len(d.execRequest.Args) != 1 || d.execRequest.Args[0] != "hi" || d.execRequest.Cwd != "/tmp" || d.execRequest.Env["A"] != "B" || d.waitSandboxID != "sb-1" || d.waitCommandID != "cmd-1" {

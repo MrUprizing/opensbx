@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -13,17 +16,22 @@ import (
 
 // Server is a reverse proxy that routes HTTP requests based on subdomain.
 type Server struct {
-	baseDomain string
-	repo       *database.Repository
-	cache      *routeCache
+	repo        *database.Repository
+	cache       *routeCache
+	resolveLive func(context.Context, string) (string, error)
+}
+
+// SetResolver is configured before serving. Live resolution prevents stale
+// published ports from routing traffic to a different process after sandbox stop.
+func (s *Server) SetResolver(resolve func(context.Context, string) (string, error)) {
+	s.resolveLive = resolve
 }
 
 // New creates a proxy Server.
-func New(baseDomain string, repo *database.Repository) *Server {
+func New(repo *database.Repository) *Server {
 	return &Server{
-		baseDomain: baseDomain,
-		repo:       repo,
-		cache:      newRouteCache(30 * time.Second),
+		repo:  repo,
+		cache: newRouteCache(30 * time.Second),
 	}
 }
 
@@ -44,7 +52,20 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := s.resolve(name)
+	var target *url.URL
+	var err error
+	if s.resolveLive != nil {
+		var port string
+		port, err = s.resolveLive(r.Context(), name)
+		if err == nil {
+			port, err = checkedHostPort(port)
+		}
+		if err == nil {
+			target = &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", port)}
+		}
+	} else {
+		target, err = s.resolve(name)
+	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("sandbox %q: %v", name, err), http.StatusBadGateway)
 		return
@@ -68,21 +89,12 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 // extractSubdomain extracts the sandbox name from the Host header.
 // "mi-app.localhost:3000" with baseDomain "localhost" → "mi-app"
 func (s *Server) extractSubdomain(host string) string {
-	// Strip port if present.
-	h := host
-	if idx := strings.LastIndex(h, ":"); idx != -1 {
-		h = h[:idx]
-	}
-
-	suffix := "." + s.baseDomain
-	if !strings.HasSuffix(h, suffix) {
+	h, _, err := canonicalAuthority(host)
+	if err != nil {
 		return ""
 	}
-
-	sub := strings.TrimSuffix(h, suffix)
-	if sub == "" || strings.Contains(sub, ".") {
-		return "" // no nested subdomains
+	if !sandboxHost.MatchString(h) {
+		return ""
 	}
-
-	return sub
+	return strings.TrimSuffix(h, ".localhost")
 }

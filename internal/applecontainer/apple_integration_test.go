@@ -4,27 +4,103 @@ package applecontainer
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+
+	"opensbx/internal/api"
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/images"
+	"opensbx/internal/proxy"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
+	"opensbx/internal/service"
 )
 
 const appleIntegrationStepTimeout = 20 * time.Second
 
+type registryRequestCounter struct {
+	transport http.RoundTripper
+	mu        sync.Mutex
+	requests  int
+}
+
+func (r *registryRequestCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.requests++
+	r.mu.Unlock()
+	return r.transport.RoundTrip(req)
+}
+func (r *registryRequestCounter) count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.requests }
+
 func appleStep(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
 	return context.WithTimeout(context.Background(), appleIntegrationStepTimeout)
+}
+
+func startAppleSingleListener(t *testing.T, app *service.Service, runtimeClient *Client, repo *database.Repository) (*http.Client, *net.TCPAddr) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.SetAddress(listener.Addr())
+	proxyServer := proxy.New(repo)
+	proxyServer.SetResolver(app.Route)
+	runtimeClient.SetCacheInvalidator(proxyServer.InvalidateCache)
+	management := gin.New()
+	handler := api.New(app)
+	handler.RegisterHealthCheck(management)
+	handler.RegisterRoutes(management.Group("/v1"))
+	mcp := api.NewMCPHandler(app)
+	management.Any("/v1/mcp", gin.WrapH(mcp))
+	management.Any("/v1/mcp/*path", gin.WrapH(mcp))
+	server := &http.Server{Handler: proxy.LocalHandler(listener.Addr(), management, proxyServer.Handler()), ReadHeaderTimeout: 5 * time.Second}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		if err := <-serveDone; err != nil && err != http.ErrServerClosed {
+			t.Errorf("Apple API listener serve error: %v", err)
+		}
+	})
+	return &http.Client{Timeout: 3 * time.Second}, listener.Addr().(*net.TCPAddr)
+}
+
+func getFriendlySandbox(t *testing.T, client *http.Client, addr *net.TCPAddr, friendlyHost, path string) (int, string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, "http://"+addr.String()+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = friendlyHost
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("single-listener request Host=%q path=%q: %v", friendlyHost, path, err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode, string(body)
 }
 
 func TestAppleRuntimeEndToEnd(t *testing.T) {
@@ -52,7 +128,22 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	repo := database.NewRepository(db)
-	client := New(repo, runner, nil)
+	runtimeClient := New(repo, runner, nil)
+	dataDir := strings.TrimSpace(os.Getenv("OPENSBX_APPLE_TEST_DATA_DIR"))
+	if dataDir == "" {
+		dataDir = filepath.Join(t.TempDir(), "opensbx-data")
+	}
+	registryCounter := &registryRequestCounter{transport: http.DefaultTransport}
+	store, err := images.Open(dataDir, images.WithTransport(registryCounter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := runtimeio.New(runtimeClient, runtimeClient, repo)
+	client, err := service.New(context.Background(), adapter, adapter, store, repo)
+	if err != nil {
+		t.Fatalf("construct runtime-neutral service: %v", err)
+	}
+	var managedCacheReference string
 	// The fresh temporary repository is the cleanup allow-list. Register before
 	// Create so recovery records from a failed rollback are included as well.
 	t.Cleanup(func() {
@@ -62,15 +153,23 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 			return
 		}
 		for _, row := range rows {
-			if !validID(row.ID) {
-				t.Errorf("refusing to clean invalid sandbox ID from isolated test database: %q", row.ID)
+			if !validID(row.NativeID) {
+				t.Errorf("refusing to clean invalid native ID from isolated test database: %q", row.NativeID)
 				continue
 			}
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 25*time.Second)
-			err := client.Remove(cleanupCtx, row.ID)
+			err := client.Remove(cleanupCtx, sandbox.SandboxID(row.ID))
 			cleanupCancel()
-			if err != nil && !errors.Is(err, docker.ErrNotFound) {
+			if err != nil && !errors.Is(err, sandbox.ErrNotFound) {
 				t.Errorf("cleanup of sandbox recorded only in isolated test database (%s) failed: %v", row.ID, err)
+			}
+		}
+		if managedCacheReference != "" {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			cleanupErr := runner.Run(cleanupCtx, []string{"image", "delete", "--force", managedCacheReference}, nil, io.Discard, io.Discard)
+			cleanupCancel()
+			if cleanupErr != nil {
+				t.Errorf("cleanup generated OpenSBX cache ref %q failed: %v", managedCacheReference, cleanupErr)
 			}
 		}
 	})
@@ -81,31 +180,81 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apple service must already be running at validated version 1.4.1: %v", err)
 	}
+	platform := v1.Platform{OS: "linux", Architecture: "arm64"}
+	ctx, cancel = appleStep(t)
+	artifact, resolveErr := store.Resolve(ctx, image, platform)
+	cancel()
+	if errors.Is(resolveErr, sandbox.ErrImageNotFound) {
+		// Default opt-in runs explicitly prepare only this named test artifact.
+		// A caller may supply the reviewed reusable diagnostic store to avoid repulling.
+		ctx, cancel = appleStep(t)
+		err = client.PullImage(ctx, image)
+		cancel()
+		if err != nil {
+			t.Fatalf("pull test image %q into isolated OpenSBX OCI store: %v", image, err)
+		}
+		ctx, cancel = appleStep(t)
+		artifact, err = store.Resolve(ctx, image, platform)
+		cancel()
+		if err != nil {
+			t.Fatalf("resolve pulled OCI platform: %v", err)
+		}
+	} else if resolveErr != nil {
+		t.Fatalf("resolve preprepared OCI platform: %v", resolveErr)
+	}
+	registryRequestsAfterPull := registryCounter.count()
+	managedCacheReference, err = CacheReference(artifact.Manifest.Digest.String())
+	if err != nil {
+		t.Fatalf("derive cleanup handle for generated native cache image: %v", err)
+	}
 	ctx, cancel = appleStep(t)
 	imageInfo, err := client.InspectImage(ctx, image)
 	cancel()
 	if err != nil {
-		t.Fatalf("required image %q is not locally available (automatic pull is disabled): %v", image, err)
+		t.Fatalf("inspect owned OCI image %q: %v", image, err)
 	}
 	if imageInfo.OS != "linux" || imageInfo.Architecture != "arm64" {
 		t.Fatalf("test image must have a local linux/arm64 variant; got %s/%s", imageInfo.OS, imageInfo.Architecture)
 	}
 
 	isNode := strings.Contains(strings.ToLower(image), "node")
-	ports := []string(nil)
+	ports := []sandbox.Port(nil)
 	if isNode {
-		ports = []string{"3000/tcp"}
+		ports = []sandbox.Port{{Number: 3000, Protocol: "tcp"}}
 	} else {
 		t.Logf("HTTP published-port subtest skipped: %q is not identified as a Node image; core shell/file/exec/lifecycle smoke continues", image)
 	}
+	var apiClient *http.Client
+	var apiAddress *net.TCPAddr
+	if isNode {
+		apiClient, apiAddress = startAppleSingleListener(t, client, runtimeClient, repo)
+	}
 	ctx, cancel = appleStep(t)
-	created, err := client.Create(ctx, models.CreateSandboxRequest{Image: image, Ports: ports, Timeout: 600})
+	created, err := client.Create(ctx, sandbox.CreateOptions{Image: image, Ports: ports, Timeout: 600 * time.Second})
 	cancel()
 	if err != nil {
 		t.Fatalf("create from pre-pulled image without implicit pull: %v", err)
 	}
-	if created.ID == "" || !validID(created.ID) {
+	if !validPublicSandboxID(string(created.ID)) {
 		t.Fatalf("backend returned unexpected non-owned sandbox identifier %q", created.ID)
+	}
+	var friendlyURL *url.URL
+	if isNode {
+		friendlyURL, err = url.Parse(created.URL)
+		if err != nil {
+			t.Fatalf("parse friendly sandbox URL %q: %v", created.URL, err)
+		}
+		wantPort := strconv.Itoa(apiAddress.Port)
+		if friendlyURL.Scheme != "http" || friendlyURL.Host != string(created.ID)+".localhost:"+wantPort {
+			t.Fatalf("sandbox URL %q does not use generated sandbox Host and shared API listener port %s", created.URL, wantPort)
+		}
+		status, body := getFriendlySandbox(t, apiClient, apiAddress, "localhost:"+wantPort, "/v1/health")
+		if status != http.StatusOK || !strings.Contains(body, "healthy") {
+			t.Fatalf("control API on shared listener status=%d body=%q", status, body)
+		}
+	}
+	if got := registryCounter.count(); got != registryRequestsAfterPull {
+		t.Fatalf("create performed implicit registry access: count before=%d after=%d", registryRequestsAfterPull, got)
 	}
 
 	const nestedPath = "tmp/opensbx-integration/nested/result.txt"
@@ -233,7 +382,7 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 		t.Fatalf("wait for remaining sibling command %s: %v", fourth.ID, err)
 	}
 
-	var serviceCommand models.CommandDetail
+	var serviceCommand sandbox.Command
 	if isNode {
 		nodeProgram := "require('http').createServer((_,res)=>res.end('apple-runtime-ok')).listen(3000,'0.0.0.0')"
 		serviceCommand, err = integrationExec(t, client, created.ID, "node", []string{"-e", nodeProgram})
@@ -246,12 +395,22 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 		if networkErr != nil {
 			t.Fatalf("get published localhost port: %v", networkErr)
 		}
-		hostPort := network.PortsMap["3000/tcp"]
+		var hostPort string
+		for _, published := range network.Ports {
+			if published.Guest == (sandbox.Port{Number: 3000, Protocol: "tcp"}) {
+				hostPort = strconv.Itoa(int(published.Host))
+				break
+			}
+		}
 		if hostPort == "" {
 			t.Fatalf("published test port missing from backend network map: %+v", network)
 		}
 		if err := waitForNodeEndpoint(t, hostPort); err != nil {
 			t.Fatal(err)
+		}
+		status, body := getFriendlySandbox(t, apiClient, apiAddress, friendlyURL.Host, "/")
+		if status != http.StatusOK || body != "apple-runtime-ok" {
+			t.Fatalf("friendly sandbox Host route status=%d body=%q", status, body)
 		}
 		ctx, cancel = appleStep(t)
 		_, err = client.KillCommand(ctx, created.ID, serviceCommand.ID, 15)
@@ -273,6 +432,12 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stop generated sandbox: %v", err)
 	}
+	if isNode {
+		status, _ := getFriendlySandbox(t, apiClient, apiAddress, friendlyURL.Host, "/")
+		if status != http.StatusBadGateway {
+			t.Fatalf("stopped sandbox Host route reused stale port, status=%d", status)
+		}
+	}
 	ctx, cancel = appleStep(t)
 	_, err = client.Start(ctx, created.ID)
 	cancel()
@@ -286,7 +451,7 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 		t.Fatalf("sandbox filesystem was not preserved: content=%q err=%v", content, err)
 	}
 	ctx, cancel = appleStep(t)
-	err = client.RenewExpiration(ctx, created.ID, 1)
+	err = client.RenewExpiration(ctx, created.ID, time.Second)
 	cancel()
 	if err != nil {
 		t.Fatalf("schedule short TTL for generated sandbox: %v", err)
@@ -318,22 +483,64 @@ func TestAppleRuntimeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remove only generated sandbox %s: %v", created.ID, err)
 	}
-	if row, err := repo.FindByID(created.ID); err != nil || row != nil {
+	if row, err := repo.FindByID(string(created.ID)); err != nil || row != nil {
 		t.Fatalf("sandbox persistence after exact-ID removal: row=%+v err=%v", row, err)
 	}
 	ctx, cancel = appleStep(t)
 	_, err = client.Inspect(ctx, created.ID)
 	cancel()
-	if !errors.Is(err, docker.ErrNotFound) {
+	if !errors.Is(err, sandbox.ErrNotFound) {
 		t.Fatalf("Inspect removed generated sandbox error=%v, want not found", err)
+	}
+	// Remove only the cache reference derived from this test's selected manifest,
+	// then recreate from the already prepared temp OCI store with no registry path.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), appleIntegrationStepTimeout)
+	err = runner.Run(cleanupCtx, []string{"image", "delete", "--force", managedCacheReference}, nil, io.Discard, io.Discard)
+	cleanupCancel()
+	if err != nil {
+		t.Fatalf("drop only generated native cache ref %q: %v", managedCacheReference, err)
+	}
+	managedCacheReference, err = CacheReference(artifact.Manifest.Digest.String())
+	if err != nil {
+		t.Fatalf("prepare exact cleanup handle for recovery cache: %v", err)
+	}
+	ctx, cancel = appleStep(t)
+	recovered, err := client.Create(ctx, sandbox.CreateOptions{Image: image, Timeout: 600 * time.Second})
+	cancel()
+	if err != nil {
+		t.Fatalf("offline cache-miss recovery from prepared OCI store: %v", err)
+	}
+	if recovered.ID == created.ID {
+		t.Fatalf("offline recovery reused public sandbox ID %q", recovered.ID)
+	}
+	row, err := repo.FindByID(string(recovered.ID))
+	if err != nil || row == nil || row.ImageRoot != artifact.Root.Digest.String() || row.ImageManifest != artifact.Manifest.Digest.String() {
+		t.Fatalf("offline recovered provenance row=%+v err=%v", row, err)
+	}
+	if got := registryCounter.count(); got != registryRequestsAfterPull {
+		t.Fatalf("offline cache recovery downloaded from registry: before=%d after=%d", registryRequestsAfterPull, got)
+	}
+	ctx, cancel = appleStep(t)
+	err = client.Remove(ctx, recovered.ID)
+	cancel()
+	if err != nil {
+		t.Fatalf("remove offline recovery sandbox %s: %v", recovered.ID, err)
 	}
 }
 
-func integrationExec(t *testing.T, client *Client, sandbox, command string, args []string) (models.CommandDetail, error) {
+func integrationExec(t *testing.T, client sandbox.Process, sandboxID sandbox.SandboxID, command string, args []string) (sandbox.Command, error) {
 	t.Helper()
 	ctx, cancel := appleStep(t)
 	defer cancel()
-	return client.ExecCommand(ctx, sandbox, models.ExecCommandRequest{Command: command, Args: args})
+	return client.ExecCommand(ctx, sandboxID, sandbox.ProcessRequest{Command: command, Args: args})
+}
+
+func validPublicSandboxID(id string) bool {
+	if !strings.HasPrefix(id, "sbx-") || len(id) != len("sbx-")+32 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(id, "sbx-"))
+	return err == nil
 }
 
 func waitForNodeEndpoint(t *testing.T, hostPort string) error {

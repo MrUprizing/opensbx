@@ -114,3 +114,11 @@ func TestResolveFailsClosedOnNonAppleHostWithoutLaunchingAnything(t *testing.T) 
 		t.Fatalf("Resolve() on a non-Apple test host = %v", err)
 	}
 }
+
+func TestResolveReportsMissingCLIWithoutAttemptingInstallation(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" { t.Skip("Apple Silicon host prerequisite") }
+	path := t.TempDir()
+	t.Setenv("PATH", path)
+	runner, err := Resolve(context.Background())
+	if err == nil || runner != nil || !strings.Contains(err.Error(), "Apple container CLI not found") { t.Fatalf("Resolve() missing PATH CLI result runner=%v err=%v", runner, err) }
+}

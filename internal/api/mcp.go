@@ -7,24 +7,26 @@ import (
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"opensbx/internal/sandbox"
 	"opensbx/models"
 )
 
 // NewMCPHandler returns a streamable HTTP MCP handler mounted under /v1/mcp.
-func NewMCPHandler(d DockerClient, baseDomain, proxyAddr string, disableLocalhostProtection bool) http.Handler {
+func NewMCPHandler(app sandbox.Application) http.Handler {
+	d := &facade{app: app}
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "opensbx",
 		Version: "1.0.0",
 	}, &mcp.ServerOptions{Instructions: mcpServerInstructions()})
 
-	addMCPTools(server, d, baseDomain, proxyAddr)
+	addMCPTools(server, d)
 	addMCPContext(server)
 	return mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return server
-	}, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: disableLocalhostProtection})
+	}, &mcp.StreamableHTTPOptions{})
 }
 
-func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr string) {
+func addMCPTools(server *mcp.Server, d *facade) {
 	type noArgs struct{}
 
 	type sandboxIDArgs struct {
@@ -32,7 +34,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 	}
 
 	type sandboxCreateArgs struct {
-		Image     string                 `json:"image" jsonschema:"docker image (required), e.g. node:24"`
+		Image     string                 `json:"image" jsonschema:"managed OCI image (required), e.g. node:24"`
 		Ports     []string               `json:"ports,omitempty" jsonschema:"container ports, e.g. [3000,8080/tcp]"`
 		Timeout   int                    `json:"timeout,omitempty" jsonschema:"auto stop timeout in seconds (0 uses default)"`
 		Resources *models.ResourceLimits `json:"resources,omitempty" jsonschema:"resource limits"`
@@ -96,10 +98,10 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 
 	type imageDeleteArgs struct {
 		ID    string `json:"id" jsonschema:"image id or name:tag"`
-		Force bool   `json:"force,omitempty" jsonschema:"force deletion"`
+		Force bool   `json:"force,omitempty" jsonschema:"ignore a missing catalog reference; never delete native images or pinned blobs"`
 	}
 
-	mcp.AddTool(server, &mcp.Tool{Name: "system_health", Description: "Check Docker daemon health"},
+	mcp.AddTool(server, &mcp.Tool{Name: "system_health", Description: "Check selected local runtime health"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
 			if err := d.Ping(ctx); err != nil {
 				return nil, nil, err
@@ -112,9 +114,6 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			items, err := d.List(ctx)
 			if err != nil {
 				return nil, nil, err
-			}
-			for i := range items {
-				items[i].URL = buildSandboxURL(items[i].Name, baseDomain, proxyAddr)
 			}
 			return mcpJSON(map[string]any{"sandboxes": items})
 		})
@@ -146,7 +145,6 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			if err != nil {
 				return nil, nil, err
 			}
-			resp.URL = buildSandboxURL(resp.Name, baseDomain, proxyAddr)
 			return mcpJSON(resp)
 		})
 
@@ -159,7 +157,6 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			if err != nil {
 				return nil, nil, err
 			}
-			resp.URL = buildSandboxURL(resp.Name, baseDomain, proxyAddr)
 			return mcpJSON(resp)
 		})
 
@@ -404,7 +401,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			return mcpJSON(models.FileListResponse{Path: path, Output: output})
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "image_list", Description: "List local Docker images"},
+	mcp.AddTool(server, &mcp.Tool{Name: "image_list", Description: "List OpenSBX-managed OCI images"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, _ noArgs) (*mcp.CallToolResult, any, error) {
 			images, err := d.ListImages(ctx)
 			if err != nil {
@@ -413,7 +410,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			return mcpJSON(map[string]any{"images": images})
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "image_get", Description: "Inspect a local image"},
+	mcp.AddTool(server, &mcp.Tool{Name: "image_get", Description: "Inspect a managed OCI image; ID is the source root descriptor digest"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, args imageIDArgs) (*mcp.CallToolResult, any, error) {
 			if args.ID == "" {
 				return nil, nil, fmt.Errorf("id is required")
@@ -425,7 +422,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			return mcpJSON(image)
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "image_pull", Description: "Pull an image from registry"},
+	mcp.AddTool(server, &mcp.Tool{Name: "image_pull", Description: "Explicitly prepare the selected runtime platform from a registry in the common OCI store"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, args imagePullArgs) (*mcp.CallToolResult, any, error) {
 			if args.Image == "" {
 				return nil, nil, fmt.Errorf("image is required")
@@ -436,7 +433,7 @@ func addMCPTools(server *mcp.Server, d DockerClient, baseDomain, proxyAddr strin
 			return mcpJSON(models.ImagePullResponse{Status: "pulled", Image: args.Image})
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "image_delete", Description: "Delete a local image"},
+	mcp.AddTool(server, &mcp.Tool{Name: "image_delete", Description: "Unreference a managed image without deleting native images, sandboxes or pinned blobs"},
 		func(ctx context.Context, _ *mcp.CallToolRequest, args imageDeleteArgs) (*mcp.CallToolResult, any, error) {
 			if args.ID == "" {
 				return nil, nil, fmt.Errorf("id is required")
@@ -538,7 +535,7 @@ Important:
 }
 
 func mcpServerInstructions() string {
-	return `Opensbx MCP exposes Docker-backed sandboxes.
+	return `Opensbx MCP exposes local runtime-neutral sandboxes backed by managed OCI images.
 
 Recommended flow:
 1) Create sandbox with sandbox_create.
@@ -555,7 +552,7 @@ Important details:
 func mcpHowItWorksDoc() string {
 	return `# Opensbx MCP: How It Works
 
-Opensbx exposes tools to manage isolated Docker sandboxes.
+Opensbx exposes tools to manage isolated local sandboxes.
 
 ## Core mental model
 - ` + "`sandbox_create`" + ` provisions a container.

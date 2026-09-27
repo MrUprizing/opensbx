@@ -15,6 +15,9 @@ import (
 	"opensbx/internal/api"
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
+	"opensbx/internal/images"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/service"
 	"opensbx/models"
 
 	"github.com/gin-gonic/gin"
@@ -30,14 +33,22 @@ func realRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 
 	db := database.New(":memory:")
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	repo := database.NewRepository(db)
 	dc := docker.New(repo)
 	if err := dc.Ping(context.Background()); err != nil {
 		t.Skipf("skipping integration test: Docker unavailable (%v)", err)
 	}
 
+	store, err := images.Open(t.TempDir())
+	require.NoError(t, err)
+	adapter := runtimeio.New(dc, dc, repo)
+	app, err := service.New(context.Background(), adapter, adapter, store, repo)
+	require.NoError(t, err)
 	r := gin.New()
-	h := api.New(dc, "localhost", ":3000")
+	h := api.New(app)
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(r.Group("/v1"))
 	return r

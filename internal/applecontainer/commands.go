@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
+	domain "opensbx/internal/sandbox"
 )
 
 const commandLogLimit = 256 << 10
@@ -58,22 +58,22 @@ type runningCommand struct {
 	stdout, stderr *boundedBuffer
 	done           chan struct{}
 	mu             sync.Mutex
-	detail         models.CommandDetail
+	detail         runtimeio.CommandDetail
 	pid, start     string
 	persistErr     error
 }
 
-func (r *runningCommand) snapshot() (models.CommandDetail, error) {
+func (r *runningCommand) snapshot() (runtimeio.CommandDetail, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	d := r.detail
 	d.Args = append([]string(nil), d.Args...)
 	return d, r.persistErr
 }
-func commandDetail(row database.Command) models.CommandDetail {
+func commandDetail(row database.Command) runtimeio.CommandDetail {
 	args := []string{}
 	_ = json.Unmarshal([]byte(row.Args), &args)
-	return models.CommandDetail{ID: row.ID, Name: row.Name, Args: args, Cwd: row.Cwd, SandboxID: row.SandboxID, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt, ExitCode: row.ExitCode}
+	return runtimeio.CommandDetail{ID: row.ID, Name: row.Name, Args: args, Cwd: row.Cwd, SandboxID: row.SandboxID, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt, ExitCode: row.ExitCode}
 }
 func (c *Client) commandRow(sandbox, id string) (*database.Command, error) {
 	if _, err := c.owned(sandbox); err != nil {
@@ -84,18 +84,18 @@ func (c *Client) commandRow(sandbox, id string) (*database.Command, error) {
 		return nil, err
 	}
 	if row == nil || row.SandboxID != sandbox {
-		return nil, docker.ErrCommandNotFound
+		return nil, domain.ErrCommandNotFound
 	}
 	return row, nil
 }
 
-func (c *Client) ExecCommand(ctx context.Context, sandbox string, req models.ExecCommandRequest) (models.CommandDetail, error) {
+func (c *Client) ExecCommand(ctx context.Context, sandbox string, req runtimeio.ExecCommandRequest) (runtimeio.CommandDetail, error) {
 	if err := validateCommandInput(req); err != nil {
-		return models.CommandDetail{}, err
+		return runtimeio.CommandDetail{}, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var zero models.CommandDetail
+	var zero runtimeio.CommandDetail
 	if c.closing {
 		return zero, errors.New("backend is shutting down")
 	}
@@ -223,19 +223,19 @@ func (c *Client) ExecCommand(ctx context.Context, sandbox string, req models.Exe
 	}
 }
 
-func (c *Client) GetCommand(ctx context.Context, sandbox, id string) (models.CommandDetail, error) {
+func (c *Client) GetCommand(ctx context.Context, sandbox, id string) (runtimeio.CommandDetail, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	row, err := c.commandRow(sandbox, id)
 	if err != nil {
-		return models.CommandDetail{}, err
+		return runtimeio.CommandDetail{}, err
 	}
 	if r := c.commands[id]; r != nil {
 		return r.snapshot()
 	}
 	return commandDetail(*row), nil
 }
-func (c *Client) ListCommands(ctx context.Context, sandbox string) ([]models.CommandDetail, error) {
+func (c *Client) ListCommands(ctx context.Context, sandbox string) ([]runtimeio.CommandDetail, error) {
 	if _, err := c.owned(sandbox); err != nil {
 		return nil, err
 	}
@@ -243,22 +243,22 @@ func (c *Client) ListCommands(ctx context.Context, sandbox string) ([]models.Com
 	if err != nil {
 		return nil, err
 	}
-	out := make([]models.CommandDetail, 0, len(rows))
+	out := make([]runtimeio.CommandDetail, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, commandDetail(row))
 	}
 	return out, nil
 }
-func (c *Client) KillCommand(ctx context.Context, sandbox, id string, signal int) (models.CommandDetail, error) {
+func (c *Client) KillCommand(ctx context.Context, sandbox, id string, signal int) (runtimeio.CommandDetail, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var zero models.CommandDetail
+	var zero runtimeio.CommandDetail
 	row, err := c.commandRow(sandbox, id)
 	if err != nil {
 		return zero, err
 	}
 	if row.ExitCode != nil {
-		return zero, docker.ErrCommandFinished
+		return zero, domain.ErrCommandFinished
 	}
 	if signal < 1 || signal > 64 {
 		return zero, errors.New("Linux signal must be between 1 and 64")
@@ -269,7 +269,7 @@ func (c *Client) KillCommand(ctx context.Context, sandbox, id string, signal int
 	}
 	select {
 	case <-r.done:
-		return zero, docker.ErrCommandFinished
+		return zero, domain.ErrCommandFinished
 	default:
 	}
 	if r.pid == "" || r.start == "" {
@@ -295,34 +295,34 @@ func (c *Client) tracked(sandbox, id string) (*runningCommand, error) {
 	}
 	return r, nil
 }
-func (c *Client) WaitCommand(ctx context.Context, sandbox, id string) (models.CommandDetail, error) {
+func (c *Client) WaitCommand(ctx context.Context, sandbox, id string) (runtimeio.CommandDetail, error) {
 	r, err := c.tracked(sandbox, id)
 	if err != nil {
 		d, e := c.GetCommand(ctx, sandbox, id)
 		if e == nil && d.ExitCode != nil {
 			return d, nil
 		}
-		return models.CommandDetail{}, err
+		return runtimeio.CommandDetail{}, err
 	}
 	select {
 	case <-ctx.Done():
-		return models.CommandDetail{}, ctx.Err()
+		return runtimeio.CommandDetail{}, ctx.Err()
 	case <-r.done:
 		return r.snapshot()
 	}
 }
-func (c *Client) GetCommandLogs(ctx context.Context, sandbox, id string) (models.CommandLogsResponse, error) {
+func (c *Client) GetCommandLogs(ctx context.Context, sandbox, id string) (runtimeio.CommandLogsResponse, error) {
 	r, err := c.tracked(sandbox, id)
 	if err != nil {
-		return models.CommandLogsResponse{}, err
+		return runtimeio.CommandLogsResponse{}, err
 	}
 	d, err := r.snapshot()
 	if err != nil {
-		return models.CommandLogsResponse{}, err
+		return runtimeio.CommandLogsResponse{}, err
 	}
 	stdout, _ := r.stdout.snapshot()
 	stderr, _ := r.stderr.snapshot()
-	return models.CommandLogsResponse{Stdout: stdout, Stderr: stderr, ExitCode: d.ExitCode}, nil
+	return runtimeio.CommandLogsResponse{Stdout: stdout, Stderr: stderr, ExitCode: d.ExitCode}, nil
 }
 
 type logReader struct {

@@ -62,7 +62,7 @@ type RestartResponse struct {
 // SandboxNetwork is the network/routing view for a sandbox.
 type SandboxNetwork struct {
 	MainPort string            `json:"main_port"` // selected container port for proxy routing (e.g. "3000/tcp")
-	PortsMap map[string]string `json:"ports_map"` // map of container port -> docker host port
+	PortsMap map[string]string `json:"ports_map"` // map of guest port -> loopback host port
 }
 
 // ExecCommandRequest is the body for POST /v1/sandboxes/:id/cmd
@@ -160,7 +160,7 @@ type MemoryUsage struct {
 	Percent float64 `json:"percent"` // usage / limit * 100
 }
 
-// ImageDetail is the inspect response for a single Docker image.
+// ImageDetail describes an OpenSBX-managed OCI image; ID is its root digest.
 type ImageDetail struct {
 	ID           string   `json:"id"`
 	Tags         []string `json:"tags"`
@@ -170,7 +170,7 @@ type ImageDetail struct {
 	OS           string   `json:"os"`           // e.g. "linux"
 }
 
-// ImageSummary is a concise view of a local Docker image.
+// ImageSummary is a concise view of a managed OCI root, independent of runtime caches.
 type ImageSummary struct {
 	ID   string   `json:"id"`
 	Tags []string `json:"tags"`

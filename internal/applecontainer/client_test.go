@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 )
 
 type call struct {
@@ -73,7 +74,7 @@ func TestCreatePinsLocalImageUsesWholeCPUAndRollsBackNothingOnValidation(t *test
 			if args[len(args)-3] != "node:24" || args[len(args)-2] != "-c" || args[len(args)-1] != "exec sleep infinity" {
 				t.Errorf("create argv tail = %#v", args)
 			}
-			if args[0] != "create" || args[1] != "--name" || !validID(args[2]) {
+			if args[0] != "create" || !reflect.DeepEqual(args[1:4], []string{"--max-concurrent-downloads", "0", "--name"}) || !validID(args[4]) {
 				t.Errorf("unowned create ID in argv %#v", args)
 			}
 			for i := 0; i < len(args); i++ {
@@ -88,7 +89,7 @@ func TestCreatePinsLocalImageUsesWholeCPUAndRollsBackNothingOnValidation(t *test
 		return nil
 	}
 	c, _ := testClient(t, r)
-	_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "node:24", Resources: &models.ResourceLimits{CPUs: 2, Memory: 512}})
+	_, err := c.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: "node:24", Resources: &runtimeio.ResourceLimits{CPUs: 2, Memory: 512}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestCreatePinsLocalImageUsesWholeCPUAndRollsBackNothingOnValidation(t *test
 	}
 	before := len(r.calls)
 	for _, cpu := range []float64{1.5, 0.5, 5, -1} {
-		_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "node:24", Resources: &models.ResourceLimits{CPUs: cpu}})
+		_, err := c.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: "node:24", Resources: &runtimeio.ResourceLimits{CPUs: cpu}})
 		if err == nil {
 			t.Errorf("fractional/out-of-range CPU %v accepted", cpu)
 		}
@@ -117,7 +118,7 @@ func TestCreateRejectsImageMissAndHostileInputBeforeMutation(t *testing.T) {
 		return nil
 	}
 	c, _ := testClient(t, r)
-	for _, req := range []models.CreateSandboxRequest{
+	for _, req := range []runtimeio.CreateSandboxRequest{
 		{Image: "-danger"}, {Image: "missing:latest"}, {Image: "node:24", Env: []string{"SECRET"}},
 		{Image: "node:24", Env: []string{"BAD KEY=value"}}, {Image: "node:24", Ports: []string{"1/tcp"}},
 	} {
@@ -260,10 +261,10 @@ func TestLookupEnforcesRepositoryOwnershipAndExactCLIID(t *testing.T) {
 	if err := repo.Save(database.Sandbox{ID: id, Name: id}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Inspect(context.Background(), id); !errors.Is(err, docker.ErrNotFound) {
+	if _, err := c.Inspect(context.Background(), id); !errors.Is(err, sandbox.ErrNotFound) {
 		t.Fatalf("unlisted owned ID error = %v, want not found", err)
 	}
-	if _, err := c.Inspect(context.Background(), "../../etc/passwd"); !errors.Is(err, docker.ErrNotFound) {
+	if _, err := c.Inspect(context.Background(), "../../etc/passwd"); !errors.Is(err, sandbox.ErrNotFound) {
 		t.Fatalf("invalid ID error = %v", err)
 	}
 }
@@ -300,7 +301,7 @@ func TestImageReferenceNormalizationAndArchitectureSelection(t *testing.T) {
 	if err != nil || ref != "docker.io/library/node:latest" {
 		t.Fatalf("normalized image = %q, %v", ref, err)
 	}
-	for _, bad := range []string{"", "-option", "node\nlatest", "node\x00tag"} {
+	for _, bad := range []string{"", "-option", "node\nlatest", "node\x00tag", "registry::malformed"} {
 		if _, err := imageRef(bad); err == nil {
 			t.Errorf("invalid image reference %q accepted", bad)
 		}
@@ -313,43 +314,75 @@ func TestImageReferenceNormalizationAndArchitectureSelection(t *testing.T) {
 	}
 }
 
-func TestImageOperationsUseLocalJSONAndExactReferences(t *testing.T) {
-	r := &scriptedRunner{t: t}
-	ref := "docker.io/library/node:24"
-	r.run = func(args []string, _ io.Reader, out, _ io.Writer) error {
-		switch {
-		case reflect.DeepEqual(args, []string{"image", "list", "--format", "json"}):
-			_, _ = io.WriteString(out, `[{"ID":"sha256:node","Configuration":{"Name":"docker.io/library/node:24","Descriptor":{"Digest":"sha256:node"}},"Variants":[{"Platform":{"Architecture":"amd64","OS":"linux"},"Size":10},{"Platform":{"Architecture":"arm64","OS":"linux"},"Size":20}]}]`)
-		case reflect.DeepEqual(args, []string{"image", "inspect", ref}):
-			_, _ = io.WriteString(out, `[{"ID":"sha256:node","Configuration":{"Name":"docker.io/library/node:24","Descriptor":{"Digest":"sha256:node"}},"Variants":[{"Platform":{"Architecture":"arm64","OS":"linux"},"Size":20,"Config":{"Created":"2026-09-01T00:00:00Z","Architecture":"arm64","OS":"linux"}}]}]`)
-		case reflect.DeepEqual(args, []string{"image", "pull", "--platform", "linux/arm64", ref}):
-		case reflect.DeepEqual(args, []string{"image", "delete", "--force", ref}):
-		case reflect.DeepEqual(args, []string{"image", "delete", ref}):
-		default:
-			t.Fatalf("unexpected image CLI argv: %#v", args)
+func TestClientUsesInjectedClockForDeterministicLifecycleTiming(t *testing.T) {
+	clock := time.Date(2026, time.September, 26, 12, 30, 0, 0, time.UTC)
+	client, repo := testClient(t, &scriptedRunner{t: t})
+	client = New(repo, &scriptedRunner{t: t}, func() time.Time { return clock })
+	if got := client.now(); !got.Equal(clock) {
+		t.Fatalf("injected clock=%s want %s", got, clock)
+	}
+}
+
+func TestReservePortsAllocatesAndReleasesLoopbackTCPAndUDPLeases(t *testing.T) {
+	ports, release, err := reservePorts([]string{"3000/tcp", "53/udp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, guest := range []string{"3000/tcp", "53/udp"} {
+		port := ports[guest]
+		if port == "" {
+			t.Fatalf("no host lease for %s: %v", guest, ports)
 		}
-		return nil
+		if _, err := net.LookupPort("tcp", port); err != nil {
+			t.Errorf("non-numeric host lease for %s: %q", guest, port)
+		}
 	}
-	c, _ := testClient(t, r)
-	images, err := c.ListImages(context.Background())
-	if err != nil || len(images) != 1 || images[0].ID != "sha256:node" || images[0].Size != 30 || !reflect.DeepEqual(images[0].Tags, []string{ref}) {
-		t.Fatalf("ListImages() = %+v, %v", images, err)
+	release()
+}
+
+func TestNativeImageInventoryPropagatesCLIFailure(t *testing.T) {
+	runner := &scriptedRunner{t: t}
+	runner.run = func([]string, io.Reader, io.Writer, io.Writer) error {
+		return errors.New("image inventory unavailable")
 	}
-	detail, err := c.InspectImage(context.Background(), "sha256:node")
-	if err != nil || detail.Architecture != "arm64" || detail.Size != 20 || detail.OS != "linux" {
-		t.Fatalf("InspectImage() = %+v, %v", detail, err)
+	client, _ := testClient(t, runner)
+	if _, err := client.images(context.Background()); err == nil || !strings.Contains(err.Error(), "CLI execution failed") || strings.Contains(err.Error(), "inventory unavailable") {
+		t.Fatalf("image inventory error leaked native diagnostics or lost failure status: %v", err)
 	}
-	if err := c.PullImage(context.Background(), "docker.io/library/node:24"); err != nil {
-		t.Fatal(err)
+}
+
+func TestNativeImageInventoryRejectsMalformedIncompleteAndAmbiguousRows(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+		ref           string
+		want          string
+	}{
+		{name: "invalid JSON", payload: `not-json`, ref: "node:latest", want: "invalid Apple image list JSON"},
+		{name: "incomplete record", payload: `[{}]`, ref: "node:latest", want: "incomplete Apple image JSON"},
+		{name: "ambiguous digest alias", payload: `[{"ID":"sha256:same","Configuration":{"Name":"node:one","Descriptor":{"Digest":"sha256:same"}}},{"ID":"sha256:same","Configuration":{"Name":"node:two","Descriptor":{"Digest":"sha256:same"}}}]`, ref: "sha256:same", want: "multiple references"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &scriptedRunner{t: t}
+			runner.run = func(args []string, _ io.Reader, out, _ io.Writer) error {
+				if !reflect.DeepEqual(args, []string{"image", "list", "--format", "json"}) {
+					t.Fatalf("unexpected inventory command %v", args)
+				}
+				_, _ = io.WriteString(out, tc.payload)
+				return nil
+			}
+			client, _ := testClient(t, runner)
+			if _, err := client.findImage(context.Background(), tc.ref); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("findImage error=%v, want %q", err, tc.want)
+			}
+		})
 	}
-	if err := c.RemoveImage(context.Background(), "sha256:node", true); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.RemoveImage(context.Background(), "sha256:node", false); err != nil {
-		t.Fatal(err)
-	}
-	if len(r.calls) != 8 {
-		t.Fatalf("image operation command count = %d, want 8", len(r.calls))
+}
+
+func TestNativeVariantRejectsPlatformsOutsideLinuxArm64(t *testing.T) {
+	var image imageInfo
+	_ = json.Unmarshal([]byte(`{"Variants":[{"Platform":{"Architecture":"amd64","OS":"linux"}},{"Platform":{"Architecture":"arm64","OS":"darwin"}}]}`), &image)
+	if _, err := nativeVariant(image); err == nil || !strings.Contains(err.Error(), "no locally available linux/arm64 variant") {
+		t.Fatalf("nativeVariant wrong-platform error=%v", err)
 	}
 }
 
@@ -360,9 +393,9 @@ func TestCreateFailureDeletesOnlyTheNewOwnedContainer(t *testing.T) {
 		switch {
 		case reflect.DeepEqual(args, []string{"image", "list", "--format", "json"}):
 			_, _ = io.WriteString(out, `[{"ID":"sha256:img","Configuration":{"Name":"node:24","Descriptor":{"Digest":"sha256:img"}},"Variants":[{"Platform":{"Architecture":"arm64","OS":"linux"},"Size":55}]}]`)
-		case len(args) == 16 && args[0] == "create":
-			id := args[2]
-			if !validID(id) || args[1] != "--name" {
+		case len(args) == 18 && args[0] == "create":
+			id := args[4]
+			if !validID(id) || !reflect.DeepEqual(args[1:4], []string{"--max-concurrent-downloads", "0", "--name"}) {
 				t.Fatalf("create did not use a generated ID: %#v", args)
 			}
 			created = append(created, id)
@@ -384,7 +417,7 @@ func TestCreateFailureDeletesOnlyTheNewOwnedContainer(t *testing.T) {
 		return nil
 	}
 	c, _ := testClient(t, r)
-	if _, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "node:24"}); err == nil {
+	if _, err := c.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: "node:24"}); err == nil {
 		t.Fatal("create unexpectedly succeeded after start failures")
 	}
 	if len(created) != 3 {
@@ -394,5 +427,73 @@ func TestCreateFailureDeletesOnlyTheNewOwnedContainer(t *testing.T) {
 		if !validID(id) {
 			t.Errorf("invalid generated ID %q", id)
 		}
+	}
+}
+
+func TestCreatePinsCanonicalOpenSBXCacheReferenceWithoutNativePull(t *testing.T) {
+	const ref = "opensbx.invalid/cache@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	runner := &scriptedRunner{t: t}
+	var nativeID string
+	runner.run = func(args []string, _ io.Reader, out, _ io.Writer) error {
+		switch {
+		case reflect.DeepEqual(args, []string{"image", "list", "--format", "json"}):
+			_, _ = io.WriteString(out, `[{"ID":"sha256:native-index","Configuration":{"Name":"`+ref+`","Descriptor":{"Digest":"sha256:native-index"}},"Variants":[{"Platform":{"Architecture":"arm64","OS":"linux"},"Size":1}]}]`)
+		case len(args) == 18 && args[0] == "create":
+			if !reflect.DeepEqual(args[1:4], []string{"--max-concurrent-downloads", "0", "--name"}) {
+				t.Fatalf("create download guard/identity args=%v", args)
+			}
+			nativeID = args[4]
+			if !validID(nativeID) || args[len(args)-3] != ref {
+				t.Fatalf("create did not pin exact cache reference: %#v", args)
+			}
+		case len(args) == 2 && args[0] == "start" && args[1] == nativeID:
+		default:
+			t.Fatalf("unexpected native command; image pull must not be invoked: %#v", args)
+		}
+		return nil
+	}
+	client, _ := testClient(t, runner)
+	created, err := client.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeID == "" || created.ID != nativeID {
+		t.Fatalf("Create response=%+v native ID=%q", created, nativeID)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("native calls=%v, want inventory/create/start only", runner.calls)
+	}
+}
+
+func TestCreateClassifiesMissingVminitOfflineAndDoesNotRetry(t *testing.T) {
+	const imageRef = "opensbx.invalid/cache@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const diagnostic = "Error: maximum number of concurrent downloads must be greater than 0, got 0"
+	runner := &scriptedRunner{t: t}
+	createAttempts := 0
+	runner.run = func(args []string, _ io.Reader, out, stderr io.Writer) error {
+		switch {
+		case reflect.DeepEqual(args, []string{"image", "list", "--format", "json"}):
+			_, _ = io.WriteString(out, `[{"ID":"sha256:native","Configuration":{"Name":"`+imageRef+`","Descriptor":{"Digest":"sha256:native"}},"Variants":[{"Platform":{"Architecture":"arm64","OS":"linux"},"Size":1}]}]`)
+		case len(args) == 18 && args[0] == "create":
+			createAttempts++
+			_, _ = io.WriteString(stderr, diagnostic)
+			return exitStatusError(1)
+		case reflect.DeepEqual(args, []string{"list", "--all", "--format", "json"}):
+			_, _ = io.WriteString(out, `[]`)
+		default:
+			t.Fatalf("unexpected CLI command after offline classification: %#v", args)
+		}
+		return nil
+	}
+	client, _ := testClient(t, runner)
+	_, err := client.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: imageRef})
+	if !errors.Is(err, errOfflineImageUnavailable) {
+		t.Fatalf("offline sentinel=%v want %v", err, errOfflineImageUnavailable)
+	}
+	if strings.Contains(err.Error(), diagnostic) {
+		t.Fatalf("native diagnostic leaked through safe offline error: %v", err)
+	}
+	if createAttempts != 1 {
+		t.Fatalf("offline create attempts=%d want single attempt", createAttempts)
 	}
 }

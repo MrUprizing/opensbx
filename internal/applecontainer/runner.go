@@ -119,6 +119,10 @@ func (c *Client) run(ctx context.Context, in io.Reader, args ...string) ([]byte,
 	if err != nil {
 		// Arguments and native diagnostics can contain credentials or host paths.
 		// Do not reflect them through the unchanged public error handlers.
+		diagnostic, truncated := diag.snapshot()
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && offlineImageUnavailable(args, diagnostic, truncated) {
+			return nil, errOfflineImageUnavailable
+		}
 		return nil, fmt.Errorf("Apple container %s failed: %w", args[0], safeError(err))
 	}
 	if overflow {

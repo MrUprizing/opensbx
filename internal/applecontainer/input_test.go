@@ -9,21 +9,21 @@ import (
 	"testing"
 
 	"opensbx/internal/database"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
 )
 
 func TestExecInputBudgetIncludesAllFieldsAtExactByteAndEntryBoundaries(t *testing.T) {
 	tests := []struct {
 		name string
-		req  models.ExecCommandRequest
+		req  runtimeio.ExecCommandRequest
 		ok   bool
 	}{
-		{name: "one executable consumes exact byte limit", req: models.ExecCommandRequest{Command: strings.Repeat("x", maxInputBytes-1)}, ok: true},
-		{name: "combined executable and argument consume exact byte limit", req: models.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40002)}}, ok: true},
-		{name: "combined executable and argument exceed byte limit", req: models.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40001)}}, ok: false},
-		{name: "command cwd and environment share byte budget", req: models.ExecCommandRequest{Command: strings.Repeat("c", 40000), Cwd: strings.Repeat("d", 25531), Env: map[string]string{"K": "v"}}, ok: false},
-		{name: "1024 entries including executable", req: models.ExecCommandRequest{Command: "x", Args: make([]string, maxInputEntries-1)}, ok: true},
-		{name: "1025 entries including executable", req: models.ExecCommandRequest{Command: "x", Args: make([]string, maxInputEntries)}, ok: false},
+		{name: "one executable consumes exact byte limit", req: runtimeio.ExecCommandRequest{Command: strings.Repeat("x", maxInputBytes-1)}, ok: true},
+		{name: "combined executable and argument consume exact byte limit", req: runtimeio.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40002)}}, ok: true},
+		{name: "combined executable and argument exceed byte limit", req: runtimeio.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40001)}}, ok: false},
+		{name: "command cwd and environment share byte budget", req: runtimeio.ExecCommandRequest{Command: strings.Repeat("c", 40000), Cwd: strings.Repeat("d", 25531), Env: map[string]string{"K": "v"}}, ok: false},
+		{name: "1024 entries including executable", req: runtimeio.ExecCommandRequest{Command: "x", Args: make([]string, maxInputEntries-1)}, ok: true},
+		{name: "1025 entries including executable", req: runtimeio.ExecCommandRequest{Command: "x", Args: make([]string, maxInputEntries)}, ok: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,7 +76,7 @@ func TestOversizedCreateInputIsRejectedBeforeCLIOrPersistence(t *testing.T) {
 		{name: "nul creation env value", env: []string{"KEY=bad\x00value"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "node:24", Env: tc.env})
+			_, err := c.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: "node:24", Env: tc.env})
 			if err == nil {
 				t.Fatal("oversized create environment accepted")
 			}
@@ -106,18 +106,18 @@ func TestExecInputBudgetRejectionsPrecedeCLICommandPersistenceAndLaunch(t *testi
 	}
 	for _, tc := range []struct {
 		name      string
-		req       models.ExecCommandRequest
+		req       runtimeio.ExecCommandRequest
 		wantCalls int
 	}{
-		{name: "combined exec byte overflow", req: models.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40001)}}},
-		{name: "oversized exec env key", req: models.ExecCommandRequest{Command: "echo", Env: map[string]string{strings.Repeat("K", maxInputBytes): "x"}}},
-		{name: "oversized exec env value", req: models.ExecCommandRequest{Command: "echo", Env: map[string]string{"K": strings.Repeat("v", maxInputBytes)}}},
-		{name: "exec entry overflow", req: models.ExecCommandRequest{Command: "echo", Args: make([]string, maxInputEntries)}},
-		{name: "nul executable", req: models.ExecCommandRequest{Command: "ec\x00ho"}},
-		{name: "nul argument", req: models.ExecCommandRequest{Command: "echo", Args: []string{"bad\x00arg"}}},
-		{name: "nul working directory", req: models.ExecCommandRequest{Command: "echo", Cwd: "/tmp/bad\x00cwd"}},
-		{name: "nul environment key", req: models.ExecCommandRequest{Command: "echo", Env: map[string]string{"BAD\x00KEY": "value"}}},
-		{name: "nul environment value", req: models.ExecCommandRequest{Command: "echo", Env: map[string]string{"KEY": "bad\x00value"}}},
+		{name: "combined exec byte overflow", req: runtimeio.ExecCommandRequest{Command: strings.Repeat("c", 40000), Args: []string{strings.Repeat("a", maxInputBytes-40001)}}},
+		{name: "oversized exec env key", req: runtimeio.ExecCommandRequest{Command: "echo", Env: map[string]string{strings.Repeat("K", maxInputBytes): "x"}}},
+		{name: "oversized exec env value", req: runtimeio.ExecCommandRequest{Command: "echo", Env: map[string]string{"K": strings.Repeat("v", maxInputBytes)}}},
+		{name: "exec entry overflow", req: runtimeio.ExecCommandRequest{Command: "echo", Args: make([]string, maxInputEntries)}},
+		{name: "nul executable", req: runtimeio.ExecCommandRequest{Command: "ec\x00ho"}},
+		{name: "nul argument", req: runtimeio.ExecCommandRequest{Command: "echo", Args: []string{"bad\x00arg"}}},
+		{name: "nul working directory", req: runtimeio.ExecCommandRequest{Command: "echo", Cwd: "/tmp/bad\x00cwd"}},
+		{name: "nul environment key", req: runtimeio.ExecCommandRequest{Command: "echo", Env: map[string]string{"BAD\x00KEY": "value"}}},
+		{name: "nul environment value", req: runtimeio.ExecCommandRequest{Command: "echo", Env: map[string]string{"KEY": "bad\x00value"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			beforeCalls := len(r.calls)

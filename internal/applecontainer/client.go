@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"opensbx/internal/database"
-	"opensbx/internal/docker"
-	"opensbx/models"
+	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 )
 
 const defaultTimeout = 900
@@ -46,7 +46,7 @@ func New(repo *database.Repository, runner Runner, now func() time.Time) *Client
 	if now == nil {
 		now = time.Now
 	}
-	return &Client{repo: repo, runner: runner, now: now, timers: make(map[string]*expiration), finished: make(map[string]string), commands: make(map[string]*runningCommand)}
+	return &Client{repo: repo.NativeView(), runner: runner, now: now, timers: make(map[string]*expiration), finished: make(map[string]string), commands: make(map[string]*runningCommand)}
 }
 func (c *Client) SetCacheInvalidator(fn func(string)) {
 	c.mu.Lock()
@@ -106,14 +106,14 @@ type containerInfo struct {
 
 func (c *Client) owned(id string) (*database.Sandbox, error) {
 	if !validID(id) {
-		return nil, docker.ErrNotFound
+		return nil, sandbox.ErrNotFound
 	}
 	sb, err := c.repo.FindByID(id)
 	if err != nil {
 		return nil, err
 	}
 	if sb == nil {
-		return nil, docker.ErrNotFound
+		return nil, sandbox.ErrNotFound
 	}
 	return sb, nil
 }
@@ -168,7 +168,7 @@ func (c *Client) inventory(ctx context.Context) (map[string]containerInfo, error
 func ownedInventoryEntry(inventory map[string]containerInfo, id string) (containerInfo, error) {
 	info, found := inventory[id]
 	if !validID(id) || !found {
-		return containerInfo{}, docker.ErrNotFound
+		return containerInfo{}, sandbox.ErrNotFound
 	}
 	if info.Configuration.Labels[ownerLabel] != id {
 		return containerInfo{}, errors.New("container ownership label does not match repository")
@@ -230,37 +230,37 @@ func (c *Client) timingLocked(id string) sandboxTiming {
 	return timing
 }
 
-func sandboxDetail(sb database.Sandbox, info containerInfo, timing sandboxTiming) (models.SandboxDetail, error) {
+func sandboxDetail(sb database.Sandbox, info containerInfo, timing sandboxTiming) (runtimeio.SandboxDetail, error) {
 	ports, err := networkPorts(info)
 	if err != nil {
-		return models.SandboxDetail{}, err
+		return runtimeio.SandboxDetail{}, err
 	}
-	d := models.SandboxDetail{ID: sb.ID, Name: sb.Name, Image: sb.Image, Status: info.Status.State, Running: info.Status.State == "running", Ports: keys(ports), Resources: models.ResourceLimits{CPUs: info.Configuration.Resources.CPUs, Memory: info.Configuration.Resources.MemoryInBytes / (1024 * 1024)}, StartedAt: dateString(info.Status.StartedDate), FinishedAt: timing.finishedAt, ExpiresAt: timing.expiresAt}
+	d := runtimeio.SandboxDetail{ID: sb.ID, Name: sb.Name, Image: sb.Image, Status: info.Status.State, Running: info.Status.State == "running", Ports: keys(ports), Resources: runtimeio.ResourceLimits{CPUs: info.Configuration.Resources.CPUs, Memory: info.Configuration.Resources.MemoryInBytes / (1024 * 1024)}, StartedAt: dateString(info.Status.StartedDate), FinishedAt: timing.finishedAt, ExpiresAt: timing.expiresAt}
 	return d, nil
 }
 
-func (c *Client) detailLocked(ctx context.Context, id string) (models.SandboxDetail, error) {
+func (c *Client) detailLocked(ctx context.Context, id string) (runtimeio.SandboxDetail, error) {
 	info, err := c.lookup(ctx, id)
 	if err != nil {
-		return models.SandboxDetail{}, err
+		return runtimeio.SandboxDetail{}, err
 	}
 	sb, err := c.owned(id)
 	if err != nil {
-		return models.SandboxDetail{}, err
+		return runtimeio.SandboxDetail{}, err
 	}
 	return sandboxDetail(*sb, info, c.timingLocked(id))
 }
-func (c *Client) Inspect(ctx context.Context, id string) (models.SandboxDetail, error) {
+func (c *Client) Inspect(ctx context.Context, id string) (runtimeio.SandboxDetail, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.detailLocked(ctx, id)
 }
-func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
+func (c *Client) List(ctx context.Context) ([]runtimeio.SandboxSummary, error) {
 	rows, err := c.repo.FindAll()
 	if err != nil {
 		return nil, err
 	}
-	result := make([]models.SandboxSummary, 0, len(rows))
+	result := make([]runtimeio.SandboxSummary, 0, len(rows))
 	if len(rows) == 0 {
 		return result, nil
 	}
@@ -278,8 +278,8 @@ func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
 	c.mu.Unlock()
 	for _, row := range rows {
 		info, err := ownedInventoryEntry(inventory, row.ID)
-		if errors.Is(err, docker.ErrNotFound) {
-			result = append(result, models.SandboxSummary{ID: row.ID, Name: row.Name, Image: row.Image, Status: "removed", State: "removed", Ports: keys(row.Ports)})
+		if errors.Is(err, sandbox.ErrNotFound) {
+			result = append(result, runtimeio.SandboxSummary{ID: row.ID, Name: row.Name, Image: row.Image, Status: "removed", State: "removed", Ports: keys(row.Ports)})
 			continue
 		}
 		if err != nil {
@@ -289,7 +289,7 @@ func (c *Client) List(ctx context.Context) ([]models.SandboxSummary, error) {
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, models.SandboxSummary{ID: d.ID, Name: d.Name, Image: d.Image, Status: d.Status, State: d.Status, Ports: d.Ports, ExpiresAt: d.ExpiresAt})
+		result = append(result, runtimeio.SandboxSummary{ID: d.ID, Name: d.Name, Image: d.Image, Status: d.Status, State: d.Status, Ports: d.Ports, ExpiresAt: d.ExpiresAt})
 	}
 	return result, nil
 }
@@ -384,10 +384,10 @@ func reservePorts(ports []string) (map[string]string, func(), error) {
 	return m, release, nil
 }
 
-func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (models.CreateSandboxResponse, error) {
+func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest) (runtimeio.CreateSandboxResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var result models.CreateSandboxResponse
+	var result runtimeio.CreateSandboxResponse
 	if c.closing {
 		return result, errors.New("backend is shutting down")
 	}
@@ -434,7 +434,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (m
 		if err != nil {
 			return result, err
 		}
-		args := []string{"create", "--name", id, "--label", ownerLabel + "=" + id, "--cpus", strconv.Itoa(int(cpus)), "--memory", strconv.FormatInt(mem, 10) + "MiB", "--platform", "linux/arm64", "--entrypoint", "/bin/sh"}
+		// In validated 1.4.1, fetch returns local content first; pull rejects zero
+		// downloads before creating any registry request. This also applies to
+		// Apple's configured vminit image, which must already be prepared locally.
+		args := []string{"create", "--max-concurrent-downloads", "0", "--name", id, "--label", ownerLabel + "=" + id, "--cpus", strconv.Itoa(int(cpus)), "--memory", strconv.FormatInt(mem, 10) + "MiB", "--platform", "linux/arm64", "--entrypoint", "/bin/sh"}
 		args = append(args, env...)
 		for _, p := range ports {
 			args = append(args, "--publish", "127.0.0.1:"+mapped[p]+":"+p)
@@ -449,29 +452,45 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest) (m
 		if createErr != nil {
 			// Preserve a recovery record if rollback cannot complete. Only this
 			// random, app-labelled resource can be touched by cleanup.
-			row := database.Sandbox{ID: id, Name: id, Image: req.Image, Ports: database.JSONMap(mapped)}
+			row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped)}
 			if len(ports) > 0 {
 				row.Port = ports[0]
 			}
 			if err := c.rollback(id); err != nil {
-				saveErr := c.repo.Save(row)
+				saveErr := c.repo.CreateOwnership(row)
 				return result, errors.Join(createErr, err, saveErr)
 			}
 			lastErr = createErr
 			if ctx.Err() != nil {
 				return result, ctx.Err()
 			}
+			if errors.Is(createErr, errOfflineImageUnavailable) {
+				return result, createErr
+			}
 			continue
 		}
-		row := database.Sandbox{ID: id, Name: id, Image: req.Image, Ports: database.JSONMap(mapped)}
+		row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped)}
 		if len(ports) > 0 {
 			row.Port = ports[0]
 		}
-		if err := c.repo.Save(row); err != nil {
-			return result, errors.Join(err, c.rollback(id))
+		if err := c.repo.CreateOwnership(row); err != nil {
+			rollbackErr := c.rollback(id)
+			if rollbackErr == nil {
+				return result, err
+			}
+			// No Provisioned handle reaches the service on this path. Retain this
+			// exact creation's identity without overwriting a colliding owner row.
+			cause := errors.Join(err, rollbackErr)
+			row.ImageRoot = sandbox.CreationImage(ctx, "")
+			row.NativeImage = image.Configuration.Name
+			if ref, refErr := imageRef(image.Configuration.Name); refErr == nil {
+				_, row.ImageManifest, _ = strings.Cut(ref, "@")
+			}
+			row.RecoveryError = cause.Error()
+			return result, errors.Join(cause, c.repo.CreateOwnership(row))
 		}
 		c.scheduleLocked(id, req.Timeout)
-		return models.CreateSandboxResponse{ID: id, Name: id, Ports: ports}, nil
+		return runtimeio.CreateSandboxResponse{ID: id, Name: id, Ports: ports}, nil
 	}
 	return result, fmt.Errorf("Apple container create/start failed after 3 attempts: %w", lastErr)
 }
@@ -516,7 +535,7 @@ func (c *Client) scheduleLocked(id string, timeout int) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, docker.ErrAlreadyStopped) && !errors.Is(err, docker.ErrNotFound) {
+		if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
 			log.Printf("Apple sandbox TTL stop failed for %s: %v", id, err)
 			c.scheduleLocked(id, 30)
 		}
@@ -537,7 +556,7 @@ func (c *Client) stopLocked(ctx context.Context, id string) error {
 	if info.Status.State == "stopped" {
 		c.clearTimer(id)
 		c.changed(id)
-		return docker.ErrAlreadyStopped
+		return sandbox.ErrAlreadyStopped
 	}
 	if _, err := c.run(ctx, nil, "stop", id); err != nil {
 		return err
@@ -552,43 +571,43 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 	defer c.mu.Unlock()
 	return c.stopLocked(ctx, id)
 }
-func (c *Client) startLocked(ctx context.Context, id string) (models.RestartResponse, error) {
+func (c *Client) startLocked(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	if c.closing {
-		return models.RestartResponse{}, errors.New("backend is shutting down")
+		return runtimeio.RestartResponse{}, errors.New("backend is shutting down")
 	}
 	info, err := c.lookup(ctx, id)
 	if err != nil {
-		return models.RestartResponse{}, err
+		return runtimeio.RestartResponse{}, err
 	}
 	if info.Status.State == "running" {
-		return models.RestartResponse{}, docker.ErrAlreadyRunning
+		return runtimeio.RestartResponse{}, sandbox.ErrAlreadyRunning
 	}
 	ports, err := networkPorts(info)
 	if err != nil {
-		return models.RestartResponse{}, err
+		return runtimeio.RestartResponse{}, err
 	}
 	if _, err := c.run(ctx, nil, "start", id); err != nil {
-		return models.RestartResponse{}, err
+		return runtimeio.RestartResponse{}, err
 	}
 	delete(c.finished, id)
 	c.scheduleLocked(id, defaultTimeout)
 	c.changed(id)
 	if err := c.repo.UpdatePorts(id, database.JSONMap(ports)); err != nil {
-		return models.RestartResponse{}, err
+		return runtimeio.RestartResponse{}, err
 	}
 	d, err := c.detailLocked(ctx, id)
-	return models.RestartResponse{Status: "started", Ports: d.Ports, ExpiresAt: d.ExpiresAt}, err
+	return runtimeio.RestartResponse{Status: "started", Ports: d.Ports, ExpiresAt: d.ExpiresAt}, err
 }
-func (c *Client) Start(ctx context.Context, id string) (models.RestartResponse, error) {
+func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.startLocked(ctx, id)
 }
-func (c *Client) Restart(ctx context.Context, id string) (models.RestartResponse, error) {
+func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, docker.ErrAlreadyStopped) {
-		return models.RestartResponse{}, err
+	if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) {
+		return runtimeio.RestartResponse{}, err
 	}
 	// Never recreate an existing sandbox to repair a port collision.
 	result, err := c.startLocked(ctx, id)
@@ -597,22 +616,22 @@ func (c *Client) Restart(ctx context.Context, id string) (models.RestartResponse
 	}
 	return result, err
 }
-func (c *Client) GetNetwork(ctx context.Context, id string) (models.SandboxNetwork, error) {
+func (c *Client) GetNetwork(ctx context.Context, id string) (runtimeio.SandboxNetwork, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	info, err := c.lookup(ctx, id)
 	if err != nil {
-		return models.SandboxNetwork{}, err
+		return runtimeio.SandboxNetwork{}, err
 	}
 	sb, err := c.owned(id)
 	if err != nil {
-		return models.SandboxNetwork{}, err
+		return runtimeio.SandboxNetwork{}, err
 	}
 	ports, err := networkPorts(info)
 	if err != nil {
-		return models.SandboxNetwork{}, err
+		return runtimeio.SandboxNetwork{}, err
 	}
-	return models.SandboxNetwork{MainPort: sb.Port, PortsMap: ports}, nil
+	return runtimeio.SandboxNetwork{MainPort: sb.Port, PortsMap: ports}, nil
 }
 func (c *Client) Remove(ctx context.Context, id string) error {
 	c.mu.Lock()
@@ -621,7 +640,7 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 		return err
 	}
 	_, err := c.lookup(ctx, id)
-	if err != nil && !errors.Is(err, docker.ErrNotFound) {
+	if err != nil && !errors.Is(err, sandbox.ErrNotFound) {
 		return err
 	}
 	if err == nil {
@@ -704,7 +723,7 @@ func (c *Client) Shutdown(ctx context.Context) {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := c.stopLocked(ctx, row.ID); err != nil && !errors.Is(err, docker.ErrAlreadyStopped) && !errors.Is(err, docker.ErrNotFound) {
+		if err := c.stopLocked(ctx, row.ID); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
 			log.Printf("Apple shutdown %s: %v", row.ID, err)
 		}
 	}
