@@ -7,10 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,47 +17,20 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/klauspost/compress/zstd"
-	moby "github.com/moby/moby/client"
 	"opensbx/internal/images"
 	"opensbx/internal/sandbox"
 )
 
-func ValidateEndpoint(raw string) error {
-	u, err := url.Parse(raw)
+// ImageExists checks if an image exists locally.
+func (c *Client) ImageExists(ctx context.Context, image string) (bool, error) {
+	_, err := c.cli.ImageInspect(ctx, image)
 	if err != nil {
-		return err
-	}
-	switch u.Scheme {
-	case "unix":
-		if u.Host == "" && filepath.IsAbs(u.Path) {
-			return nil
+		if errdefs.IsNotFound(err) {
+			return false, nil
 		}
-	case "npipe":
-		if u.Host == "" && strings.HasPrefix(u.Path, "//./pipe/") {
-			return nil
-		}
-	case "tcp", "http", "https":
-		host := u.Hostname()
-		ip := net.ParseIP(host)
-		if u.User == nil && (host == "localhost" || ip != nil && ip.IsLoopback()) && u.Port() != "" && u.Path == "" {
-			return nil
-		}
+		return false, err
 	}
-	return fmt.Errorf("Docker endpoint %q is not a local socket or loopback endpoint", raw)
-}
-func (c *Client) Capabilities(ctx context.Context) (sandbox.Capabilities, error) {
-	info, err := c.cli.Info(ctx, moby.InfoOptions{})
-	if err != nil {
-		return sandbox.Capabilities{}, err
-	}
-	arch := info.Info.Architecture
-	switch arch {
-	case "aarch64":
-		arch = "arm64"
-	case "x86_64":
-		arch = "amd64"
-	}
-	return sandbox.Capabilities{Runtime: "docker", Version: info.Info.ServerVersion + "/docker-archive-v2", Platform: sandbox.Platform{OS: info.Info.OSType, Architecture: arch}, Pause: true, FractionalCPU: true}, nil
+	return true, nil
 }
 
 // Serialize each private tag across clients. External tag changes are harmless:
