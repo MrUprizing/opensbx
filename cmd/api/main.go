@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"opensbx/internal/docker"
 	"opensbx/internal/images"
 	"opensbx/internal/logging"
+	"opensbx/internal/processctl"
 	"opensbx/internal/proxy"
 	"opensbx/internal/runtimechoice"
 	"opensbx/internal/runtimeio"
@@ -36,7 +38,7 @@ import (
 // @title           Opensbx API
 // @version         1.0
 // @description     Lightweight sandbox API for running untrusted code in isolated environments.
-// @host      localhost:8080
+// @host      localhost:18089
 // @BasePath  /v1
 
 // @securityDefinitions.apikey  ApiKeyAuth
@@ -45,44 +47,54 @@ import (
 // @description                 Enter "Bearer {your-api-key}"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "image" {
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
-		if err := images.CLI(ctx, os.Args[2:], config.DefaultDataDir(), os.Stdout); err != nil {
-			log.Fatal(err)
-		}
-		return
+	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
+		log.Printf("opensbx: %v", err)
+		os.Exit(1)
 	}
-	cfg := config.Load()
+}
+
+func runServer(args []string) error {
+	cfg, err := config.Parse(args)
+	if err != nil {
+		return err
+	}
 	logFileCloser, err := logging.Setup(cfg.LogFile)
 	if err != nil {
-		log.Fatalf("logging setup failed: %v", err)
+		return fmt.Errorf("logging setup failed: %w", err)
 	}
 	defer logFileCloser.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), serverSignals()...)
 	defer stop()
 	choice, err := runtimechoice.Select(ctx, cfg.Runtime, runtime.GOOS, isatty.IsTerminal(os.Stdin.Fd()), os.Stdin, os.Stdout)
 	if err != nil {
-		log.Fatalf("runtime selection failed: %v", err)
+		return fmt.Errorf("runtime selection failed: %w", err)
 	}
 	dbPath, err := cfg.ExecutionPath(choice)
 	if err != nil {
-		log.Fatalf("local state: %v", err)
+		return fmt.Errorf("local state: %w", err)
 	}
 	executionLock := flock.New(dbPath + ".lock")
 	locked, err := executionLock.TryLock()
-	if err != nil || !locked {
-		log.Fatalf("execution database already in use or inaccessible: %v", err)
+	if err != nil {
+		return fmt.Errorf("could not lock execution database: %w", err)
+	}
+	if !locked {
+		return errors.New("execution database already in use by another OpenSBX process; stop that server before starting another")
 	}
 	defer executionLock.Unlock()
+	serverLock, err := processctl.Acquire(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer serverLock.Close()
 	var appleRunner applecontainer.Runner
 	if choice == "container" {
 		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		appleRunner, err = applecontainer.Resolve(checkCtx)
 		cancel()
 		if err != nil {
-			log.Fatalf("runtime validation failed: %v", err)
+			return fmt.Errorf("runtime validation failed: %w", err)
 		}
 	}
 	db := database.New(dbPath)
@@ -99,7 +111,7 @@ func main() {
 		err = client.Ping(checkCtx)
 		cancel()
 		if err != nil {
-			log.Fatalf("runtime validation failed: %v", err)
+			return fmt.Errorf("runtime validation failed: %w", err)
 		}
 		dc = client
 	} else {
@@ -109,17 +121,17 @@ func main() {
 
 	store, err := images.Open(cfg.DataDir)
 	if err != nil {
-		log.Fatalf("image store: %v", err)
+		return fmt.Errorf("image store: %w", err)
 	}
 	adapter := runtimeio.New(dc, dc, repo)
 	app, err := service.New(ctx, adapter, adapter, store, repo)
 	if err != nil {
-		log.Fatalf("application setup: %v", err)
+		return fmt.Errorf("application setup: %w", err)
 	}
 	// Open one loopback listener only after runtime and store validation.
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		log.Fatalf("api listen: %v", err)
+		return fmt.Errorf("api listen: %w", listenError(cfg.Addr, err))
 	}
 	defer listener.Close()
 	app.SetAddress(listener.Addr())
@@ -157,17 +169,31 @@ func main() {
 		})
 	})
 
-	// Graceful shutdown: listen for SIGINT/SIGTERM, then stop tracked containers.
+	// Graceful shutdown on terminal or process-control signals stops tracked containers.
 	srv := &http.Server{Addr: listener.Addr().String(), Handler: proxy.LocalHandler(listener.Addr(), r, proxyHandler), ReadHeaderTimeout: 10 * time.Second}
 
+	serveErrors := make(chan error, 1)
 	go func() {
 		log.Printf("local API and sandbox URLs listening on %s", listener.Addr())
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("api listen: %v", err)
+			serveErrors <- err
 		}
 	}()
+	readyCtx, cancelReady := context.WithTimeout(ctx, 5*time.Second)
+	if err := waitForAPIReady(readyCtx, listener.Addr().String()); err != nil {
+		cancelReady()
+		return err
+	}
+	cancelReady()
+	if err := serverLock.Publish(os.Getpid()); err != nil {
+		return fmt.Errorf("record server process: %w", err)
+	}
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serveErrors:
+		return fmt.Errorf("api server stopped unexpectedly: %w", err)
+	}
 	log.Println("shutting down: stopping incoming traffic...")
 
 	httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), 10*time.Second)
@@ -187,4 +213,36 @@ func main() {
 	dc.Shutdown(sandboxShutdownCtx)
 
 	log.Println("server stopped")
+	return nil
+}
+
+func listenError(addr string, err error) error {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return fmt.Errorf("address %s is already in use; choose another loopback port with -addr 127.0.0.1:18090", addr)
+	}
+	return fmt.Errorf("cannot listen on %s: %w", addr, err)
+}
+
+func waitForAPIReady(ctx context.Context, addr string) error {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/swagger/index.html", nil)
+		if err != nil {
+			return fmt.Errorf("prepare API readiness check: %w", err)
+		}
+		response, requestErr := client.Do(req)
+		if response != nil {
+			_ = response.Body.Close()
+			if requestErr == nil && response.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("API did not become ready: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }

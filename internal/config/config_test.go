@@ -37,17 +37,29 @@ func TestLoadAppliesExplicitFlagsAndEnvironmentDefaults(t *testing.T) {
 	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
 		old, had := os.LookupEnv(key)
 		_ = os.Unsetenv(key)
-		t.Cleanup(func() { if had { _ = os.Setenv(key, old) } else { _ = os.Unsetenv(key) } })
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(key, old)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		})
 	}
 	got := Load()
-	if got.Addr != "127.0.0.1:9099" || got.Runtime != "docker" || got.LegacyDB == "" || got.LogFile != "custom.log" || got.APIKey != "local-secret" { t.Fatalf("explicit config=%+v", got) }
-	if got.DataDir != filepath.Join(filepath.Dir(got.LegacyDB), "explicit") && !strings.HasSuffix(got.DataDir, "explicit") { t.Fatalf("data directory flag ignored: %q", got.DataDir) }
+	if got.Addr != "127.0.0.1:9099" || got.Runtime != "docker" || got.LegacyDB == "" || got.LogFile != "custom.log" || got.APIKey != "local-secret" {
+		t.Fatalf("explicit config=%+v", got)
+	}
+	if got.DataDir != filepath.Join(filepath.Dir(got.LegacyDB), "explicit") && !strings.HasSuffix(got.DataDir, "explicit") {
+		t.Fatalf("data directory flag ignored: %q", got.DataDir)
+	}
 }
 
 func TestDefaultDataDirUsesExplicitLocalOverride(t *testing.T) {
 	custom := filepath.Join(t.TempDir(), "user-owned-state")
 	t.Setenv("OPENSBX_DATA_DIR", custom)
-	if got := DefaultDataDir(); got != custom { t.Fatalf("DefaultDataDir()=%q want %q", got, custom) }
+	if got := DefaultDataDir(); got != custom {
+		t.Fatalf("DefaultDataDir()=%q want %q", got, custom)
+	}
 }
 
 func TestLoadUsesLoopbackDefaultsAndNormalizedLogFile(t *testing.T) {
@@ -69,7 +81,7 @@ func TestLoadUsesLoopbackDefaultsAndNormalizedLogFile(t *testing.T) {
 		})
 	}
 	got := Load()
-	if got.Addr != "127.0.0.1:8080" || got.APIKey != "" || got.LogFile != "opensbx.log" {
+	if got.Addr != "127.0.0.1:18089" || got.APIKey != "" || got.LogFile != "opensbx.log" {
 		t.Fatalf("unexpected defaults: %+v", got)
 	}
 }

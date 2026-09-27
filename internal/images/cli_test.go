@@ -76,6 +76,18 @@ func TestImageCLIHelpAndOfflineArchiveLifecycleWithoutRuntime(t *testing.T) {
 	}
 }
 
+func TestImageCLIHelpAliasesShowUsage(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"-help"}, {"pull", "-h"}, {"pull", "--help"}} {
+		var output bytes.Buffer
+		if err := CLI(context.Background(), args, t.TempDir(), &output); err != nil {
+			t.Fatalf("CLI(%q): %v", args, err)
+		}
+		if !strings.Contains(output.String(), "Usage: opensbx image") {
+			t.Errorf("CLI(%q) help=%q", args, output.String())
+		}
+	}
+}
+
 func TestImageCLIRejectsInvalidCommandArgumentsAndPlatforms(t *testing.T) {
 	for _, args := range [][]string{
 		{"unknown"}, {"unknown", "image"}, {"inspect", "--platform", "linux", "image"}, {"inspect", "--platform", "linux/amd64", "one", "two"},

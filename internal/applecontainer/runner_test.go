@@ -105,8 +105,8 @@ func TestResolveFailsClosedOnNonAppleHostWithoutLaunchingAnything(t *testing.T) 
 		if err == nil {
 			t.Skip("Apple container CLI is installed; no user service was started or contacted")
 		}
-		if !strings.Contains(err.Error(), "Apple container CLI not found") {
-			t.Fatalf("Resolve() prerequisite error = %v, want missing CLI", err)
+		if !strings.Contains(err.Error(), "Apple container CLI not found") || !strings.Contains(err.Error(), "https://github.com/apple/container/releases") || !strings.Contains(err.Error(), "container system start") {
+			t.Fatalf("Resolve() prerequisite error = %v, want actionable missing-CLI guidance", err)
 		}
 		return
 	}
@@ -116,9 +116,13 @@ func TestResolveFailsClosedOnNonAppleHostWithoutLaunchingAnything(t *testing.T) 
 }
 
 func TestResolveReportsMissingCLIWithoutAttemptingInstallation(t *testing.T) {
-	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" { t.Skip("Apple Silicon host prerequisite") }
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("Apple Silicon host prerequisite")
+	}
 	path := t.TempDir()
 	t.Setenv("PATH", path)
 	runner, err := Resolve(context.Background())
-	if err == nil || runner != nil || !strings.Contains(err.Error(), "Apple container CLI not found") { t.Fatalf("Resolve() missing PATH CLI result runner=%v err=%v", runner, err) }
+	if err == nil || runner != nil || !strings.Contains(err.Error(), "Apple container CLI not found") {
+		t.Fatalf("Resolve() missing PATH CLI result runner=%v err=%v", runner, err)
+	}
 }

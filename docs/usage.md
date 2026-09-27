@@ -10,15 +10,21 @@ curl -fsSL https://raw.githubusercontent.com/MrUprizing/opensbx/main/scripts/ins
 
 On Windows, download the matching binary from [GitHub Releases](https://github.com/MrUprizing/opensbx/releases).
 
-Start with a local runtime already running. Docker is the default:
+Start with the default configuration. On Linux, Docker is selected by default;
+on supported Apple Silicon Macs, OpenSBX lets you select Docker or Apple
+Container:
 
 ```sh
-opensbx -runtime docker -addr 127.0.0.1:8080
+opensbx start
 ```
 
-On supported Apple Silicon Macs, use `-runtime container`; see [runtime setup](runtimes.md).
-The server binds to loopback only. API, MCP, Swagger and sandbox app URLs share
-this listener.
+The server starts in the background and binds to `127.0.0.1:18089` by default.
+Use `opensbx start -runtime container` to select Apple Container, or `-addr` to
+change the address. Stop the server with `opensbx stop`. See [runtime setup](runtimes.md).
+The server binds to loopback only. API, MCP, Swagger and sandbox app URLs share this listener.
+
+Use `opensbx -h` or `opensbx -help` for the command list and options. Add `-h`
+to a command, such as `opensbx start -h`, for command-specific help.
 
 ## Create and use a sandbox
 
@@ -32,7 +38,7 @@ opensbx image pull node:22
 Create a sandbox with the image, an exposed app port and a 15-minute timeout:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:8080/v1/sandboxes \
+curl -fsS -X POST http://127.0.0.1:18089/v1/sandboxes \
   -H 'Content-Type: application/json' \
   -d '{"image":"node:22","ports":["3000"],"timeout":900}'
 ```
@@ -40,16 +46,16 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/sandboxes \
 Save the returned `id`. Run a command:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:8080/v1/sandboxes/SANDBOX_ID/cmd \
+curl -fsS -X POST http://127.0.0.1:18089/v1/sandboxes/SANDBOX_ID/cmd \
   -H 'Content-Type: application/json' \
   -d '{"command":"node","args":["--version"]}'
 ```
 
 When a sandbox exposes a TCP port, its response includes an app URL such as
-`http://<sandbox>.localhost:8080`. Delete the sandbox when finished:
+`http://<sandbox>.localhost:18089`. Delete the sandbox when finished:
 
 ```sh
-curl -i -X DELETE http://127.0.0.1:8080/v1/sandboxes/SANDBOX_ID
+curl -i -X DELETE http://127.0.0.1:18089/v1/sandboxes/SANDBOX_ID
 ```
 
 Sandboxes default to 1 CPU, 1 GiB memory and a 15-minute timeout. Limits are 4
@@ -77,7 +83,7 @@ non-default image catalog with the server. See `opensbx image help` for options.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `ADDR` / `-addr` | `127.0.0.1:8080` | Loopback address for API and sandbox URLs |
+| `ADDR` / `-addr` | `127.0.0.1:18089` | Loopback address for API and sandbox URLs |
 | `OPENSBX_DATA_DIR` / `-data-dir` | `~/.local/share/opensbx` | Image catalog and runtime state |
 | `LOG_FILE` / `-log-file` | `opensbx.log` | Server log file |
 | `API_KEY` | unset | Optional Bearer token for API requests |
@@ -90,9 +96,9 @@ stopped.
 
 ## API and MCP
 
-- Interactive REST API: `http://localhost:8080/swagger/index.html`
-- MCP endpoint: `http://localhost:8080/v1/mcp`
-- Health check: `http://localhost:8080/v1/health`
+- Interactive REST API: `http://localhost:18089/swagger/index.html`
+- MCP endpoint: `http://localhost:18089/v1/mcp`
+- Health check: `http://localhost:18089/v1/health`
 
 The MCP server also exposes `opensbx://docs/quickstart` and
 `opensbx://docs/how-it-works` resources to connected clients.
@@ -105,12 +111,11 @@ database must be named `sandbox.db`; the Apple database must be named
 `sandbox-container.db`. Start the same runtime with its matching database path:
 
 ```sh
-opensbx -runtime docker -legacy-db /absolute/path/sandbox.db
-opensbx -runtime container -legacy-db /absolute/path/sandbox-container.db
+opensbx start -runtime docker -legacy-db /absolute/path/sandbox.db
+opensbx start -runtime container -legacy-db /absolute/path/sandbox-container.db
 ```
 
-For Apple, select `-runtime container` and the original Apple database. Do not
-rename a database to switch runtimes. Legacy mode updates the database in place;
+Do not rename a database to switch runtimes. Legacy mode updates the database in place;
 keep the backup until you have verified the migration. Do not run multiple
 OpenSBX processes against the same database.
 

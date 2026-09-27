@@ -292,6 +292,12 @@ func TestAppleHealthRequiresExactServiceAndVersionSchema(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Ping() error = %v, wantErr %v", err, tc.wantErr)
 			}
+			if tc.name == "stopped" && (err == nil || !strings.Contains(err.Error(), "container system start")) {
+				t.Fatalf("stopped-service error = %v, want a container system start instruction", err)
+			}
+			if tc.name == "wrong version" && (err == nil || !strings.Contains(err.Error(), "https://github.com/apple/container/releases")) {
+				t.Fatalf("wrong-version error = %v, want official upgrade guidance", err)
+			}
 		})
 	}
 }

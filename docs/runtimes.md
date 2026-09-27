@@ -8,18 +8,24 @@ are the same for both supported backends.
 | Docker | Linux, macOS, Windows | Local Docker daemon already running; default backend |
 | Apple container | Apple Silicon, macOS 26+ | Apple `container` CLI and server 1.4.1 already installed and running; `linux/arm64` images only |
 
-Select the backend when starting the server:
+Select the backend when starting the server (it runs in the background):
 
 ```sh
-opensbx -runtime docker
-opensbx -runtime container
+opensbx start -runtime docker
+opensbx start -runtime container
+opensbx stop
 ```
 
 ## Apple container setup
 
-The Apple CLI/server are installed separately; OpenSBX does not install them or
-start the service. Ensure `container` is on the launching process's `PATH` and
-that its service is running for the same macOS user.
+Install Apple's signed `container` CLI from [GitHub Releases](https://github.com/apple/container/releases)
+or follow the [official repository](https://github.com/apple/container). OpenSBX
+does not install the CLI or start its service. Ensure `container` is on the
+launching process's `PATH`, then start the service for the same macOS user:
+
+```sh
+container system start
+```
 
 The configured kernel and trusted vminit image must be available locally before
 creating sandboxes. With the default configuration, prepare vminit explicitly:

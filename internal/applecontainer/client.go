@@ -62,7 +62,7 @@ func (c *Client) changed(id string) {
 func (c *Client) Ping(ctx context.Context) error {
 	b, err := c.run(ctx, nil, "system", "status", "--format", "json")
 	if err != nil {
-		return fmt.Errorf("Apple container user service is unavailable (it must already be running): %w", err)
+		return fmt.Errorf("Apple Container service is unavailable. Start it with `container system start`; install the CLI from https://github.com/apple/container/releases if needed: %w", err)
 	}
 	var status struct {
 		Status string
@@ -73,11 +73,11 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("invalid Apple container health JSON: %w", err)
 	}
 	if status.Status != "running" {
-		return fmt.Errorf("Apple container user service is not running (status %q)", status.Status)
+		return fmt.Errorf("Apple Container service is not running (status %q); start it with `container system start`", status.Status)
 	}
 	// CLI JSON is not a stable API. Fail closed on unvalidated schema versions.
 	if status.Client.Version != "1.4.1" || status.Server.Version != "1.4.1" {
-		return errors.New("Apple container requires CLI and server version 1.4.1 (validated JSON contract)")
+		return errors.New("Apple Container CLI and service version 1.4.1 are required. Install the matching signed release from https://github.com/apple/container/releases, then run `container system start`")
 	}
 	return nil
 }

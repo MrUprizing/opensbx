@@ -447,6 +447,99 @@ func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 	assertListenerReleased(t, apiAddr)
 }
 
+func TestStartAndStopCLIControlsBackgroundServer(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "opensbx")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/api")
+	build.Dir = root
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build OpenSBX binary: %v\n%s", err, output)
+	}
+
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/v1.54")
+		path = strings.TrimPrefix(path, "/v1.53")
+		switch {
+		case r.Method == http.MethodGet && path == "/_ping":
+			_, _ = io.WriteString(w, "OK")
+		case r.Method == http.MethodGet && path == "/version":
+			_, _ = io.WriteString(w, `{"ApiVersion":"1.54","MinAPIVersion":"1.24"}`)
+		case r.Method == http.MethodGet && path == "/info":
+			_, _ = io.WriteString(w, `{"OSType":"linux","Architecture":"x86_64","ServerVersion":"27.1.0"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"unsupported synthetic Docker API endpoint"}`)
+		}
+	}))
+	defer engine.Close()
+
+	workDir := t.TempDir()
+	dataDir := filepath.Join(workDir, "data")
+	logPath := filepath.Join(workDir, "opensbx.log")
+	addr := reserveTCPAddress(t)
+	env := make([]string, 0, len(os.Environ())+3)
+	for _, item := range os.Environ() {
+		if strings.HasPrefix(item, "ADDR=") || strings.HasPrefix(item, "API_KEY=") || strings.HasPrefix(item, "BASE_DOMAIN=") || strings.HasPrefix(item, "DOCKER_HOST=") || strings.HasPrefix(item, "LOG_FILE=") || strings.HasPrefix(item, "OPENSBX_DATA_DIR=") || strings.HasPrefix(item, "PROXY_ADDR=") {
+			continue
+		}
+		env = append(env, item)
+	}
+	env = append(env, "DOCKER_HOST=tcp://"+strings.TrimPrefix(engine.URL, "http://"))
+	startArgs := []string{"start", "-runtime", "docker", "-addr", addr, "-data-dir", dataDir, "-log-file", logPath}
+	started := false
+	stop := func() {
+		if started {
+			cmd := exec.Command(bin, "stop", "-data-dir", dataDir)
+			cmd.Env = env
+			_ = cmd.Run()
+		}
+	}
+	t.Cleanup(stop)
+
+	start := exec.Command(bin, startArgs...)
+	start.Env = env
+	output, err := start.CombinedOutput()
+	if err != nil {
+		t.Fatalf("opensbx start: %v\n%s", err, output)
+	}
+	started = true
+	if !strings.Contains(string(output), "OpenSBX started") {
+		t.Fatalf("start output=%s", output)
+	}
+
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get("http://" + addr + "/v1/health")
+	if err != nil {
+		t.Fatalf("server did not accept requests after start: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status=%d, want %d", response.StatusCode, http.StatusOK)
+	}
+
+	second := exec.Command(bin, startArgs...)
+	second.Env = env
+	secondOutput, err := second.CombinedOutput()
+	if err == nil || !strings.Contains(string(secondOutput), "already running") {
+		t.Fatalf("duplicate start: err=%v output=%s", err, secondOutput)
+	}
+
+	stopCmd := exec.Command(bin, "stop", "-data-dir", dataDir)
+	stopCmd.Env = env
+	stopOutput, err := stopCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("opensbx stop: %v\n%s", err, stopOutput)
+	}
+	started = false
+	if !strings.Contains(string(stopOutput), "OpenSBX stopped") {
+		t.Fatalf("stop output=%s", stopOutput)
+	}
+	assertListenerReleased(t, addr)
+}
+
 func flagValue(name string) string {
 	if value := flag.Lookup(name); value != nil {
 		return value.Value.String()

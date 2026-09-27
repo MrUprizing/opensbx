@@ -145,7 +145,7 @@ func safeError(err error) error {
 // software or starts system services. Health/version validation is done by Ping.
 func Resolve(ctx context.Context) (Runner, error) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		return nil, errors.New("Apple container requires Apple Silicon macOS 26 or later")
+		return nil, errors.New("Apple container requires Apple Silicon macOS 26 or later; choose `-runtime docker` on this host. Setup: https://github.com/apple/container")
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/sw_vers", "-productVersion")
 	var out bytes.Buffer
@@ -155,11 +155,11 @@ func Resolve(ctx context.Context) (Runner, error) {
 	}
 	major, err := strconv.Atoi(strings.Split(strings.TrimSpace(out.String()), ".")[0])
 	if err != nil || major < 26 {
-		return nil, errors.New("Apple container requires macOS 26 or later")
+		return nil, errors.New("Apple Container requires macOS 26 or later; upgrade macOS or choose `-runtime docker`. Setup: https://github.com/apple/container")
 	}
 	path, err := exec.LookPath("container")
 	if err != nil {
-		return nil, errors.New("Apple container CLI not found in PATH; install it separately and start its user service before launching opensbx")
+		return nil, errors.New("Apple container CLI not found in PATH (`container`). Install the signed package from https://github.com/apple/container/releases, then run `container system start` and retry `opensbx start -runtime container`")
 	}
 	return cliRunner{path}, nil
 }

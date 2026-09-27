@@ -3,12 +3,15 @@ package config
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+const DefaultAddr = "127.0.0.1:18089"
 
 type Config struct {
 	Runtime  string
@@ -31,27 +34,43 @@ func DefaultDataDir() string {
 }
 
 func Load() *Config {
-	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
-		if _, set := os.LookupEnv(key); set {
-			panic(key + " is no longer supported: use ADDR=127.0.0.1:8080; sandbox URLs share that port")
-		}
-	}
-	addr := flag.String("addr", envOrDefault("ADDR", "127.0.0.1:8080"), "Loopback HTTP address for API, MCP and sandbox URLs")
-	logFile := flag.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
-	runtime := flag.String("runtime", "", "Sandbox runtime: docker or container")
-	dataDir := flag.String("data-dir", DefaultDataDir(), "OpenSBX local data directory")
-	legacyDB := flag.String("legacy-db", "", "Explicit legacy execution database path; back it up first and select its original runtime")
-	for _, arg := range os.Args[1:] {
-		key := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
-		if key == "proxy-addr" || key == "base-domain" {
-			panic("legacy proxy/domain options were removed: use -addr 127.0.0.1:8080")
-		}
-	}
-	flag.Parse()
-	if err := ValidateAddr(*addr); err != nil {
+	cfg, err := Parse(os.Args[1:])
+	if err != nil {
 		panic(err)
 	}
-	return &Config{Runtime: *runtime, Addr: *addr, APIKey: os.Getenv("API_KEY"), LogFile: normalizeLogFile(*logFile), DataDir: *dataDir, LegacyDB: *legacyDB}
+	return cfg
+}
+
+// Parse reads server options without mutating the process-global flag set.
+func Parse(args []string) (*Config, error) {
+	for _, key := range []string{"PROXY_ADDR", "BASE_DOMAIN"} {
+		if _, set := os.LookupEnv(key); set {
+			return nil, fmt.Errorf("%s is no longer supported: use ADDR=%s; sandbox URLs share that port", key, DefaultAddr)
+		}
+	}
+	for _, arg := range args {
+		key := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
+		if key == "proxy-addr" || key == "base-domain" {
+			return nil, fmt.Errorf("legacy proxy/domain options were removed: use -addr %s", DefaultAddr)
+		}
+	}
+	fs := flag.NewFlagSet("opensbx", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	addr := fs.String("addr", envOrDefault("ADDR", DefaultAddr), "Loopback HTTP address for API, MCP and sandbox URLs")
+	logFile := fs.String("log-file", envOrDefault("LOG_FILE", "opensbx.log"), "Path to log file")
+	runtime := fs.String("runtime", "", "Sandbox runtime: docker or container")
+	dataDir := fs.String("data-dir", DefaultDataDir(), "OpenSBX local data directory")
+	legacyDB := fs.String("legacy-db", "", "Explicit legacy execution database path; back it up first and select its original runtime")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if fs.NArg() != 0 {
+		return nil, fmt.Errorf("unexpected argument %q; run opensbx -h for available commands", fs.Arg(0))
+	}
+	if err := ValidateAddr(*addr); err != nil {
+		return nil, err
+	}
+	return &Config{Runtime: *runtime, Addr: *addr, APIKey: os.Getenv("API_KEY"), LogFile: normalizeLogFile(*logFile), DataDir: *dataDir, LegacyDB: *legacyDB}, nil
 }
 
 func ValidateAddr(addr string) error {

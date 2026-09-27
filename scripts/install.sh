@@ -185,22 +185,36 @@ main() {
 set -euo pipefail
 
 BIN_PATH="$binary_target"
-LOG_PATH="\${OPENSBX_LOG_FILE:-opensbx.log}"
 
 if [[ "\${OPENSBX_FOREGROUND:-0}" == "1" ]]; then
   exec "\$BIN_PATH" "\$@"
 fi
 
-if pgrep -f "\$BIN_PATH" >/dev/null 2>&1; then
-  echo "opensbx is already running"
-  exit 0
+if [[ -n "\${OPENSBX_LOG_FILE:-}" && -z "\${LOG_FILE:-}" ]]; then
+  export LOG_FILE="\$OPENSBX_LOG_FILE"
 fi
 
-nohup "\$BIN_PATH" "\$@" >>"\$LOG_PATH" 2>&1 &
-pid="\$!"
-disown "\$pid" 2>/dev/null || true
-
-echo "opensbx started in background (pid: \$pid, log: \$LOG_PATH)"
+case "\${1:-}" in
+  start|stop|image|help|-h|-help|--h|--help)
+    exec "\$BIN_PATH" "\$@"
+    ;;
+  -* )
+    for arg in "\$@"; do
+      case "\$arg" in
+        -h|-help|--h|--help)
+          exec "\$BIN_PATH" "\$@"
+          ;;
+      esac
+    done
+    exec "\$BIN_PATH" start "\$@"
+    ;;
+  "")
+    exec "\$BIN_PATH" start
+    ;;
+  *)
+    exec "\$BIN_PATH" "\$@"
+    ;;
+esac
 EOF
 
   if ! mkdir -p "$LIB_DIR" 2>/dev/null || ! install -m 0755 "$extracted" "$binary_target" 2>/dev/null || ! install -m 0755 "$wrapper" "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null; then
@@ -210,9 +224,10 @@ EOF
     run_as_root install -m 0755 "$wrapper" "$INSTALL_DIR/$BINARY_NAME"
   fi
 
-  echo "Installed wrapper: $INSTALL_DIR/$BINARY_NAME"
+  echo "Installed command: $INSTALL_DIR/$BINARY_NAME"
   echo "Installed binary: $binary_target"
-  echo "Run in background: $BINARY_NAME"
+  echo "Start in background: $BINARY_NAME start"
+  echo "Stop gracefully: $BINARY_NAME stop"
   echo "Run in foreground: OPENSBX_FOREGROUND=1 $BINARY_NAME"
 }
 

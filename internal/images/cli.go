@@ -27,18 +27,21 @@ type cliImageDetail struct {
 // CLI needs neither a runtime selector nor a runtime connection. Flags precede
 // positional arguments, following Go's flag package convention.
 func CLI(ctx context.Context, args []string, dataDir string, out io.Writer) error {
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" {
-		_, err := fmt.Fprintln(out, "Usage: opensbx image <list|inspect|pull|import|export|remove> [options] [reference/archive]\nOptions: --data-dir PATH --platform linux/arch[/variant]\nImport: --reference NAME archive.tar\nExport: --output PATH [--all-platforms] reference\nPull explicitly downloads the selected platform. Import/export use OCI archives; no runtime is contacted.")
-		return err
+	if len(args) == 0 || args[0] == "help" || isHelp(args[0]) {
+		return writeImageUsage(out)
 	}
 	fs := flag.NewFlagSet("image "+args[0], flag.ContinueOnError)
 	fs.SetOutput(out)
+	fs.Usage = func() { _ = writeImageUsage(out) }
 	dir := fs.String("data-dir", dataDir, "Local data directory")
 	platform := fs.String("platform", "linux/"+runtime.GOARCH, "Explicit target platform")
 	ref := fs.String("reference", "", "Reference for a single imported archive root")
 	output := fs.String("output", "", "Export archive destination (must not exist)")
 	full := fs.Bool("all-platforms", false, "Export complete root index; fails if any blob is missing")
 	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	p, err := v1.ParsePlatform(*platform)
@@ -90,4 +93,18 @@ func CLI(ctx context.Context, args []string, dataDir string, out io.Writer) erro
 	default:
 		return fmt.Errorf("unknown image command %q; use opensbx image help", args[0])
 	}
+}
+
+func isHelp(arg string) bool {
+	switch arg {
+	case "-h", "-help", "--h", "--help":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeImageUsage(out io.Writer) error {
+	_, err := fmt.Fprintln(out, "Usage: opensbx image <list|inspect|pull|import|export|remove> [options] [reference/archive]\nOptions: --data-dir PATH --platform linux/arch[/variant]\nImport: --reference NAME archive.tar\nExport: --output PATH [--all-platforms] reference\nPull explicitly downloads the selected platform. Import/export use OCI archives; no runtime is contacted.")
+	return err
 }
