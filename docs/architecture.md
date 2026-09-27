@@ -1,107 +1,45 @@
-# Local execution architecture
+# Architecture
 
 ```text
-REST / MCP DTOs (models)
+REST / MCP models
         |
-internal/api facade: explicit DTO <-> domain conversion
+internal/api: transport and domain conversion
         |
-internal/service: application policy and creation compensation
+internal/service: application policy
         |
-internal/sandbox: typed Runtime / Process / Filesystem / Cache ports
+internal/sandbox: runtime, process, filesystem and cache contracts
         |
-internal/runtimeio adapter: private native records, identity mapping and leases
+internal/runtimeio: native IDs, ownership and runtime records
         |
-Docker engine client or Apple container CLI 1.4.1
+Docker engine client or Apple container CLI
 ```
 
-`internal/sandbox`, the application service and runtime adapters do not import
-`models`. Domain records are independent types, not aliases to HTTP structs.
-`SandboxID`, `CommandID`, `ImageID`, `Port`, `PublishedPort`, `ResourceLimits`,
-process requests/results and durations are used by the actual ports. `models`
-remains the stable REST/MCP JSON contract. The image CLI has its own serialization
-boundary. Adapter-local `runtimeio` records are not application or HTTP DTOs.
+## Boundaries
 
-## Identity and creation transactions
+- `models` defines the public REST/MCP JSON contract. Domain and runtime packages
+  use their own types; HTTP DTOs stay at the API edge.
+- `internal/service` owns application policy and sandbox creation compensation.
+- `internal/sandbox` defines the interfaces implemented by the runtime adapters.
+- `internal/runtimeio` translates public IDs into native references and keeps
+  adapter-specific persistence details out of the service.
+- `internal/images` manages a shared OCI catalog independent of the selected
+  runtime's native image cache.
 
-The service assigns a public `sbx-...` ID. Only the adapter's repository view
-resolves it to the native reference. Existing public IDs are retained; an empty
-legacy native-reference column falls back to its unchanged public ID. Process
-history stores public sandbox backreferences. Cache preparation returns an opaque
-`PreparedImage`; the application sees source root/manifest identity, not a Docker
-config ID or Apple cache reference.
+When adding behavior, start at the layer that owns it: HTTP or MCP conversion in
+`internal/api`, shared policy in `internal/service`, runtime-specific behavior in
+the relevant adapter, and OCI image operations in `internal/images`.
 
-Successful native creation returns a bounded `Provisioned` transaction, not a
-native ID. Its adapter-owned handle binds compensation to that exact new resource:
+## Invariants
 
-1. `Adopt` verifies ownership and native identity and persists image provenance.
-2. Any post-create adoption/ownership failure triggers `Rollback` under a separate
-   bounded cleanup context, never the canceled request context.
-3. If compensation fails, `Recover` retains/corrects ownership and provenance and
-   records the original failure in private execution metadata. Recovery failures
-   are returned together with the original error, never silently hidden.
-
-Compensation never targets a native reference obtained from an inconsistent row
-or an API parameter. Existing sandboxes and historical IDs are not rewritten.
-Persistent database failures can also prevent recovery writes; the combined error
-must be investigated rather than interpreted as successful cleanup.
-
-## Coherent routing and inventory
-
-`Runtime.Routing` reads running state and published endpoints together. Docker
-uses one inspect response; Apple uses one inventory entry. The service coalesces
-only concurrent in-flight reads for the same owned sandbox, with a bounded read
-context and no completed-result TTL. A subsequent request reads current state.
-Stopped/unowned resources and non-TCP main ports do not route.
-
-List reconciliation uses batch ownership maps, not one database query per native
-item. Runtime identifiers are translated inside the adapter; the service and API
-operate on public identities.
-
-## Owned image store
-
-Pull/import stage, verify and decompress outside the catalog lock. Publication
-briefly takes the process mutex and OS file lock, atomically publishes verified
-blobs, rereads the current catalog and merges references/platform availability.
-Unrelated tag changes are not overwritten. Export snapshots its descriptor under
-the lock and performs archive I/O after releasing it. Resolved artifact callbacks
-retain the original immutable descriptor; deleting/repointing a tag cannot change
-or invalidate the artifact they export while its blobs remain present.
-
-`catalog.json` is authoritative. The derived OCI index is replaced only when its
-contents differ, including recovery from an interrupted publication. Read-only
-operations do not rewrite an unchanged index. Interrupted commits may leave
-unreferenced verified blobs; automatic garbage collection is deliberately absent.
-
-Verification reuse is process-local and bounded to 64 graphs with at most 256
-files each. Entries are populated only after digest, size, graph and expanded
-layer/diffID checks. File identity, size, modification time and available change
-time invalidate reuse; materialization rechecks those fingerprints. Unchanged
-prepared images do not repeatedly decompress every layer. This is not a promise
-to defeat a privileged host actor capable of manipulating files and metadata.
-
-## Network trust boundaries
-
-The control plane rejects foreign/null Origin and cross-site/same-site browser
-Fetch Metadata before handlers run. Origin-less native clients remain supported.
-Sandbox proxy traffic is not subject to the control-plane origin policy.
-
-Registry requests use an explicit per-pull transport policy, including injected
-transports. Credentials are resolved only for the requested repository. Foreign
-descriptor/layer URLs are rejected. Bearer realms must be same-origin or the
-known Docker Hub token authority. Only the intended registry may use private or
-loopback addresses; permitted public token/CDN hosts are DNS-checked and dialed
-using the checked addresses. Cross-host blob CDN requests never carry registry
-Authorization/Cookie headers. Environment HTTP proxies are not used by this
-default transport because they would bypass the destination checks.
-
-An injected transport remains behind URL/realm/header checks, but its networking
-implementation is trusted code owned by the caller/test. DNS address pinning is
-provided by the default production transport, not by arbitrary injected code.
-
-Docker Hub and GHCR token/CDN paths are supported. Custom registries with other
-cross-origin token services or CDNs are denied by default rather than implicitly
-trusted. Explicit local registry addresses remain supported. Tests inject with
-`images.WithTransport`, which cannot remove the surrounding policy.
-
-OCI images are filesystem/configuration artifacts, not running-process snapshots.
-There is no checkpoint or snapshot portability API.
+- The public REST/MCP contract is independent of Docker and Apple identifiers.
+- Runtime operations require recorded ownership; listing native resources does
+  not adopt them.
+- Sandbox creation retains a bounded compensation/recovery path if adoption fails.
+- App-host routing happens before path routing; a sandbox URL cannot reach
+  management API or MCP routes.
+- The image catalog is separate from runtime caches. Pull/import validate OCI
+  content before publication; retagging cannot redirect an already-resolved image.
+- Registry requests validate destinations and do not forward credentials across
+  hosts. Custom cross-origin token/CDN services fail closed by default.
+- OCI images represent filesystem/configuration, not running process snapshots.
+  Checkpointing and snapshot portability are not implemented.

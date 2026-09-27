@@ -121,7 +121,7 @@ check tool names, schemas, resource/prompt content, and registration order.
 
 For an implemented source refactor, run the applicable package tests and required
 repository checks. OpenSBX's commands and integration prerequisites are in
-`docs/testing.md`; typical checks are `go test ./...`, `go vet ./...`, and
+`CONTRIBUTING.md`; typical checks are `go test ./...`, `go vet ./...`, and
 `git diff --check`. Use `go test -race` for affected concurrency paths and compile
 relevant build-tag/platform variants when their declarations move.
 
