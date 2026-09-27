@@ -26,6 +26,14 @@ jobs:
       - name: Run unit tests
         run: go test ./...
 
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Vet default and integration builds
+        run: |
+          go vet ./...
+          go vet -tags='integration,appleintegration' ./...
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest

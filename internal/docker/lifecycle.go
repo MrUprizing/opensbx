@@ -42,6 +42,10 @@ const (
 // Applies optional resource limits and schedules auto-stop with a default TTL of 15 minutes.
 // Returns ErrImageNotFound if the image does not exist locally.
 func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest) (response runtimeio.CreateSandboxResponse, createErr error) {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return response, err
+	}
+	defer c.lifecycleMu.Unlock()
 	// Verify image exists locally
 	exists, err := c.ImageExists(ctx, req.Image)
 	if err != nil {
@@ -157,6 +161,10 @@ func (c *Client) DiscardCreated(ctx context.Context, id string) error { return c
 // Start starts a stopped sandbox and re-schedules the auto-stop timer.
 // Returns ErrAlreadyRunning (409) if the sandbox is already running.
 func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.lifecycleMu.Unlock()
 	// Check current state to return a meaningful conflict error.
 	pre, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
@@ -200,24 +208,34 @@ func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartRespons
 // Stop stops a running sandbox and cancels its expiration timer.
 // Returns ErrAlreadyStopped (409) if the sandbox is not running.
 func (c *Client) Stop(ctx context.Context, id string) error {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer c.lifecycleMu.Unlock()
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
 		return wrapNotFound(err)
 	}
 	if !info.Container.State.Running {
+		c.cancelTimer(id)
 		return sandbox.ErrAlreadyStopped
 	}
 
-	c.cancelTimer(id)
-	c.invalidateCache(id)
 	_, err = c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{})
+	if err == nil || errdefs.IsNotFound(err) {
+		c.cancelTimer(id)
+		c.invalidateCache(id)
+	}
 	return wrapNotFound(err)
 }
 
 // Restart restarts a sandbox and returns the new port mappings.
 // It cancels any existing timer and schedules a fresh one with the default timeout.
 func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
-	c.cancelTimer(id)
+	if err := c.lockLifecycle(ctx); err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.lifecycleMu.Unlock()
 
 	if _, err := c.cli.ContainerRestart(ctx, id, moby.ContainerRestartOptions{}); err != nil {
 		return runtimeio.RestartResponse{}, wrapNotFound(err)
@@ -256,6 +274,14 @@ func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartRespo
 // Remove removes a sandbox forcefully and cancels its expiration timer.
 // If the container no longer exists in Docker, it still cleans up the DB record.
 func (c *Client) Remove(ctx context.Context, id string) error {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer c.lifecycleMu.Unlock()
+	_, err := c.cli.ContainerRemove(ctx, id, moby.ContainerRemoveOptions{Force: true})
+	if err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
 	c.cancelTimer(id)
 	c.invalidateCache(id)
 
@@ -268,18 +294,13 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 		return true
 	})
 
-	_, err := c.cli.ContainerRemove(ctx, id, moby.ContainerRemoveOptions{Force: true})
-	if err != nil && !errdefs.IsNotFound(err) {
-		return err
-	}
-
 	// Clean up command records from DB.
 	if dbErr := c.repo.DeleteCommandsBySandbox(id); dbErr != nil {
-		log.Printf("database: failed to delete commands for sandbox %s: %v", id, dbErr)
+		return fmt.Errorf("delete commands for sandbox %s: %w", id, dbErr)
 	}
 
 	if dbErr := c.repo.Delete(id); dbErr != nil {
-		log.Printf("database: failed to delete sandbox %s: %v", id, dbErr)
+		return fmt.Errorf("delete sandbox %s: %w", id, dbErr)
 	}
 	return nil
 }
@@ -288,6 +309,10 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 // Returns ErrNotRunning (409) if the sandbox is not running,
 // or ErrAlreadyPaused (409) if it is already paused.
 func (c *Client) Pause(ctx context.Context, id string) error {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer c.lifecycleMu.Unlock()
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
 		return wrapNotFound(err)
@@ -306,6 +331,10 @@ func (c *Client) Pause(ctx context.Context, id string) error {
 // Resume unpauses a paused sandbox.
 // Returns ErrNotPaused (409) if the sandbox is not currently paused.
 func (c *Client) Resume(ctx context.Context, id string) error {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer c.lifecycleMu.Unlock()
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
 		return wrapNotFound(err)
@@ -320,12 +349,15 @@ func (c *Client) Resume(ctx context.Context, id string) error {
 
 // RenewExpiration resets the auto-stop timer for a sandbox.
 func (c *Client) RenewExpiration(ctx context.Context, id string, timeout int) error {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return err
+	}
+	defer c.lifecycleMu.Unlock()
 	// Verify the sandbox exists.
 	if _, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{}); err != nil {
 		return wrapNotFound(err)
 	}
 
-	c.cancelTimer(id)
 	c.scheduleStop(id, timeout)
 	return nil
 }
@@ -333,6 +365,12 @@ func (c *Client) RenewExpiration(ctx context.Context, id string, timeout int) er
 // Shutdown cancels all pending timers, running commands, and stops tracked containers.
 // Called during graceful shutdown to prevent orphaned containers.
 func (c *Client) Shutdown(ctx context.Context) {
+	if err := c.lockLifecycle(ctx); err != nil {
+		log.Printf("docker shutdown: %v", err)
+		return
+	}
+	defer c.lifecycleMu.Unlock()
+	c.closing = true
 	commandCount := 0
 	c.commands.Range(func(_, _ any) bool {
 		commandCount++
@@ -356,10 +394,7 @@ func (c *Client) Shutdown(ctx context.Context) {
 
 	c.timers.Range(func(key, value any) bool {
 		id := key.(string)
-		entry := value.(*timerEntry)
-		entry.timer.Stop()
-		close(entry.cancel)
-		c.timers.Delete(id)
+		c.cancelTimer(id)
 		if _, err := c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{}); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				log.Printf("docker shutdown: stop sandbox %s timeout", id)
@@ -374,21 +409,24 @@ func (c *Client) Shutdown(ctx context.Context) {
 // scheduleStop creates a timer that auto-stops the sandbox after the given seconds.
 // Uses a cancel channel so cancelTimer can cleanly terminate the goroutine.
 func (c *Client) scheduleStop(id string, seconds int) {
+	c.timersMu.Lock()
+	defer c.timersMu.Unlock()
+	c.cancelTimerLocked(id)
 	d := time.Duration(seconds) * time.Second
 	timer := time.NewTimer(d)
 	cancel := make(chan struct{})
 
-	c.timers.Store(id, &timerEntry{
+	entry := &timerEntry{
 		timer:     timer,
 		cancel:    cancel,
 		expiresAt: time.Now().Add(d),
-	})
+	}
+	c.timers.Store(id, entry)
 
 	go func() {
 		select {
 		case <-timer.C:
-			c.timers.Delete(id)
-			c.cli.ContainerStop(context.Background(), id, moby.ContainerStopOptions{})
+			c.expire(id, entry)
 		case <-cancel:
 			// Timer was cancelled; stop it and drain the channel if needed.
 			if !timer.Stop() {
@@ -403,10 +441,57 @@ func (c *Client) scheduleStop(id string, seconds int) {
 
 // cancelTimer stops and removes the expiration timer for a sandbox.
 func (c *Client) cancelTimer(id string) {
+	c.timersMu.Lock()
+	defer c.timersMu.Unlock()
+	c.cancelTimerLocked(id)
+}
+
+func (c *Client) cancelTimerLocked(id string) {
 	if v, ok := c.timers.LoadAndDelete(id); ok {
 		entry := v.(*timerEntry)
+		entry.timer.Stop()
 		close(entry.cancel)
 	}
+}
+
+// Lifecycle operations share a lock with expiration so an old callback cannot
+// stop a newly started or renewed sandbox. Waiting respects caller cancellation.
+func (c *Client) lockLifecycle(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.lifecycleMu.TryLock() {
+			if c.closing {
+				c.lifecycleMu.Unlock()
+				return errors.New("Docker backend is shutting down")
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (c *Client) expire(id string, entry *timerEntry) {
+	// Keep the timer tracked while waiting; shutdown or renewal may supersede it.
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closing || c.getTimerEntry(id) != entry {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{}); err != nil && !errdefs.IsNotFound(err) {
+		log.Printf("docker sandbox TTL stop failed for %s: %v", id, err)
+		c.scheduleStop(id, 30)
+		return
+	}
+	c.cancelTimer(id)
+	c.invalidateCache(id)
 }
 
 // getTimerEntry returns the timer entry for a sandbox, or nil if not tracked.

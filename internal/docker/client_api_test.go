@@ -1829,8 +1829,13 @@ func TestDockerClientTimerExpiryStopsContainer(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the timer-triggered Docker stop request to complete")
 	}
-	if dc.getTimerEntry("container-1") != nil {
-		t.Fatal("expired timer remained in tracking map after stop request")
+	// The HTTP fixture signals before the client consumes its response. Wait for
+	// expiration to finish confirming the stop before checking tracking cleanup.
+	dc.lifecycleMu.Lock()
+	entry := dc.getTimerEntry("container-1")
+	dc.lifecycleMu.Unlock()
+	if entry != nil {
+		t.Fatal("expired timer remained in tracking map after confirmed stop")
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()

@@ -20,6 +20,9 @@ import (
 type Client struct {
 	cli            *moby.Client
 	repo           *database.Repository
+	lifecycleMu    sync.Mutex        // serializes native lifecycle mutations and expiration
+	timersMu       sync.Mutex        // protects timer replacement and cancellation
+	closing        bool              // guarded by lifecycleMu
 	timers         sync.Map          // map[containerID]*timerEntry
 	commands       sync.Map          // map[cmdID]*runningCommand
 	onCacheInvalid func(name string) // called when a sandbox's ports change or it is removed

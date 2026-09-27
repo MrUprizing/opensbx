@@ -177,6 +177,7 @@ locks, exec-start readiness and literal command-signaling corrections:
 
 ## CI
 
-The current workflow runs default tests on pushes to `main` and pull requests,
-then invokes the Docker-tagged integration suite. Apple live integration remains
+The current workflow runs default tests, race tests, and default and
+integration-tagged vet on pushes to `main` and pull requests, then invokes the
+Docker-tagged integration suite. Apple live integration remains
 an explicit opt-in command outside that workflow.

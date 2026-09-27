@@ -142,9 +142,9 @@ Run integration tests (Docker required):
 go test -tags=integration ./... -run '^TestIntegration'
 ```
 
-The Apple 1.4.1 live smoke has passed; Docker live verification remains unavailable
-on the validation host. See [testing](docs/testing.md) for exact opt-in commands,
-coverage results and verification limits; this is not a cross-runtime live claim.
+Docker live tests and prepared-image Docker/Apple 1.4.1 portability verification
+passed on the recorded validation host. See [testing](docs/testing.md) for the
+tested revisions, exact opt-in commands, coverage results and verification limits.
 
 ## Sponsors
 
