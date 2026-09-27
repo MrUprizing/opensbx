@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -720,6 +721,14 @@ func (h *Handler) pullImage(c *gin.Context) {
 func (h *Handler) deleteImage(c *gin.Context) {
 	force := c.Query("force") == "true"
 	if err := h.app.RemoveImage(c.Request.Context(), c.Param("id"), force); err != nil {
+		if errors.Is(err, sandbox.ErrImageNotFound) {
+			if force {
+				c.Status(http.StatusNoContent)
+			} else {
+				notFound(c, "image")
+			}
+			return
+		}
 		internalError(c, err)
 		return
 	}
@@ -741,6 +750,10 @@ func (h *Handler) deleteImage(c *gin.Context) {
 func (h *Handler) getImage(c *gin.Context) {
 	detail, err := h.app.InspectImage(c.Request.Context(), c.Param("id"))
 	if err != nil {
+		if errors.Is(err, sandbox.ErrImageNotFound) {
+			notFound(c, "image")
+			return
+		}
 		internalError(c, err)
 		return
 	}

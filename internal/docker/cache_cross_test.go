@@ -61,13 +61,13 @@ func TestDockerAndAppleCachesMaterializeTheSameResolvedOCIManifest(t *testing.T)
 		t.Fatal(err)
 	}
 	dockerClient, daemon := newDockerFixture(t)
-	daemon.cacheDigest = image.ConfigDigest
+	configureDockerCacheFixture(daemon, image)
 	dockerHandle, err := dockerClient.Materialize(ctx, image)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dockerHandle != image.ConfigDigest {
-		t.Fatalf("Docker cache handle=%q want native config digest %q", dockerHandle, image.ConfigDigest)
+	if dockerHandle != daemon.cacheNativeID || dockerHandle == image.ConfigDigest {
+		t.Fatalf("Docker cache handle=%q want daemon native ID %q distinct from config digest %q", dockerHandle, daemon.cacheNativeID, image.ConfigDigest)
 	}
 	db := database.New(":memory:")
 	sqlDB, err := db.DB()

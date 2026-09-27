@@ -439,7 +439,7 @@ func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read startup/shutdown log: %v", err)
 	}
-	for _, expected := range []string{"api listening on", "shutting down: stopping incoming traffic", "shutting down: stopping tracked sandboxes", "server stopped"} {
+	for _, expected := range []string{"local API and sandbox URLs listening on", "shutting down: stopping incoming traffic", "shutting down: stopping tracked sandboxes", "server stopped"} {
 		if !strings.Contains(string(logs), expected) {
 			t.Errorf("main log omitted %q: %s", expected, logs)
 		}

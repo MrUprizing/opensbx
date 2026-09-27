@@ -61,6 +61,92 @@ func TestRegistryPolicyAllowsOnlyExplicitOriginAndStripsCredentialsFromStorageCD
 	}
 }
 
+func TestDockerHubCloudFrontRedirectAllowsOnlySafeReadsAndStripsSensitiveHeaders(t *testing.T) {
+	var originRequests, cdnRequests int
+	var policy *registryPolicy
+	policy = &registryPolicy{primary: "registry-1.docker.io", hub: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Hostname() {
+		case "registry-1.docker.io":
+			originRequests++
+			header := make(http.Header)
+			header.Set("Location", "https://production.cloudfront.docker.com/blob")
+			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: header, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+		case "production.cloudfront.docker.com":
+			cdnRequests++
+			if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" || r.Header.Get("Proxy-Authorization") != "" {
+				t.Errorf("credentials reached approved Docker Hub CDN: %v", r.Header)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("blob")), Request: r}, nil
+		default:
+			t.Errorf("base transport received unexpected authority %q", r.URL.Host)
+			return nil, errors.New("unexpected test authority")
+		}
+	})}
+	client := &http.Client{Transport: policy}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		request, err := http.NewRequest(method, "https://registry-1.docker.io/v2/library/node/blobs/sha256:test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer synthetic-only")
+		request.Header.Set("Cookie", "session=synthetic")
+		request.Header.Set("Proxy-Authorization", "Basic synthetic")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("follow Docker Hub blob redirect for %s: %v", method, err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Errorf("redirected %s response status=%d want 200", method, response.StatusCode)
+		}
+	}
+	if originRequests != 2 || cdnRequests != 2 {
+		t.Fatalf("redirect requests origin=%d CDN=%d want 2 each", originRequests, cdnRequests)
+	}
+}
+
+func TestDockerHubCloudFrontPolicyRejectsNearbyAuthoritiesMethodsAndBearerRealms(t *testing.T) {
+	baseCalls := 0
+	policy := &registryPolicy{primary: "registry-1.docker.io", hub: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		baseCalls++
+		if r.URL.Hostname() == "registry-1.docker.io" {
+			header := make(http.Header)
+			header.Set("WWW-Authenticate", `Bearer realm="https://production.cloudfront.docker.com/token"`)
+			return policyResponse(r, header), nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+	})}
+	for _, raw := range []string{
+		"https://evil-production.cloudfront.docker.com/blob",
+		"https://production.cloudfront.docker.com.evil.test/blob",
+		"https://nested.production.cloudfront.docker.com/blob",
+		"https://production.cloudfront.docker.com:444/blob",
+		"https://production.cloudflare.docker.com:444/blob",
+	} {
+		request, _ := http.NewRequest(http.MethodGet, raw, nil)
+		if _, err := policy.RoundTrip(request); err == nil {
+			t.Errorf("unapproved nearby CDN authority accepted: %s", raw)
+		}
+	}
+	post, _ := http.NewRequest(http.MethodPost, "https://production.cloudfront.docker.com/blob", nil)
+	if _, err := policy.RoundTrip(post); err == nil {
+		t.Fatal("POST to approved CloudFront hostname was accepted")
+	}
+	origin, _ := http.NewRequest(http.MethodGet, "https://registry-1.docker.io/v2/library/node/manifests/latest", nil)
+	if _, err := policy.RoundTrip(origin); err == nil || !strings.Contains(err.Error(), "untrusted bearer realm") {
+		t.Fatalf("Docker Hub bearer realm pointing to a storage CDN error=%v", err)
+	}
+	if baseCalls != 1 {
+		t.Fatalf("rejected authorities/methods reached base transport %d times; only the origin challenge should", baseCalls)
+	}
+	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fd00::1"} {
+		ip := net.ParseIP(raw)
+		if ip == nil || publicRegistryIP(ip) {
+			t.Errorf("private/reserved registry redirect address %q was considered public", raw)
+		}
+	}
+}
+
 func TestRegistryPolicyRejectsUntrustedBearerRealmsBeforeFollowingThem(t *testing.T) {
 	closed := false
 	policy := &registryPolicy{primary: "registry.example.test", base: roundTripFunc(func(r *http.Request) (*http.Response, error) {

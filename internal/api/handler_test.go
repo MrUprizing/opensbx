@@ -1297,6 +1297,33 @@ func TestDeleteImage_NotFound(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "NOT_FOUND")
 }
 
+func TestDeleteImage_MissingCatalogReference(t *testing.T) {
+	r := newRouter(&stub{
+		removeImage: func(_ string, force bool) error {
+			if force {
+				return nil
+			}
+			return sandbox.ErrImageNotFound
+		},
+	})
+
+	w := do(r, "DELETE", "/v1/images/missing:tag", nil)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.JSONEq(t, `{"code":"NOT_FOUND","message":"image not found"}`, w.Body.String())
+}
+
+func TestDeleteImage_MissingCatalogReferenceWithForceIsIdempotent(t *testing.T) {
+	r := newRouter(&stub{
+		removeImage: func(string, bool) error {
+			return sandbox.ErrImageNotFound
+		},
+	})
+
+	w := do(r, "DELETE", "/v1/images/missing:tag?force=true", nil)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Empty(t, w.Body.String())
+}
+
 // ── Inspect Image Tests ─────────────────────────────────────────────────────
 
 func TestGetImage(t *testing.T) {
@@ -1331,6 +1358,18 @@ func TestGetImage_NotFound(t *testing.T) {
 	w := do(r, "GET", "/v1/images/nope", nil)
 	assert.Equal(t, 404, w.Code)
 	assert.Contains(t, w.Body.String(), "NOT_FOUND")
+}
+
+func TestGetImage_MissingCatalogReference(t *testing.T) {
+	r := newRouter(&stub{
+		inspectImage: func(string) (models.ImageDetail, error) {
+			return models.ImageDetail{}, sandbox.ErrImageNotFound
+		},
+	})
+
+	w := do(r, "GET", "/v1/images/missing:tag", nil)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.JSONEq(t, `{"code":"NOT_FOUND","message":"image not found"}`, w.Body.String())
 }
 
 // ── Conflict (409) Tests ────────────────────────────────────────────────────

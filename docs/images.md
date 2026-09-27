@@ -3,8 +3,9 @@
 Images belong to the common local OpenSBX store, not the selected runtime's image
 database. REST/MCP image routes/tools retain their names and JSON fields. `id`
 means the **canonical source root descriptor digest**, either an index or a
-manifest. A selected platform manifest digest and Docker's native config digest
-are different identities. Tags reference roots; they are not execution handles.
+manifest. The selected platform manifest digest, config digest and Docker's native
+image ID are distinct concepts; the native ID depends on Docker's image store.
+Tags reference roots; they are not execution handles.
 No native-image inventory is automatically exposed or adopted. Legacy config-ID
 lookups are not aliases for newly managed roots.
 
@@ -69,7 +70,12 @@ native-runtime disk usage or the size of missing index variants.
   garbage collection is implemented, so execution pins and legacy resources are
   preserved. Budget limits apply per operation, not as a total store quota.
 - Creation verifies content and materializes from the local store. Docker receives
-  a selected-image Docker-compatible archive and executes by verified config ID.
+  a selected-image Docker-compatible archive and executes by its verified immutable
+  native image ID (a config ID in the classic store, potentially a synthesized
+  manifest/index ID in the containerd store). Local export by that native ID
+  verifies the config, platform and uncompressed layer hashes against the selected
+  source content. Materializations of the same private cache reference serialize
+  within the process with cancelable waits; different references proceed independently.
   Apple 1.4.1 loads OCI and verifies the selected manifest/config via local export;
   its synthesized native index must not be confused with source identity.
 - Apple uses a content-derived private cache reference and the version-pinned

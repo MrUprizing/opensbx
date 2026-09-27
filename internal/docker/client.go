@@ -12,7 +12,9 @@ import (
 	"log"
 	"math"
 	"net/netip"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,7 +48,9 @@ type runningCommand struct {
 	stdout    *ringBuffer        // captures stdout
 	stderr    *ringBuffer        // captures stderr
 	done      chan struct{}      // closed when command finishes
+	attached  chan struct{}      // closed when the original attach attempt returns
 	mu        sync.Mutex
+	startErr  error
 	exitCode  int
 	finished  bool
 }
@@ -657,6 +661,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 		stdout:    stdoutBuf,
 		stderr:    stderrBuf,
 		done:      make(chan struct{}),
+		attached:  make(chan struct{}),
 	}
 	c.commands.Store(cmdID, rc)
 
@@ -677,13 +682,16 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 		if err != nil {
 			log.Printf("exec attach %s: %v", cmdID, err)
 			rc.mu.Lock()
+			rc.startErr = err
 			rc.exitCode = -1
 			rc.finished = true
 			rc.mu.Unlock()
+			close(rc.attached)
 			c.repo.UpdateCommandFinished(cmdID, -1, time.Now().UnixMilli())
 			return
 		}
 		defer attached.Close()
+		close(rc.attached)
 
 		// Demux stdout/stderr into ring buffers.
 		stdcopy.StdCopy(stdoutBuf, stderrBuf, attached.Reader)
@@ -751,6 +759,12 @@ func (c *Client) ListCommands(ctx context.Context, sandboxID string) ([]runtimei
 
 // KillCommand sends a signal to a running command.
 func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signal int) (runtimeio.CommandDetail, error) {
+	if err := ctx.Err(); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
+	if signal < 1 || signal > 64 {
+		return runtimeio.CommandDetail{}, fmt.Errorf("%w: Linux signal must be between 1 and 64", sandbox.ErrInvalidInput)
+	}
 	// Look up running command.
 	v, ok := c.commands.Load(cmdID)
 	if !ok {
@@ -767,30 +781,118 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signa
 
 	rc := v.(*runningCommand)
 	rc.mu.Lock()
-	if rc.finished {
-		rc.mu.Unlock()
-		return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
-	}
 	if rc.sandboxID != sandboxID {
 		rc.mu.Unlock()
 		return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 	}
 	cmd := rc.cmd
 	rc.mu.Unlock()
+	if err := c.waitCommandRunning(ctx, rc); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
 
-	// Kill the process inside the container using pkill with the original command pattern.
-	pattern := strings.Join(cmd, " ")
-	killCmd := fmt.Sprintf("pkill -%d -f %q", signal, pattern)
-	// Ignore error: pkill returns 1 if process already exited (race condition).
-	c.execWithStdin(ctx, sandboxID, []string{"sh", "-c", killCmd}, nil)
+	// pkill uses an extended regex over space-joined argv, not shell syntax.
+	// Quote the literal command and anchor the whole match; pass it as one argument
+	// without a shell so quotes, substitutions and newlines remain ordinary data.
+	pattern := "^" + regexp.QuoteMeta(strings.Join(cmd, " ")) + "$"
+	result, err := c.execWithStdin(ctx, sandboxID, []string{"pkill", "-" + strconv.Itoa(signal), "-f", "--", pattern}, nil)
+	if err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
+	if result.exitCode != 0 {
+		rc.mu.Lock()
+		finished := rc.finished
+		rc.mu.Unlock()
+		if finished {
+			return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
+		}
+		return runtimeio.CommandDetail{}, fmt.Errorf("command signal failed: pkill exited with code %d", result.exitCode)
+	}
 
 	// Wait briefly for the command to finish, then return current state.
 	select {
 	case <-rc.done:
 	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		return runtimeio.CommandDetail{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return runtimeio.CommandDetail{}, err
 	}
 
 	return c.GetCommand(ctx, sandboxID, cmdID)
+}
+
+// Both the HTTP upgrade and Running=true can precede native process creation.
+// Docker publishes a positive PID only after its exec process Start succeeds.
+// Use it solely as a start acknowledgment, never as a guest-namespace kill PID.
+// A canceled kill never cancels the payload.
+func (c *Client) waitCommandRunning(ctx context.Context, rc *runningCommand) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	terminal := func() error {
+		rc.mu.Lock()
+		defer rc.mu.Unlock()
+		if rc.startErr != nil {
+			return rc.startErr
+		}
+		if rc.finished {
+			return sandbox.ErrCommandFinished
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := terminal(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-rc.done:
+		if err := terminal(); err != nil {
+			return err
+		}
+		return sandbox.ErrCommandFinished
+	case <-rc.attached:
+	}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := terminal(); err != nil {
+			return err
+		}
+		inspect, err := c.cli.ExecInspect(ctx, rc.execID, moby.ExecInspectOptions{})
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := terminal(); err != nil {
+			return err
+		}
+		if inspect.Running && inspect.PID > 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-rc.done:
+			if err := terminal(); err != nil {
+				return err
+			}
+			return sandbox.ErrCommandFinished
+		case <-ticker.C:
+		}
+	}
 }
 
 // StreamCommandLogs returns readers for stdout and stderr of a command.
@@ -996,9 +1098,16 @@ func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, std
 		return execResult{}, err
 	}
 	defer attached.Close()
+	// Hijacked streams outlive the HTTP request. Close explicitly on cancellation
+	// so a stalled signal exec cannot hide the caller's canceled/deadline error.
+	stopClose := context.AfterFunc(ctx, attached.Close)
+	defer stopClose()
 
 	if stdin != nil {
 		if _, err := io.Copy(attached.Conn, stdin); err != nil {
+			if ctx.Err() != nil {
+				return execResult{}, ctx.Err()
+			}
 			return execResult{}, err
 		}
 		attached.CloseWrite()
@@ -1006,6 +1115,12 @@ func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, std
 
 	var stdout, stderr bytes.Buffer
 	if _, err := stdcopy.StdCopy(&stdout, &stderr, attached.Reader); err != nil && err != io.EOF {
+		if ctx.Err() != nil {
+			return execResult{}, ctx.Err()
+		}
+		return execResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return execResult{}, err
 	}
 

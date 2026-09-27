@@ -36,7 +36,7 @@ func (p *registryPolicy) token(host string) bool {
 	return p.registry(host) || (p.hub && host == "auth.docker.io")
 }
 func (p *registryPolicy) cdn(host string) bool {
-	return p.hub && (host == "production.cloudflare.docker.com" || strings.HasSuffix(host, ".r2.cloudflarestorage.com")) || p.primary == "ghcr.io" && (host == "pkg-containers.githubusercontent.com" || strings.HasSuffix(host, ".pkg-containers.githubusercontent.com"))
+	return p.hub && (host == "production.cloudflare.docker.com" || host == "production.cloudfront.docker.com" || strings.HasSuffix(host, ".r2.cloudflarestorage.com")) || p.primary == "ghcr.io" && (host == "pkg-containers.githubusercontent.com" || strings.HasSuffix(host, ".pkg-containers.githubusercontent.com"))
 }
 
 var realmPattern = regexp.MustCompile(`(?i)\brealm\s*=\s*(?:"([^"]+)"|([^,\s]+))`)

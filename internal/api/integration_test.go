@@ -5,22 +5,29 @@ package api_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"os/exec"
 	"strings"
-
 	"testing"
+	"time"
 
 	"opensbx/internal/api"
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
 	"opensbx/internal/images"
 	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 	"opensbx/internal/service"
 	"opensbx/models"
 
 	"github.com/gin-gonic/gin"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,6 +48,8 @@ func realRouter(t *testing.T) *gin.Engine {
 	if err := dc.Ping(context.Background()); err != nil {
 		t.Skipf("skipping integration test: Docker unavailable (%v)", err)
 	}
+	baselineCacheTags, err := dockerCacheTags()
+	require.NoError(t, err, "snapshot exact Docker private-cache refs before the integration test")
 
 	store, err := images.Open(t.TempDir())
 	require.NoError(t, err)
@@ -51,7 +60,80 @@ func realRouter(t *testing.T) *gin.Engine {
 	h := api.New(app)
 	h.RegisterHealthCheck(r)
 	h.RegisterRoutes(r.Group("/v1"))
+	// The isolated in-memory repository is the allow-list for every resource,
+	// including recovery rows from a Create that failed before returning an ID.
+	t.Cleanup(func() {
+		rows, err := repo.FindAll()
+		if err != nil {
+			t.Errorf("read isolated Docker integration cleanup records: %v", err)
+			return
+		}
+		for _, row := range rows {
+			if !validIntegrationSandboxID(row.ID) {
+				t.Errorf("refusing to clean invalid public ID from isolated integration DB: %q", row.ID)
+				continue
+			}
+			cleanup := do(r, http.MethodDelete, "/v1/sandboxes/"+row.ID, nil)
+			if cleanup.Code != http.StatusNoContent && cleanup.Code != http.StatusNotFound {
+				t.Errorf("cleanup exact sandbox recorded in isolated integration DB %s/native %s: status=%d body=%s", row.ID, row.NativeID, cleanup.Code, cleanup.Body.String())
+			}
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		caps, capsErr := dc.Capabilities(cleanupCtx)
+		if capsErr != nil {
+			t.Errorf("read isolated Docker cleanup platform: %v", capsErr)
+			return
+		}
+		artifact, resolveErr := store.Resolve(cleanupCtx, integrationTestImage, v1.Platform{OS: caps.Platform.OS, Architecture: caps.Platform.Architecture, Variant: caps.Platform.Variant})
+		if errors.Is(resolveErr, sandbox.ErrImageNotFound) {
+			return
+		}
+		if resolveErr != nil {
+			t.Errorf("resolve only integration-owned Docker cache for cleanup: %v", resolveErr)
+			return
+		}
+		privateTag := "localhost/opensbx-cache:" + strings.TrimPrefix(artifact.Manifest.Digest.String(), "sha256:")
+		if baselineCacheTags[privateTag] {
+			return
+		}
+		exists, inspectErr := dc.ImageExists(cleanupCtx, privateTag)
+		if inspectErr != nil {
+			t.Errorf("inspect exact test Docker cache ref %s for cleanup: %v", privateTag, inspectErr)
+			return
+		}
+		if exists {
+			output, removeErr := exec.CommandContext(cleanupCtx, "docker", "image", "rm", privateTag).CombinedOutput()
+			if removeErr != nil {
+				t.Errorf("remove only newly introduced Docker cache ref %s: %v (%s)", privateTag, removeErr, strings.TrimSpace(string(output)))
+			}
+		}
+	})
 	return r
+}
+
+func dockerCacheTags() (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "docker", "image", "ls", "--no-trunc", "--format", "{{.Repository}}:{{.Tag}}").Output()
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]bool{}
+	for _, ref := range strings.Split(string(output), "\n") {
+		if ref != "<none>:<none>" && ref != "" {
+			refs[ref] = true
+		}
+	}
+	return refs, nil
+}
+
+func validIntegrationSandboxID(id string) bool {
+	if !strings.HasPrefix(id, "sbx-") || len(id) != len("sbx-")+32 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(id, "sbx-"))
+	return err == nil
 }
 
 func ensureTestImage(t *testing.T, r *gin.Engine, image string) {
@@ -166,8 +248,27 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	// Kill the command.
 	w = do(r, "POST", "/v1/sandboxes/"+id+"/cmd/"+sleepID+"/kill", map[string]any{"signal": 15})
 	assert.Equal(t, http.StatusOK, w.Code)
+	var killedCmd models.CommandResponse
+	deadline := time.NewTimer(5 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		status := do(r, "GET", "/v1/sandboxes/"+id+"/cmd/"+sleepID, nil)
+		require.Equal(t, http.StatusOK, status.Code, "inspect killed command: %s", status.Body.String())
+		require.NoError(t, json.Unmarshal(status.Body.Bytes(), &killedCmd))
+		if killedCmd.Command.ExitCode != nil {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("kill endpoint did not terminate its command within bounded wait; latest response=%s", status.Body.String())
+		case <-ticker.C:
+		}
+	}
+	assert.NotEqual(t, 0, *killedCmd.Command.ExitCode, "killed command should have non-zero exit code")
 
-	// Wait and verify it exited with non-zero.
+	// Waiting after observing completion must return the final ND-JSON state.
 	w = do(r, "GET", "/v1/sandboxes/"+id+"/cmd/"+sleepID+"?wait=true", nil)
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -244,6 +345,65 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestIntegration_ImmediateKillWaitsForExecStartupAndCompletes(t *testing.T) {
+	r := realRouter(t)
+	ensureTestImage(t, r, integrationTestImage)
+
+	created := do(r, http.MethodPost, "/v1/sandboxes", map[string]any{
+		"image":   integrationTestImage,
+		"timeout": 300,
+	})
+	require.Equal(t, http.StatusCreated, created.Code, "create immediate-kill test sandbox: %s", created.Body.String())
+	var sandboxCreated models.CreateSandboxResponse
+	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &sandboxCreated))
+	require.NotEmpty(t, sandboxCreated.ID)
+
+	for iteration := 0; iteration < 10; iteration++ {
+		started := do(r, http.MethodPost, "/v1/sandboxes/"+sandboxCreated.ID+"/cmd", map[string]any{
+			"command": "sleep",
+			"args":    []string{"3600"},
+		})
+		require.Equal(t, http.StatusOK, started.Code, "cycle %d start sleep: %s", iteration, started.Body.String())
+		var command models.CommandResponse
+		require.NoError(t, json.Unmarshal(started.Body.Bytes(), &command))
+		require.NotEmpty(t, command.Command.ID)
+
+		// Deliberately signal immediately after the asynchronous ExecCommand response.
+		killed := doIntegrationBounded(t, r, http.MethodPost, "/v1/sandboxes/"+sandboxCreated.ID+"/cmd/"+command.Command.ID+"/kill", map[string]any{"signal": 15}, 5*time.Second)
+		require.Equal(t, http.StatusOK, killed.Code, "cycle %d immediate KillCommand: %s", iteration, killed.Body.String())
+
+		waited := doIntegrationBounded(t, r, http.MethodGet, "/v1/sandboxes/"+sandboxCreated.ID+"/cmd/"+command.Command.ID+"?wait=true", nil, 5*time.Second)
+		require.Equal(t, http.StatusOK, waited.Code, "cycle %d wait for killed command: %s", iteration, waited.Body.String())
+		scanner := bufio.NewScanner(strings.NewReader(waited.Body.String()))
+		var finished models.CommandResponse
+		for scanner.Scan() {
+			if scanner.Text() != "" {
+				require.NoError(t, json.Unmarshal(scanner.Bytes(), &finished))
+			}
+		}
+		require.NoError(t, scanner.Err())
+		require.NotNil(t, finished.Command.ExitCode, "cycle %d wait=true must return the terminal command state", iteration)
+		require.NotEqual(t, 0, *finished.Command.ExitCode, "cycle %d sleep should exit after SIGTERM", iteration)
+	}
+}
+
+func doIntegrationBounded(t *testing.T, r *gin.Engine, method, target string, body any, timeout time.Duration) *httptest.ResponseRecorder {
+	t.Helper()
+	var encoded bytes.Buffer
+	if body != nil {
+		require.NoError(t, json.NewEncoder(&encoded).Encode(body))
+	}
+	request, err := http.NewRequest(method, target, &encoded)
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(request.Context(), timeout)
+	defer cancel()
+	request = request.WithContext(ctx)
+	response := httptest.NewRecorder()
+	r.ServeHTTP(response, request)
+	return response
+}
+
 func TestIntegration_NotFound(t *testing.T) {
 	r := realRouter(t)
 
@@ -266,9 +426,10 @@ func TestIntegration_NotFound(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, w.Code, "%s %s should return 404", e.method, e.url)
 	}
 
-	// DELETE is idempotent: removing a nonexistent sandbox cleans DB and returns 204.
+	// A missing sandbox is reported as not found; only image deletion treats a
+	// missing reference as idempotent when force=true.
 	w := do(r, "DELETE", "/v1/sandboxes/nonexistent", nil)
-	assert.Equal(t, http.StatusNoContent, w.Code, "DELETE nonexistent should return 204")
+	assert.Equal(t, http.StatusNotFound, w.Code, "DELETE nonexistent should return 404")
 }
 
 func TestIntegration_DefaultResourceLimits(t *testing.T) {
