@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,7 +33,9 @@ func TestEndToEnd(t *testing.T) {
 		{"ImagesPullExportImport", h.images},
 		{"SandboxCommandsFilesDomainAndLifecycle", h.sandboxWorkflow},
 		{"ExpirationRenewal", h.expiration},
+		{"ConcurrentSandboxOperations", h.concurrentOperations},
 		{"MCPOverHTTP", h.mcpWorkflow},
+		{"AbruptProcessRecovery", h.abruptRecovery},
 		{"ShutdownAndPersistence", h.persistence},
 	} {
 		if !t.Run(scenario.name, scenario.run) {
@@ -267,6 +270,111 @@ func (h *harness) expiration(t *testing.T) {
 	states, err := h.inventory()
 	require.NoError(t, err)
 	require.Contains(t, []string{"stopped", "exited"}, states[h.owned[sb.ID]])
+	h.remove(t, sb.ID)
+}
+
+func (h *harness) concurrentOperations(t *testing.T) {
+	const count = 3
+	sandboxes := make([]models.CreateSandboxResponse, count)
+	for i := range sandboxes {
+		sandboxes[i] = h.create(t, nil)
+	}
+	type outcome struct {
+		id, commandID string
+		code          int
+		err           error
+	}
+	results := make(chan outcome, count)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, sb := range sandboxes {
+		wg.Add(1)
+		go func(sb models.CreateSandboxResponse) {
+			defer wg.Done()
+			<-start
+			r := outcome{id: sb.ID}
+			status, body, err := h.request("POST", "/v1/sandboxes/"+sb.ID+"/renew-expiration", map[string]int{"timeout": 300}, h.key, nil)
+			if err != nil || status != http.StatusOK {
+				r.err = fmt.Errorf("renew expiration: status=%d error=%v body=%s", status, err, body)
+				results <- r
+				return
+			}
+			status, body, err = h.request("POST", "/v1/sandboxes/"+sb.ID+"/cmd", models.ExecCommandRequest{Command: "echo", Args: []string{sb.ID}}, h.key, nil)
+			if err != nil || status != http.StatusOK {
+				r.err = fmt.Errorf("start command: status=%d error=%v body=%s", status, err, body)
+				results <- r
+				return
+			}
+			var command models.CommandResponse
+			if err := json.Unmarshal(body, &command); err != nil {
+				r.err = err
+				results <- r
+				return
+			}
+			r.commandID = command.Command.ID
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				status, body, err = h.request("GET", "/v1/sandboxes/"+sb.ID+"/cmd/"+r.commandID, nil, h.key, nil)
+				if err != nil || status != http.StatusOK {
+					r.err = fmt.Errorf("wait for command: status=%d error=%v body=%s", status, err, body)
+					results <- r
+					return
+				}
+				if err := json.Unmarshal(body, &command); err != nil {
+					r.err = err
+					results <- r
+					return
+				}
+				if command.Command.ExitCode != nil {
+					r.code = *command.Command.ExitCode
+					results <- r
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			r.err = fmt.Errorf("command did not finish within 20 seconds")
+			results <- r
+		}(sb)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	observed := map[string]outcome{}
+	for result := range results {
+		require.NoError(t, result.err, "concurrent operations for %s", result.id)
+		require.NotEmpty(t, result.commandID)
+		require.Zero(t, result.code)
+		observed[result.id] = result
+	}
+	require.Len(t, observed, count)
+	for _, sb := range sandboxes {
+		require.True(t, h.inspect(t, sb.ID).Running)
+		h.remove(t, sb.ID)
+	}
+}
+
+func (h *harness) abruptRecovery(t *testing.T) {
+	sb := h.create(t, nil)
+	file := "/v1/sandboxes/" + sb.ID + "/files?path=/tmp/crash-recovery.txt"
+	h.api(t, "PUT", file, models.FileWriteRequest{Content: sb.ID}, 200, nil)
+	command := h.command(t, sb.ID, "sleep", "300")
+	require.NotEmpty(t, command.ID)
+	require.NoError(t, h.crash(), "simulate an ungraceful server process failure")
+
+	// The native backend survives an OpenSBX process crash. A fresh process must
+	// rediscover and safely manage the exact rows from its durable execution DB.
+	h.start(t)
+	states, err := h.inventory()
+	require.NoError(t, err)
+	require.Equal(t, "running", states[h.owned[sb.ID]], "crash recovery must keep the existing sandbox identity manageable")
+	detail := h.inspect(t, sb.ID)
+	require.True(t, detail.Running)
+	var read models.FileReadResponse
+	h.api(t, "GET", file, nil, 200, &read)
+	require.Equal(t, sb.ID, read.Content)
+	require.Contains(t, string(h.api(t, "GET", "/v1/sandboxes/"+sb.ID+"/cmd", nil, 200, nil)), command.Name)
+	h.api(t, "POST", "/v1/sandboxes/"+sb.ID+"/stop", nil, 200, nil)
+	require.False(t, h.inspect(t, sb.ID).Running)
 	h.remove(t, sb.ID)
 }
 

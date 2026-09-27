@@ -15,9 +15,11 @@ git diff --check
 ```
 
 CI runs unit tests, race tests, vet for default and integration/E2E builds, the
-Docker-tagged integration suite, and the [real-process E2E suite](e2e/README.md).
-Docker is required in CI. The older integration tests skip locally if Docker is
-not available; the E2E suite fails instead. Run the live Docker integration suite:
+Docker-tagged integration suite, and the [real-process E2E suite](e2e/README.md)
+on Docker and Apple Container. The E2E jobs exercise the GoReleaser-produced
+release archive on native Linux amd64 and macOS arm64 runners. The older
+integration tests skip locally if Docker is unavailable; the E2E suite fails
+instead. Run the live Docker integration suite:
 
 ```sh
 go test -tags=integration ./... -run '^TestIntegration'
@@ -51,10 +53,12 @@ not clean up resources globally.
 
 ## Real-process end-to-end tests
 
-The E2E suite builds and starts the actual binary, exercises REST and MCP over
-HTTP against a real runtime, visits returned sandbox domains, and verifies
-runtime resource cleanup and empty database tables before removing its temporary
-database/catalog directory:
+The E2E suite starts the actual executable, exercises REST and MCP over HTTP
+against a real runtime, visits returned sandbox domains, and verifies runtime
+resource cleanup and empty database tables before removing its temporary
+database/catalog directory. CI passes the binary extracted from a GoReleaser
+snapshot archive; locally it builds `cmd/api` unless `OPENSBX_E2E_BINARY` names an
+executable to test:
 
 ```sh
 go test -tags=e2e ./e2e -run '^TestEndToEnd$' -count=1 -v -timeout=12m
@@ -62,7 +66,10 @@ OPENSBX_E2E_RUNTIME=container go test -tags=e2e ./e2e -run '^TestEndToEnd$' -cou
 ```
 
 See [E2E prerequisites, scenarios and cleanup guarantees](e2e/README.md). Apple
-requires its native runtime prerequisites; neither command installs a runtime.
+requires its native runtime prerequisites; neither local command installs a
+runtime. The CI Apple job uses the `macos-26` arm64 runner, installs signed Apple
+Container 1.4.1, prepares the recommended kernel and vminit, and stops the
+ephemeral runtime afterward.
 
 ## API documentation
 

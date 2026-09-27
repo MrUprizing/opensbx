@@ -61,7 +61,8 @@ func newHarness(t *testing.T) *harness {
 	}
 	require.Contains(t, []string{"docker", "container"}, runtimeName)
 	base := t.TempDir()
-	h := &harness{root: filepath.Join(base, "state"), bin: filepath.Join(base, "opensbx"), runtime: runtimeName,
+	bin := strings.TrimSpace(os.Getenv("OPENSBX_E2E_BINARY"))
+	h := &harness{root: filepath.Join(base, "state"), bin: bin, runtime: runtimeName,
 		key: "e2e-" + filepath.Base(base), owned: map[string]string{}, http: &http.Client{Timeout: 90 * time.Second,
 			Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	h.data = filepath.Join(h.root, "data")
@@ -69,12 +70,22 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { h.cleanup(t) })
 	_, err := exec.LookPath("curl")
 	require.NoError(t, err, "curl is required to exercise returned .localhost URLs without Host/DNS overrides")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	build := exec.CommandContext(ctx, "go", "build", "-o", h.bin, "./cmd/api")
-	build.Dir = ".."
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build: %s", out)
+	if h.bin == "" {
+		h.bin = filepath.Join(base, "opensbx")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, "go", "build", "-o", h.bin, "./cmd/api")
+		build.Dir = ".."
+		out, err := build.CombinedOutput()
+		require.NoError(t, err, "build: %s", out)
+	} else {
+		var err error
+		h.bin, err = filepath.Abs(h.bin)
+		require.NoError(t, err)
+		info, err := os.Stat(h.bin)
+		require.NoError(t, err, "packaged OpenSBX binary")
+		require.True(t, info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0, "OPENSBX_E2E_BINARY must be an executable file")
+	}
 	h.preflight(t)
 	h.start(t)
 	return h
@@ -145,6 +156,29 @@ func (h *harness) stop() error {
 		_ = h.cmd.Process.Kill()
 		<-h.done
 		return fmt.Errorf("server failed to terminate within 65 seconds")
+	}
+}
+
+func (h *harness) crash() error {
+	if h.done == nil {
+		return fmt.Errorf("server process was never started")
+	}
+	select {
+	case <-h.done:
+		return fmt.Errorf("server process already exited before forced-crash scenario: %v", h.waitErr)
+	default:
+	}
+	if err := h.cmd.Process.Kill(); err != nil {
+		return err
+	}
+	select {
+	case <-h.done:
+		if h.waitErr == nil {
+			return fmt.Errorf("server exited without a kill status")
+		}
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("server did not exit after SIGKILL")
 	}
 }
 

@@ -5,8 +5,12 @@ process, and drives its public REST and MCP interfaces over a real loopback
 listener. Runtime operations use actual Docker containers or Apple containers.
 The `e2e` build tag keeps these tests out of `go test ./...`.
 
-CI runs this package with `-race` to check the harness too. The child server is
-built normally; application race coverage also runs in the default race suite.
+CI packages the release archive with GoReleaser, extracts the native artifact,
+and runs this suite against that exact executable with `-race`. Both Docker and
+Apple Container jobs are required; the Apple job provisions its ephemeral
+[GitHub-hosted macOS 26 arm64 runner](https://github.com/actions/runner-images)
+with the pinned signed runtime and kernel prerequisites.
+When `OPENSBX_E2E_BINARY` is unset, local runs build `cmd/api` directly.
 
 ## Run
 
@@ -46,7 +50,9 @@ image. Use an isolated Docker daemon for that case.
 | ImagesPullExportImport | Missing image rejected, explicit pull/list/inspect, CLI export/remove/import/inspect, selected OCI manifest preserved |
 | SandboxCommandsFilesDomainAndLifecycle | Actual running resource and public/native identities, inventory/network/stats, stdout/stderr/exit code, log streaming, kill, file CRUD, app URL, stop/start/restart and file persistence; Docker pause/resume or Apple unsupported response |
 | ExpirationRenewal | Sandbox survives the superseded deadline, then really stops after the renewed deadline; native state confirms the stop |
+| ConcurrentSandboxOperations | Three real sandboxes receive overlapping renew-expiration and exec requests, then each must stay running and return its own successful command result |
 | MCPOverHTTP | SDK initialization and tool discovery, sandbox creation, command execution/logs, file write/read, deletion through authenticated streamable HTTP |
+| AbruptProcessRecovery | SIGKILL the OpenSBX process while a sandbox and command are live, restart against the same DB, verify native identity, files and command history, then stop and delete it through the recovered API |
 | ShutdownAndPersistence | SIGTERM exits within budget and stops the native sandbox, restart using the same DB preserves identity/history/files, API deletion clears state |
 
 The domain test passes the **exact URL returned by OpenSBX** to curl, without a
@@ -84,3 +90,10 @@ archives are not retained as artifacts.
 The existing prepared-store cross-runtime portability test remains complementary:
 it checks shared-image identity and offline native-cache recovery across both
 backends. See [Contributing](../CONTRIBUTING.md) for its invocation.
+
+The abrupt-failure case deliberately kills only the OpenSBX server process; it
+does not kill the runtime or the test runner. It verifies that resources survive
+and remain manageable after restart, then explicitly stops and removes the exact
+test-owned resource. It does not claim crash-persistent TTLs: expiration timers
+are process-local and the test uses an explicit recovery stop rather than waiting
+for an expiry after a forced server crash.
