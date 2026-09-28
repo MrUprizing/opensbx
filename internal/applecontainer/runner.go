@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"opensbx/internal/runtimeio"
 )
 
 const outputLimit = 4 << 20
@@ -123,7 +125,7 @@ func (c *Client) run(ctx context.Context, in io.Reader, args ...string) ([]byte,
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && offlineImageUnavailable(args, diagnostic, truncated) {
 			return nil, errOfflineImageUnavailable
 		}
-		return nil, fmt.Errorf("Apple container %s failed: %w", args[0], safeError(err))
+		return nil, runtimeio.DeferRecovery(fmt.Errorf("Apple container %s failed: %w", args[0], safeError(err)))
 	}
 	if overflow {
 		return nil, fmt.Errorf("Apple container output exceeds %d bytes", outputLimit)

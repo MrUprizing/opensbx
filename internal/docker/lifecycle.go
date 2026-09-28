@@ -93,16 +93,34 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		sb, _ := c.repo.FindByName(n)
 		return sb != nil
 	})
+	token := generateCmdID()
+	// A prechosen exact name and unpredictable label survive a lost create response.
+	nativeName := name + "-" + token
+	cfg.Labels = map[string]string{ownerLabel: token}
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	op := database.Operation{ID: "docker:" + token, RuntimeKind: "docker", PublicID: sandbox.CreationID(ctx, ""), NativeName: nativeName, Token: token, Kind: "create", Deadline: &deadline}
+	if err := c.repo.BeginCreate(op); err != nil {
+		return response, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			c.retryOperation(op)
+		}
+	}()
 
 	result, err := c.cli.ContainerCreate(ctx, moby.ContainerCreateOptions{
 		Config:     cfg,
 		HostConfig: hostCfg,
-		Name:       name,
+		Name:       nativeName,
 	})
 	if err != nil {
-		return runtimeio.CreateSandboxResponse{}, err
+		return runtimeio.CreateSandboxResponse{}, fmt.Errorf("create intent %s retained for recovery: %w", op.ID, err)
 	}
-	committed := false
 	defer func() {
 		if committed {
 			return
@@ -110,23 +128,21 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		c.cancelTimer(result.ID)
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := c.cli.ContainerRemove(cleanupCtx, result.ID, moby.ContainerRemoveOptions{Force: true}); err != nil {
+		if _, err := c.cli.ContainerRemove(cleanupCtx, result.ID, moby.ContainerRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
 			// Retain ownership if a newly created resource could not be rolled back.
-			saveErr := c.repo.CreateOwnership(database.Sandbox{ID: sandbox.CreationID(ctx, result.ID), NativeID: result.ID, Name: name, Image: sandbox.CreationImage(ctx, req.Image), Port: mainPort})
+			saveErr := c.repo.CreateOwnership(database.Sandbox{ID: sandbox.CreationID(ctx, result.ID), NativeID: result.ID, Name: name, Image: sandbox.CreationImage(ctx, req.Image), Port: mainPort, RuntimeKind: "docker", AttemptToken: token, ExpiresAt: &deadline})
 			createErr = errors.Join(createErr, fmt.Errorf("rollback sandbox %s: %w", result.ID, err), saveErr)
+		} else {
+			createErr = errors.Join(createErr, c.repo.DeleteOperation(op))
 		}
 	}()
+	if err := c.repo.BindCreation(&op, result.ID); err != nil {
+		return response, err
+	}
 
 	if _, err := c.cli.ContainerStart(ctx, result.ID, moby.ContainerStartOptions{}); err != nil {
 		return runtimeio.CreateSandboxResponse{}, err
 	}
-
-	// Schedule auto-stop. Default 15 min if not specified.
-	timeout := req.Timeout
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-	c.scheduleStop(result.ID, timeout)
 
 	// Inspect to get Docker-assigned host ports.
 	info, err := c.cli.ContainerInspect(ctx, result.ID, moby.ContainerInspectOptions{})
@@ -137,17 +153,22 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 	assignedPorts := extractPorts(info.Container.NetworkSettings.Ports)
 
 	// A successful create must have durable ownership metadata.
-	if err := c.repo.CreateOwnership(database.Sandbox{
-		ID:       sandbox.CreationID(ctx, result.ID),
-		NativeID: result.ID,
-		Name:     name,
-		Image:    sandbox.CreationImage(ctx, req.Image),
-		Ports:    database.JSONMap(assignedPorts),
-		Port:     mainPort,
-	}); err != nil {
+	if err := c.repo.CommitCreation(op, database.Sandbox{
+		ID:          sandbox.CreationID(ctx, result.ID),
+		NativeID:    result.ID,
+		Name:        name,
+		Image:       sandbox.CreationImage(ctx, req.Image),
+		Ports:       database.JSONMap(assignedPorts),
+		Port:        mainPort,
+		RuntimeKind: "docker", AttemptToken: token, ExpiresAt: &deadline,
+	}, runtimeio.AwaitAdoption(ctx)); err != nil {
 		return runtimeio.CreateSandboxResponse{}, err
 	}
+	if runtimeio.AwaitAdoption(ctx) {
+		c.createAttempts.Store(result.ID, op)
+	}
 	committed = true
+	c.scheduleDeadline(result.ID, deadline, time.Until(deadline))
 
 	return runtimeio.CreateSandboxResponse{
 		ID:    result.ID,
@@ -156,7 +177,15 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 	}, nil
 }
 
-func (c *Client) DiscardCreated(ctx context.Context, id string) error { return c.Remove(ctx, id) }
+func (c *Client) DiscardCreated(ctx context.Context, id string) error {
+	err := c.Remove(ctx, id)
+	if err != nil {
+		c.CreationFailed(id)
+	} else {
+		c.createAttempts.Delete(id)
+	}
+	return err
+}
 
 // Start starts a stopped sandbox and re-schedules the auto-stop timer.
 // Returns ErrAlreadyRunning (409) if the sandbox is already running.
@@ -174,11 +203,21 @@ func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartRespons
 		return runtimeio.RestartResponse{}, sandbox.ErrAlreadyRunning
 	}
 
+	deadline := time.Now().Add(defaultTimeout * time.Second)
+	op, err := c.repo.BeginOperation("docker", id, "start", &deadline)
+	if err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.retryOperation(*op)
+	if err := c.checkOwnership(ctx, *op); err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.invalidateCache(id)
 	if _, err := c.cli.ContainerStart(ctx, id, moby.ContainerStartOptions{}); err != nil {
 		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
-	c.scheduleStop(id, defaultTimeout)
+	c.scheduleDeadline(id, deadline, time.Until(deadline))
 
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
@@ -193,10 +232,9 @@ func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartRespons
 
 	ports := extractPorts(info.Container.NetworkSettings.Ports)
 
-	if dbErr := c.repo.UpdatePorts(id, database.JSONMap(ports)); dbErr != nil {
-		log.Printf("database: failed to update ports for sandbox %s: %v", id, dbErr)
+	if dbErr := c.repo.CompleteOperation(*op, database.JSONMap(ports), &deadline); dbErr != nil {
+		return runtimeio.RestartResponse{}, fmt.Errorf("persist ports for sandbox %s: %w", id, dbErr)
 	}
-	c.invalidateCache(id)
 
 	return runtimeio.RestartResponse{
 		Status:    "started",
@@ -212,21 +250,46 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 		return err
 	}
 	defer c.lifecycleMu.Unlock()
+	return c.stopLocked(ctx, id)
+}
+
+func (c *Client) stopLocked(ctx context.Context, id string) error {
+	op, err := c.repo.BeginOperation("docker", id, "stop", nil)
+	if err != nil {
+		return err
+	}
+	defer c.retryOperation(*op)
+	if err := c.checkOwnership(ctx, *op); err != nil {
+		return err
+	}
+	defer c.invalidateCache(id)
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
-		return wrapNotFound(err)
+		if errdefs.IsNotFound(err) {
+			if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
+				return err
+			}
+			c.cancelTimer(id)
+			return sandbox.ErrNotFound
+		}
+		return runtimeio.DeferRecovery(wrapNotFound(err))
 	}
 	if !info.Container.State.Running {
+		if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
+			return err
+		}
 		c.cancelTimer(id)
 		return sandbox.ErrAlreadyStopped
 	}
 
 	_, err = c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{})
 	if err == nil || errdefs.IsNotFound(err) {
+		if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
+			return err
+		}
 		c.cancelTimer(id)
-		c.invalidateCache(id)
 	}
-	return wrapNotFound(err)
+	return runtimeio.DeferRecovery(wrapNotFound(err))
 }
 
 // Restart restarts a sandbox and returns the new port mappings.
@@ -236,13 +299,23 @@ func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartRespo
 		return runtimeio.RestartResponse{}, err
 	}
 	defer c.lifecycleMu.Unlock()
+	deadline := time.Now().Add(defaultTimeout * time.Second)
+	op, err := c.repo.BeginOperation("docker", id, "restart", &deadline)
+	if err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.retryOperation(*op)
+	if err := c.checkOwnership(ctx, *op); err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.invalidateCache(id)
 
 	if _, err := c.cli.ContainerRestart(ctx, id, moby.ContainerRestartOptions{}); err != nil {
 		return runtimeio.RestartResponse{}, wrapNotFound(err)
 	}
 
 	// Re-schedule auto-stop with the default timeout.
-	c.scheduleStop(id, defaultTimeout)
+	c.scheduleDeadline(id, deadline, time.Until(deadline))
 
 	// Inspect to get the new ports.
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
@@ -259,10 +332,9 @@ func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartRespo
 	ports := extractPorts(info.Container.NetworkSettings.Ports)
 
 	// Update persisted ports after restart (they may change).
-	if dbErr := c.repo.UpdatePorts(id, database.JSONMap(ports)); dbErr != nil {
-		log.Printf("database: failed to update ports for sandbox %s: %v", id, dbErr)
+	if dbErr := c.repo.CompleteOperation(*op, database.JSONMap(ports), &deadline); dbErr != nil {
+		return runtimeio.RestartResponse{}, fmt.Errorf("persist ports for sandbox %s: %w", id, dbErr)
 	}
-	c.invalidateCache(id)
 
 	return runtimeio.RestartResponse{
 		Status:    "restarted",
@@ -278,7 +350,15 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 		return err
 	}
 	defer c.lifecycleMu.Unlock()
-	_, err := c.cli.ContainerRemove(ctx, id, moby.ContainerRemoveOptions{Force: true})
+	op, err := c.repo.BeginOperation("docker", id, "delete", nil)
+	if err != nil {
+		return err
+	}
+	defer c.retryOperation(*op)
+	if err := c.checkOwnership(ctx, *op); err != nil {
+		return err
+	}
+	_, err = c.cli.ContainerRemove(ctx, id, moby.ContainerRemoveOptions{Force: true})
 	if err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
@@ -286,20 +366,9 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 	c.invalidateCache(id)
 
 	// Kill all running commands for this sandbox.
-	c.commands.Range(func(key, value any) bool {
-		rc := value.(*runningCommand)
-		if rc.sandboxID == id {
-			rc.cancel()
-		}
-		return true
-	})
+	c.clearCommands(id)
 
-	// Clean up command records from DB.
-	if dbErr := c.repo.DeleteCommandsBySandbox(id); dbErr != nil {
-		return fmt.Errorf("delete commands for sandbox %s: %w", id, dbErr)
-	}
-
-	if dbErr := c.repo.Delete(id); dbErr != nil {
+	if dbErr := c.repo.DeleteOperation(*op); dbErr != nil {
 		return fmt.Errorf("delete sandbox %s: %w", id, dbErr)
 	}
 	return nil
@@ -313,6 +382,9 @@ func (c *Client) Pause(ctx context.Context, id string) error {
 		return err
 	}
 	defer c.lifecycleMu.Unlock()
+	if err := c.repo.RequireIdle("docker", id); err != nil {
+		return err
+	}
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
 		return wrapNotFound(err)
@@ -335,6 +407,9 @@ func (c *Client) Resume(ctx context.Context, id string) error {
 		return err
 	}
 	defer c.lifecycleMu.Unlock()
+	if err := c.repo.RequireIdle("docker", id); err != nil {
+		return err
+	}
 	info, err := c.cli.ContainerInspect(ctx, id, moby.ContainerInspectOptions{})
 	if err != nil {
 		return wrapNotFound(err)
@@ -358,13 +433,18 @@ func (c *Client) RenewExpiration(ctx context.Context, id string, timeout int) er
 		return wrapNotFound(err)
 	}
 
-	c.scheduleStop(id, timeout)
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	if err := c.repo.SetDeadline(id, "docker", &deadline); err != nil {
+		return err
+	}
+	c.scheduleDeadline(id, deadline, time.Until(deadline))
 	return nil
 }
 
 // Shutdown cancels all pending timers, running commands, and stops tracked containers.
 // Called during graceful shutdown to prevent orphaned containers.
 func (c *Client) Shutdown(ctx context.Context) {
+	c.recovery.Stop()
 	if err := c.lockLifecycle(ctx); err != nil {
 		log.Printf("docker shutdown: %v", err)
 		return
@@ -395,7 +475,7 @@ func (c *Client) Shutdown(ctx context.Context) {
 	c.timers.Range(func(key, value any) bool {
 		id := key.(string)
 		c.cancelTimer(id)
-		if _, err := c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{}); err != nil {
+		if err := c.stopForShutdown(ctx, id); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				log.Printf("docker shutdown: stop sandbox %s timeout", id)
 			} else {
@@ -409,17 +489,21 @@ func (c *Client) Shutdown(ctx context.Context) {
 // scheduleStop creates a timer that auto-stops the sandbox after the given seconds.
 // Uses a cancel channel so cancelTimer can cleanly terminate the goroutine.
 func (c *Client) scheduleStop(id string, seconds int) {
+	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
+	c.scheduleDeadline(id, deadline, time.Until(deadline))
+}
+
+func (c *Client) scheduleDeadline(id string, deadline time.Time, delay time.Duration) {
 	c.timersMu.Lock()
 	defer c.timersMu.Unlock()
 	c.cancelTimerLocked(id)
-	d := time.Duration(seconds) * time.Second
-	timer := time.NewTimer(d)
+	timer := time.NewTimer(delay)
 	cancel := make(chan struct{})
 
 	entry := &timerEntry{
 		timer:     timer,
 		cancel:    cancel,
-		expiresAt: time.Now().Add(d),
+		expiresAt: deadline,
 	}
 	c.timers.Store(id, entry)
 
@@ -477,17 +561,47 @@ func (c *Client) lockLifecycle(ctx context.Context) error {
 }
 
 func (c *Client) expire(id string, entry *timerEntry) {
-	// Keep the timer tracked while waiting; shutdown or renewal may supersede it.
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
+	key := fmt.Sprintf("ttl:%s:%p", id, entry)
+	c.recovery.Schedule(key, func(ctx context.Context) error {
+		if err := c.lockLifecycle(ctx); err != nil {
+			return err
+		}
+		defer c.lifecycleMu.Unlock()
+		c.expireLocked(ctx, id, entry)
+		return nil
+	})
+	_ = c.recovery.Run(context.Background(), key)
+}
+
+func (c *Client) expireLocked(ctx context.Context, id string, entry *timerEntry) {
 	if c.closing || c.getTimerEntry(id) != entry {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := c.cli.ContainerStop(ctx, id, moby.ContainerStopOptions{}); err != nil && !errdefs.IsNotFound(err) {
+	if err := c.reconcileResource(ctx, id); err != nil {
+		log.Printf("docker sandbox TTL recovery failed for %s: %v", id, err)
+		c.scheduleDeadline(id, entry.expiresAt, 30*time.Second)
+		return
+	}
+	if c.getTimerEntry(id) == nil {
+		return
+	} // Reconciliation already stopped or removed it.
+	row, err := c.repo.FindByNativeID(id)
+	if err != nil {
+		log.Printf("Docker TTL ownership lookup %s: %v", id, err)
+		c.scheduleDeadline(id, entry.expiresAt, 30*time.Second)
+		return
+	}
+	if row == nil {
+		c.cancelTimer(id)
+		return
+	}
+	if row.ExpiresAt != nil && row.ExpiresAt.After(entry.expiresAt) && row.ExpiresAt.After(time.Now()) {
+		c.scheduleDeadline(id, *row.ExpiresAt, time.Until(*row.ExpiresAt))
+		return
+	}
+	if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
 		log.Printf("docker sandbox TTL stop failed for %s: %v", id, err)
-		c.scheduleStop(id, 30)
+		c.scheduleDeadline(id, entry.expiresAt, 30*time.Second)
 		return
 	}
 	c.cancelTimer(id)

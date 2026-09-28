@@ -128,8 +128,11 @@ func TestDiscardCreatedRejectsLabelMismatchAndNeverDeletesUnverifiedResource(t *
 		_, _ = io.WriteString(out, strings.Replace(listJSON(id, "stopped", "[]"), ownerLabel+"\":\""+id, ownerLabel+"\":\"opensbx-wrong-owner", 1))
 		return nil
 	}
-	client, _ := testClient(t, runner)
-	if err := client.DiscardCreated(context.Background(), id); err == nil || !strings.Contains(err.Error(), "ownership mismatch") {
+	client, repo := testClient(t, runner)
+	if err := repo.Save(database.Sandbox{ID: id, NativeID: id, RuntimeKind: "container", AttemptToken: id, Name: "owned"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DiscardCreated(context.Background(), id); err == nil || !strings.Contains(err.Error(), "ownership label mismatch") {
 		t.Fatalf("label-mismatch discard error=%v", err)
 	}
 	if len(runner.calls) != 1 {

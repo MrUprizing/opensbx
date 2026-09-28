@@ -53,6 +53,7 @@ image. Use an isolated Docker daemon for that case.
 | ConcurrentSandboxOperations | Three real sandboxes receive overlapping renew-expiration and exec requests, then each must stay running and return its own successful command result |
 | MCPOverHTTP | SDK initialization and tool discovery, sandbox creation, command execution/logs, file write/read, deletion through authenticated streamable HTTP |
 | AbruptProcessRecovery | SIGKILL the OpenSBX process while a sandbox and command are live, restart against the same DB, verify native identity, files and command history, then stop and delete it through the recovered API |
+| AbruptExpirationRecovery | SIGKILL the process while a short-TTL sandbox is live, wait past its persisted deadline, restart, then verify the listener remains available while same-process background recovery stops the exact owned resource and clears its deadline |
 | ShutdownAndPersistence | SIGTERM exits within budget and stops the native sandbox, restart using the same DB preserves identity/history/files, API deletion clears state |
 
 The domain test passes the **exact URL returned by OpenSBX** to curl, without a
@@ -91,9 +92,9 @@ The existing prepared-store cross-runtime portability test remains complementary
 it checks shared-image identity and offline native-cache recovery across both
 backends. See [Contributing](../CONTRIBUTING.md) for its invocation.
 
-The abrupt-failure case deliberately kills only the OpenSBX server process; it
-does not kill the runtime or the test runner. It verifies that resources survive
-and remain manageable after restart, then explicitly stops and removes the exact
-test-owned resource. It does not claim crash-persistent TTLs: expiration timers
-are process-local and the test uses an explicit recovery stop rather than waiting
-for an expiry after a forced server crash.
+Abrupt-failure cases deliberately kill only the OpenSBX server process; they do
+not kill the runtime or the test runner. The general recovery case verifies that
+resources survive and remain manageable after restart. The expiration-recovery
+case waits past the saved absolute deadline while the server is down, then verifies
+startup stops the exact test-owned resource. Both cases remove their exact
+test-owned resources afterward.

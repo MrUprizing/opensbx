@@ -39,6 +39,17 @@ type runningCommand struct {
 	finished  bool
 }
 
+func (c *Client) clearCommands(id string) {
+	c.commands.Range(func(key, value any) bool {
+		rc := value.(*runningCommand)
+		if rc.sandboxID == id {
+			rc.cancel()
+			c.commands.Delete(key)
+		}
+		return true
+	})
+}
+
 // generateCmdID creates a command ID: cmd_ + 40 hex chars.
 func generateCmdID() string {
 	b := make([]byte, 20)
@@ -51,6 +62,13 @@ func generateCmdID() string {
 // ExecCommand creates and starts a command asynchronously inside a sandbox.
 // Returns the CommandDetail immediately (no exit_code yet).
 func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimeio.ExecCommandRequest) (runtimeio.CommandDetail, error) {
+	if err := c.lockLifecycle(ctx); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
+	defer c.lifecycleMu.Unlock()
+	if err := c.repo.RequireIdle("docker", sandboxID); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
 	// Verify sandbox is running.
 	info, err := c.cli.ContainerInspect(ctx, sandboxID, moby.ContainerInspectOptions{})
 	if err != nil {

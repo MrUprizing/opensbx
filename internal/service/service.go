@@ -111,14 +111,14 @@ func (s *Service) Create(ctx context.Context, opts sandbox.CreateOptions) (sandb
 }
 func (s *Service) SetAddress(addr net.Addr) { _, s.port, _ = net.SplitHostPort(addr.String()) }
 func (s *Service) Route(ctx context.Context, name string) (string, error) {
-	row, err := s.repo.FindByName(name)
+	row, err := s.routeOwner(ctx, name)
 	if err != nil {
 		return "", err
 	}
-	if row == nil {
-		return "", sandbox.ErrNotFound
-	}
-	wait := s.routes.DoChan(row.ID, func() (any, error) {
+	// Do not share an earlier owner's in-flight native snapshot with a replacement
+	// that reuses the same public ID. No result is cached after the flight ends.
+	key := fmt.Sprintf("%q:%q:%q:%q", row.ID, row.RuntimeID(), row.RuntimeKind, row.AttemptToken)
+	wait := s.routes.DoChan(key, func() (any, error) {
 		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		return s.Runtime.Routing(readCtx, sandbox.SandboxID(row.ID))
@@ -133,6 +133,15 @@ func (s *Service) Route(ctx context.Context, name string) (string, error) {
 		}
 		route = result.Val.(sandbox.Route)
 	}
+	// Every waiter rechecks after the shared read: a running native snapshot is
+	// not authorization to bypass a newly persisted intent or removed ownership.
+	current, err := s.routeOwner(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if current.ID != row.ID || current.RuntimeID() != row.RuntimeID() || current.RuntimeKind != row.RuntimeKind || current.AttemptToken != row.AttemptToken {
+		return "", sandbox.ErrNotFound
+	}
 	if !route.Running {
 		return "", sandbox.ErrNotRunning
 	}
@@ -145,6 +154,22 @@ func (s *Service) Route(ctx context.Context, name string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func (s *Service) routeOwner(ctx context.Context, name string) (*database.Sandbox, error) {
+	row, pending, err := s.repo.WithContext(ctx).FindRoutingState(name, s.caps.Runtime)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil || (row.RuntimeKind != "" && row.RuntimeKind != s.caps.Runtime) {
+		return nil, sandbox.ErrNotFound
+	}
+	// Any pending lifecycle kind is uncommitted, including start/restart and
+	// unknown kinds. Legacy rows without a deadline remain eligible.
+	if pending || (row.ExpiresAt != nil && !row.ExpiresAt.After(time.Now())) {
+		return nil, sandbox.ErrNotRunning
+	}
+	return row, nil
 }
 func (s *Service) url(row database.Sandbox) string {
 	if row.Port == "" && len(row.Ports) == 1 {

@@ -99,6 +99,9 @@ func (c *Client) ExecCommand(ctx context.Context, sandbox string, req runtimeio.
 	if c.closing {
 		return zero, errors.New("backend is shutting down")
 	}
+	if err := c.repo.RequireIdle("container", sandbox); err != nil {
+		return zero, err
+	}
 	if err := c.running(ctx, sandbox); err != nil {
 		return zero, err
 	}

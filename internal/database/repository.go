@@ -153,6 +153,17 @@ func (r *Repository) Delete(id string) error {
 	return r.db.Delete(&Sandbox{}, "id = ?", id).Error
 }
 
+// DeleteSandbox removes ownership and history in the same transaction.
+func (r *Repository) DeleteSandbox(id string) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		repo := &Repository{db: tx, native: r.native}
+		if err := repo.DeleteCommandsBySandbox(id); err != nil {
+			return err
+		}
+		return repo.Delete(id)
+	})
+}
+
 // SaveCommand creates a new command record.
 func (r *Repository) SaveCommand(cmd Command) error {
 	id, err := r.storedID(cmd.SandboxID)

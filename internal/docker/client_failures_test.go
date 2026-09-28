@@ -30,8 +30,10 @@ func TestLifecycleReportsPostMutationInspectFailure(t *testing.T) {
 			case "create":
 				_, err = dc.Create(ctx, runtimeio.CreateSandboxRequest{Image: "alpine"})
 			case "start":
+				seedDockerLifecycleOwner(t, dc, "container-1")
 				_, err = dc.Start(ctx, "container-1")
 			case "restart":
+				seedDockerLifecycleOwner(t, dc, "container-1")
 				_, err = dc.Restart(ctx, "container-1")
 			}
 			require.ErrorContains(t, err, "fixture error", "a failed post-operation inspect must not be reported as success")

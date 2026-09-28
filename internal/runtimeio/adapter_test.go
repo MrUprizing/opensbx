@@ -58,7 +58,10 @@ func (e *engineFake) Create(ctx context.Context, req CreateSandboxRequest) (Crea
 }
 func (e *engineFake) DiscardCreated(_ context.Context, id string) error {
 	e.call("discard", id)
-	return e.discardErr
+	if e.discardErr != nil {
+		return e.discardErr
+	}
+	return e.repo.NativeView().DeleteSandbox(id)
 }
 func (e *engineFake) List(context.Context) ([]SandboxSummary, error) {
 	e.call("list", "")
@@ -488,7 +491,7 @@ func TestProvisionedAdoptionRefusesMissingOrNativeMismatchOwnershipRows(t *testi
 	}
 }
 
-func TestProvisionedAdoptionChecksContextAndImageIdentityAndRecoveryRecreatesMissingRow(t *testing.T) {
+func TestProvisionedAdoptionChecksContextAndImageIdentityAndRecoveryDoesNotResurrectDeletedOwner(t *testing.T) {
 	adapter, _, _, repo := newAdapterFixture(t)
 	const publicID = sandbox.SandboxID("sbx-provision-recovery")
 	prepared, err := adapter.Materialize(context.Background(), sandbox.Image{RootDigest: "sha256:root", ManifestDigest: "sha256:manifest"})
@@ -511,12 +514,12 @@ func TestProvisionedAdoptionChecksContextAndImageIdentityAndRecoveryRecreatesMis
 	if err := repo.Delete(string(publicID)); err != nil {
 		t.Fatal(err)
 	}
-	if err := transaction.Recover(context.Background(), identity, errors.New("recovery test cause")); err != nil {
-		t.Fatal(err)
+	if err := transaction.Recover(context.Background(), identity, errors.New("recovery test cause")); err == nil || !strings.Contains(err.Error(), "ownership disappeared") {
+		t.Fatalf("recovery without current ownership error=%v; want refusal to resurrect deleted row", err)
 	}
 	row, err := repo.FindByID(string(publicID))
-	if err != nil || row == nil || row.NativeID == "" || row.RecoveryError != "recovery test cause" || row.ImageRoot != identity.Root || row.ImageManifest != identity.Manifest {
-		t.Fatalf("recreated recovery row=%+v err=%v", row, err)
+	if err != nil || row != nil {
+		t.Fatalf("deleted owner was resurrected by stale recovery: row=%+v err=%v", row, err)
 	}
 }
 

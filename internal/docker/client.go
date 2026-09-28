@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"opensbx/internal/database"
+	"opensbx/internal/runtimeio"
 	"opensbx/internal/sandbox"
 
 	"github.com/containerd/errdefs"
@@ -18,6 +19,8 @@ import (
 
 // Client wraps the Docker SDK and exposes sandbox operations.
 type Client struct {
+	createAttempts sync.Map // Native ID -> operation held until the service Adopt boundary.
+	recovery       runtimeio.RecoveryQueue
 	cli            *moby.Client
 	repo           *database.Repository
 	lifecycleMu    sync.Mutex        // serializes native lifecycle mutations and expiration

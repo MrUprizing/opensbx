@@ -10,6 +10,8 @@ import (
 type Engine interface {
 	Ping(context.Context) error
 	Create(context.Context, CreateSandboxRequest) (CreateSandboxResponse, error)
+	// DiscardCreated owns native compensation and transactional metadata cleanup.
+	// Failed compensation must retain its durable operation for startup recovery.
 	DiscardCreated(context.Context, string) error
 	List(context.Context) ([]SandboxSummary, error)
 	Inspect(context.Context, string) (SandboxDetail, error)

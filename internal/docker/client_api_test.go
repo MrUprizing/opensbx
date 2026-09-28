@@ -26,9 +26,10 @@ import (
 )
 
 type dockerAPIFixture struct {
-	mu   sync.Mutex
-	t    *testing.T
-	fail map[string]int
+	mu                sync.Mutex
+	t                 *testing.T
+	fail              map[string]int
+	failAfterMutation map[string]int
 	// Sequential responses allow a preflight inspect to succeed and the
 	// post-mutation inspect to fail without changing state from a test goroutine.
 	responses         map[string][]int
@@ -37,6 +38,8 @@ type dockerAPIFixture struct {
 	createBody        container.Config
 	createHost        container.HostConfig
 	containerID       string
+	containerLabels   map[string]string
+	containerHostPort string
 	running           bool
 	paused            bool
 	stdin             []byte
@@ -45,6 +48,8 @@ type dockerAPIFixture struct {
 	pullBody          string
 	attachBody        string
 	stopDone          chan struct{}
+	blockStopRequests bool
+	stopEntered       chan struct{}
 	cacheDigest       string
 	cacheTag          string
 	cacheNativeID     string
@@ -57,6 +62,8 @@ type dockerAPIFixture struct {
 	cacheSaveEntered  chan struct{}
 	cacheSaveRelease  chan struct{}
 	execStartup       *execStartupFixture
+	execCreateEntered chan struct{}
+	releaseExecCreate chan struct{}
 }
 
 type execStartupFixture struct {
@@ -263,6 +270,7 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		f.mu.Lock()
 		f.createBody, f.createHost = payload.Config, payload.HostConfig
+		f.containerLabels = payload.Config.Labels
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprintf(w, `{"Id":%q,"Warnings":[]}`, f.containerID)
@@ -270,13 +278,19 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`[{"Id":"container-1","Names":["/demo"],"Image":"alpine:latest","State":"running","Status":"Up","Ports":[{"PrivatePort":3000,"PublicPort":32768,"Type":"tcp"}]}]`))
 	case r.Method == http.MethodGet && path == "/containers/container-1/json":
 		f.mu.Lock()
-		running, paused := f.running, f.paused
+		running, paused, labels, hostPort := f.running, f.paused, f.containerLabels, f.containerHostPort
 		f.mu.Unlock()
+		if hostPort == "" {
+			hostPort = "32768"
+		}
+		labelsJSON, _ := json.Marshal(labels)
 		status := "exited"
 		if running {
 			status = "running"
 		}
-		_, _ = fmt.Fprintf(w, `{"Id":"container-1","Name":"/demo","Config":{"Image":"alpine:latest"},"State":{"Status":%q,"Running":%t,"Paused":%t,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"32768"}]}}}`, status, running, paused)
+		_, _ = fmt.Fprintf(w, `{"Id":"container-1","Name":"/demo","Config":{"Image":"alpine:latest","Labels":%s},"State":{"Status":%q,"Running":%t,"Paused":%t,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":%q}]}}}`, labelsJSON, status, running, paused, hostPort)
+	case r.Method == http.MethodGet && path == "/containers/container-2/json":
+		_, _ = w.Write([]byte(`{"Id":"container-2","Name":"/demo-two","Config":{"Image":"alpine:latest","Labels":{}},"State":{"Status":"running","Running":true,"Paused":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{}}}`))
 	case r.Method == http.MethodGet && path == "/containers/container-1/archive":
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"message":"not found"}`))
@@ -287,6 +301,10 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(body))
 	case r.Method == http.MethodPost && path == "/containers/container-1/exec":
+		if f.execCreateEntered != nil {
+			close(f.execCreateEntered)
+			<-f.releaseExecCreate
+		}
 		body, _ := io.ReadAll(r.Body)
 		var options struct {
 			AttachStdin bool     `json:"AttachStdin"`
@@ -325,12 +343,58 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && path == "/containers/container-1/start":
 		f.mu.Lock()
 		f.running = true
+		failure := f.failAfterMutation[key]
 		f.mu.Unlock()
+		if failure != 0 {
+			writeDockerFixtureFailure(w, failure)
+			break
+		}
 		w.WriteHeader(http.StatusNoContent)
-	case r.Method == http.MethodPost && (path == "/containers/container-1/stop" || path == "/containers/container-1/restart"):
+	case r.Method == http.MethodPost && path == "/containers/container-1/stop" && f.blockStopRequests:
 		f.mu.Lock()
-		f.running = path == "/containers/container-1/restart"
+		entered := f.stopEntered
 		f.mu.Unlock()
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+		}
+		<-r.Context().Done()
+	case r.Method == http.MethodPost && path == "/containers/container-2/stop":
+		if f.blockStopRequests {
+			f.mu.Lock()
+			entered := f.stopEntered
+			f.mu.Unlock()
+			if entered != nil {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+			}
+			<-r.Context().Done()
+			break
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && path == "/containers/container-1/restart":
+		f.mu.Lock()
+		f.running = true
+		failure := f.failAfterMutation[key]
+		f.mu.Unlock()
+		if failure != 0 {
+			writeDockerFixtureFailure(w, failure)
+			break
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && path == "/containers/container-1/stop":
+		f.mu.Lock()
+		f.running = false
+		failure := f.failAfterMutation[key]
+		f.mu.Unlock()
+		if failure != 0 {
+			writeDockerFixtureFailure(w, failure)
+			break
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodPost && path == "/containers/container-1/pause":
 		f.mu.Lock()
@@ -350,6 +414,12 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"message":"unknown fixture route"}`))
 	}
+}
+
+func writeDockerFixtureFailure(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(`{"message":"fixture post-mutation error"}`))
 }
 
 func (f *dockerAPIFixture) serveExecAttach(w http.ResponseWriter, r *http.Request) {
@@ -665,6 +735,10 @@ func TestDockerClientCreateInspectListAndLifecycle(t *testing.T) {
 	if created.ID != "container-1" || created.Name == "" || len(created.Ports) != 1 || created.Ports[0] != "3000/tcp" {
 		t.Fatalf("Create() response = %+v", created)
 	}
+	createdRow, err := dc.repo.FindByID(created.ID)
+	if err != nil || createdRow == nil || createdRow.ExpiresAt == nil {
+		t.Fatalf("Create() did not persist its absolute expiration: row=%+v err=%v", createdRow, err)
+	}
 	fixture.mu.Lock()
 	if fixture.createBody.Image != "alpine:latest" || fixture.createBody.Env[0] != "MODE=test" {
 		t.Errorf("container config did not retain requested image/env: %+v", fixture.createBody)
@@ -693,12 +767,24 @@ func TestDockerClientCreateInspectListAndLifecycle(t *testing.T) {
 	if err != nil || started.Status != "started" || len(started.Ports) != 1 || started.ExpiresAt == nil {
 		t.Fatalf("Start() = %+v, %v", started, err)
 	}
+	startedRow, err := dc.repo.FindByID(created.ID)
+	if err != nil || startedRow == nil || startedRow.ExpiresAt == nil || !startedRow.ExpiresAt.Equal(*started.ExpiresAt) {
+		t.Fatalf("Start() response/persisted deadline mismatch: response=%v row=%+v err=%v", started.ExpiresAt, startedRow, err)
+	}
 	if err := dc.Stop(ctx, created.ID); err != nil {
 		t.Fatalf("Stop() error: %v", err)
+	}
+	stoppedRow, err := dc.repo.FindByID(created.ID)
+	if err != nil || stoppedRow == nil || stoppedRow.ExpiresAt != nil {
+		t.Fatalf("Stop() did not clear durable deadline: row=%+v err=%v", stoppedRow, err)
 	}
 	restarted, err := dc.Restart(ctx, created.ID)
 	if err != nil || restarted.Status != "restarted" || restarted.ExpiresAt == nil {
 		t.Fatalf("Restart() = %+v, %v", restarted, err)
+	}
+	restartedRow, err := dc.repo.FindByID(created.ID)
+	if err != nil || restartedRow == nil || restartedRow.ExpiresAt == nil || !restartedRow.ExpiresAt.Equal(*restarted.ExpiresAt) {
+		t.Fatalf("Restart() response/persisted deadline mismatch: response=%v row=%+v err=%v", restarted.ExpiresAt, restartedRow, err)
 	}
 	if err := dc.Pause(ctx, created.ID); err != nil {
 		t.Fatalf("Pause() error: %v", err)
@@ -708,6 +794,11 @@ func TestDockerClientCreateInspectListAndLifecycle(t *testing.T) {
 	}
 	if err := dc.RenewExpiration(ctx, created.ID, 120); err != nil {
 		t.Fatalf("RenewExpiration() error: %v", err)
+	}
+	renewedRow, err := dc.repo.FindByID(created.ID)
+	renewedTimer := dc.getTimerEntry(created.ID)
+	if err != nil || renewedRow == nil || renewedRow.ExpiresAt == nil || renewedTimer == nil || !renewedRow.ExpiresAt.Equal(renewedTimer.expiresAt) {
+		t.Fatalf("RenewExpiration() deadline not durable and synchronized: row=%+v timer=%v err=%v", renewedRow, entryDeadline(renewedTimer), err)
 	}
 	if err := dc.Remove(ctx, created.ID); err != nil {
 		t.Fatalf("Remove() error: %v", err)
@@ -857,12 +948,10 @@ func TestDockerClientExecWaitLogsAndFileOperations(t *testing.T) {
 func TestDockerClientCommandStateErrorsAndContextCancellation(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
 	ctx := context.Background()
+	seedDockerLifecycleOwner(t, dc, "container-1")
 	fixture.running = false
 	if _, err := dc.ExecCommand(ctx, "container-1", runtimeio.ExecCommandRequest{Command: "echo"}); err != ErrNotRunning {
 		t.Fatalf("ExecCommand() stopped sandbox error = %v", err)
-	}
-	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
-		t.Fatal(err)
 	}
 	if err := dc.repo.SaveCommand(database.Command{ID: "cmd-1", SandboxID: "container-1", Name: "sleep"}); err != nil {
 		t.Fatal(err)
@@ -945,7 +1034,7 @@ func TestDockerClientPingCacheInvalidationAndStateConflicts(t *testing.T) {
 	if len(invalidated) != 0 {
 		t.Fatalf("invalidateCache() notified for an unknown id: %v", invalidated)
 	}
-	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
+	if err := dc.repo.Save(database.Sandbox{ID: "container-1", NativeID: "container-1", RuntimeKind: "docker", Name: "demo"}); err != nil {
 		t.Fatal(err)
 	}
 	dc.invalidateCache("container-1")
@@ -1059,6 +1148,7 @@ func TestDockerClientRemoveAndImageInspectionErrorBranches(t *testing.T) {
 func TestDockerClientStatsAndExecErrorBranches(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
 	ctx := context.Background()
+	seedDockerLifecycleOwner(t, dc, "container-1")
 	fixture.mu.Lock()
 	fixture.statsBody = "not-json"
 	fixture.mu.Unlock()
@@ -1823,6 +1913,7 @@ func inspectFakePayload(t *testing.T, dc *Client) moby.ExecInspectResult {
 
 func TestDockerClientTimerExpiryStopsContainer(t *testing.T) {
 	dc, fixture := newDockerFixture(t)
+	seedDockerLifecycleOwner(t, dc, "container-1")
 	dc.scheduleStop("container-1", -1)
 	select {
 	case <-fixture.stopDone:

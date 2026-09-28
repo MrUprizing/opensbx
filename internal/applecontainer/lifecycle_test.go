@@ -206,4 +206,8 @@ func TestListNetworkAndRenewExpirationReflectOwnedState(t *testing.T) {
 	if entry == nil {
 		t.Fatal("renewal did not schedule expiration")
 	}
+	row, err := repo.FindByID(id)
+	if err != nil || row == nil || row.ExpiresAt == nil || !row.ExpiresAt.Equal(entry.at) {
+		t.Fatalf("renewal deadline not persisted exactly: row=%+v timer=%v err=%v", row, entry.at, err)
+	}
 }

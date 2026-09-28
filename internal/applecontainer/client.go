@@ -30,15 +30,17 @@ type expiration struct {
 }
 
 type Client struct {
-	runner     Runner
-	repo       *database.Repository
-	now        func() time.Time
-	mu         sync.Mutex // Serializes lifecycle mutations, port allocation and TTL callbacks.
-	timers     map[string]*expiration
-	finished   map[string]string
-	commands   map[string]*runningCommand
-	closing    bool
-	invalidate func(string)
+	createAttempts sync.Map
+	recovery       runtimeio.RecoveryQueue
+	runner         Runner
+	repo           *database.Repository
+	now            func() time.Time
+	mu             sync.Mutex // Serializes lifecycle mutations, port allocation and TTL callbacks.
+	timers         map[string]*expiration
+	finished       map[string]string
+	commands       map[string]*runningCommand
+	closing        bool
+	invalidate     func(string)
 }
 
 // New accepts an injectable runner and clock. Call Ping before opening listeners.
@@ -113,6 +115,9 @@ func (c *Client) owned(id string) (*database.Sandbox, error) {
 		return nil, err
 	}
 	if sb == nil {
+		return nil, sandbox.ErrNotFound
+	}
+	if sb.RuntimeKind != "" && sb.RuntimeKind != "container" {
 		return nil, sandbox.ErrNotFound
 	}
 	return sb, nil
@@ -445,6 +450,21 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		// Pin the already-local reference; do not pass unvalidated user flags.
 		args = append(args, image.Configuration.Name, "-c", "exec sleep infinity")
 		release()
+		timeout := req.Timeout
+		if timeout <= 0 {
+			timeout = defaultTimeout
+		}
+		deadline := c.now().Add(time.Duration(timeout) * time.Second)
+		op := database.Operation{ID: "container:" + id, RuntimeKind: "container", PublicID: sandbox.CreationID(ctx, id), NativeID: id, NativeName: id, Token: id, Kind: "create", Deadline: &deadline}
+		if err := c.repo.BeginCreate(op); err != nil {
+			return result, err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				c.retryOperation(op)
+			}
+		}()
 		_, createErr := c.run(ctx, nil, args...)
 		if createErr == nil {
 			_, createErr = c.run(ctx, nil, "start", id)
@@ -452,13 +472,16 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		if createErr != nil {
 			// Preserve a recovery record if rollback cannot complete. Only this
 			// random, app-labelled resource can be touched by cleanup.
-			row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped)}
+			row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped), RuntimeKind: "container", AttemptToken: id, ExpiresAt: &deadline}
 			if len(ports) > 0 {
 				row.Port = ports[0]
 			}
 			if err := c.rollback(id); err != nil {
 				saveErr := c.repo.CreateOwnership(row)
 				return result, errors.Join(createErr, err, saveErr)
+			}
+			if err := c.repo.DeleteOperation(op); err != nil {
+				return result, errors.Join(createErr, err)
 			}
 			lastErr = createErr
 			if ctx.Err() != nil {
@@ -469,14 +492,14 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 			}
 			continue
 		}
-		row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped)}
+		row := database.Sandbox{ID: sandbox.CreationID(ctx, id), NativeID: id, Name: sandbox.CreationID(ctx, id), Image: sandbox.CreationImage(ctx, req.Image), Ports: database.JSONMap(mapped), RuntimeKind: "container", AttemptToken: id, ExpiresAt: &deadline}
 		if len(ports) > 0 {
 			row.Port = ports[0]
 		}
-		if err := c.repo.CreateOwnership(row); err != nil {
+		if err := c.repo.CommitCreation(op, row, runtimeio.AwaitAdoption(ctx)); err != nil {
 			rollbackErr := c.rollback(id)
 			if rollbackErr == nil {
-				return result, err
+				return result, errors.Join(err, c.repo.DeleteOperation(op))
 			}
 			// No Provisioned handle reaches the service on this path. Retain this
 			// exact creation's identity without overwriting a colliding owner row.
@@ -489,7 +512,11 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 			row.RecoveryError = cause.Error()
 			return result, errors.Join(cause, c.repo.CreateOwnership(row))
 		}
-		c.scheduleLocked(id, req.Timeout)
+		if runtimeio.AwaitAdoption(ctx) {
+			c.createAttempts.Store(id, op)
+		}
+		committed = true
+		c.scheduleDeadline(id, deadline, deadline.Sub(c.now()))
 		return runtimeio.CreateSandboxResponse{ID: id, Name: id, Ports: ports}, nil
 	}
 	return result, fmt.Errorf("Apple container create/start failed after 3 attempts: %w", lastErr)
@@ -520,27 +547,64 @@ func (c *Client) rollback(id string) error {
 }
 
 func (c *Client) scheduleLocked(id string, timeout int) {
-	if e := c.timers[id]; e != nil {
-		e.timer.Stop()
-	}
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	e := &expiration{at: c.now().Add(time.Duration(timeout) * time.Second)}
-	e.timer = time.AfterFunc(time.Duration(timeout)*time.Second, func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.timers[id] != e || c.closing {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
-			log.Printf("Apple sandbox TTL stop failed for %s: %v", id, err)
-			c.scheduleLocked(id, 30)
-		}
+	deadline := c.now().Add(time.Duration(timeout) * time.Second)
+	c.scheduleDeadline(id, deadline, deadline.Sub(c.now()))
+}
+
+func (c *Client) scheduleDeadline(id string, deadline time.Time, delay time.Duration) {
+	if e := c.timers[id]; e != nil {
+		e.timer.Stop()
+	}
+	e := &expiration{at: deadline}
+	e.timer = time.AfterFunc(delay, func() {
+		key := fmt.Sprintf("ttl:%s:%p", id, e)
+		c.recovery.Schedule(key, func(ctx context.Context) error {
+			if err := c.lockRecovery(ctx); err != nil {
+				return err
+			}
+			defer c.mu.Unlock()
+			c.expireLocked(ctx, id, e)
+			return nil
+		})
+		_ = c.recovery.Run(context.Background(), key)
 	})
 	c.timers[id] = e
+}
+
+func (c *Client) expireLocked(ctx context.Context, id string, e *expiration) {
+	deadline := e.at
+	if c.timers[id] != e || c.closing {
+		return
+	}
+	if err := c.reconcileResource(ctx, id); err != nil {
+		log.Printf("Apple sandbox TTL recovery failed for %s: %v", id, err)
+		c.scheduleDeadline(id, deadline, 30*time.Second)
+		return
+	}
+	if c.timers[id] == nil {
+		return
+	} // Reconciliation already stopped or removed it.
+	row, err := c.repo.FindByID(id)
+	if err != nil {
+		log.Printf("Apple TTL ownership lookup %s: %v", id, err)
+		c.scheduleDeadline(id, deadline, 30*time.Second)
+		return
+	}
+	if row == nil {
+		c.clearTimer(id)
+		return
+	}
+	if row.ExpiresAt != nil && row.ExpiresAt.After(deadline) && row.ExpiresAt.After(c.now()) {
+		c.scheduleDeadline(id, *row.ExpiresAt, row.ExpiresAt.Sub(c.now()))
+		return
+	}
+	if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
+		log.Printf("Apple sandbox TTL stop failed for %s: %v", id, err)
+		c.scheduleDeadline(id, deadline, 30*time.Second)
+	}
 }
 func (c *Client) clearTimer(id string) {
 	if e := c.timers[id]; e != nil {
@@ -549,16 +613,38 @@ func (c *Client) clearTimer(id string) {
 	}
 }
 func (c *Client) stopLocked(ctx context.Context, id string) error {
-	info, err := c.lookup(ctx, id)
+	if _, err := c.owned(id); err != nil {
+		return err
+	}
+	op, err := c.repo.BeginOperation("container", id, "stop", nil)
 	if err != nil {
 		return err
 	}
+	defer c.retryOperation(*op)
+	info, err := c.lookup(ctx, id)
+	if err != nil {
+		if errors.Is(err, sandbox.ErrNotFound) {
+			if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
+				return err
+			}
+			c.clearTimer(id)
+			c.changed(id)
+			return sandbox.ErrNotFound
+		}
+		return err
+	}
 	if info.Status.State == "stopped" {
+		if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
+			return err
+		}
 		c.clearTimer(id)
 		c.changed(id)
 		return sandbox.ErrAlreadyStopped
 	}
 	if _, err := c.run(ctx, nil, "stop", id); err != nil {
+		return err
+	}
+	if err := c.repo.CompleteOperation(*op, nil, nil); err != nil {
 		return err
 	}
 	c.clearTimer(id)
@@ -582,21 +668,34 @@ func (c *Client) startLocked(ctx context.Context, id string) (runtimeio.RestartR
 	if info.Status.State == "running" {
 		return runtimeio.RestartResponse{}, sandbox.ErrAlreadyRunning
 	}
-	ports, err := networkPorts(info)
+	deadline := c.now().Add(defaultTimeout * time.Second)
+	op, err := c.repo.BeginOperation("container", id, "start", &deadline)
 	if err != nil {
 		return runtimeio.RestartResponse{}, err
 	}
+	defer c.retryOperation(*op)
+	return c.finishStart(ctx, id, *op)
+}
+
+func (c *Client) finishStart(ctx context.Context, id string, op database.Operation) (runtimeio.RestartResponse, error) {
 	if _, err := c.run(ctx, nil, "start", id); err != nil {
 		return runtimeio.RestartResponse{}, err
 	}
 	delete(c.finished, id)
-	c.scheduleLocked(id, defaultTimeout)
+	c.scheduleDeadline(id, *op.Deadline, op.Deadline.Sub(c.now()))
 	c.changed(id)
-	if err := c.repo.UpdatePorts(id, database.JSONMap(ports)); err != nil {
+	info, err := c.lookup(ctx, id)
+	if err != nil {
 		return runtimeio.RestartResponse{}, err
 	}
-	d, err := c.detailLocked(ctx, id)
-	return runtimeio.RestartResponse{Status: "started", Ports: d.Ports, ExpiresAt: d.ExpiresAt}, err
+	ports, err := networkPorts(info)
+	if err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	if err := c.repo.CompleteOperation(op, database.JSONMap(ports), op.Deadline); err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	return runtimeio.RestartResponse{Status: "started", Ports: keys(ports), ExpiresAt: op.Deadline}, nil
 }
 func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	c.mu.Lock()
@@ -606,11 +705,27 @@ func (c *Client) Start(ctx context.Context, id string) (runtimeio.RestartRespons
 func (c *Client) Restart(ctx context.Context, id string) (runtimeio.RestartResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.stopLocked(ctx, id); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) {
+	if c.closing {
+		return runtimeio.RestartResponse{}, errors.New("backend is shutting down")
+	}
+	info, err := c.lookup(ctx, id)
+	if err != nil {
 		return runtimeio.RestartResponse{}, err
 	}
+	deadline := c.now().Add(defaultTimeout * time.Second)
+	op, err := c.repo.BeginOperation("container", id, "restart", &deadline)
+	if err != nil {
+		return runtimeio.RestartResponse{}, err
+	}
+	defer c.retryOperation(*op)
+	if info.Status.State != "stopped" {
+		if _, err := c.run(ctx, nil, "stop", id); err != nil {
+			return runtimeio.RestartResponse{}, err
+		}
+	}
+	c.changed(id)
 	// Never recreate an existing sandbox to repair a port collision.
-	result, err := c.startLocked(ctx, id)
+	result, err := c.finishStart(ctx, id, *op)
 	if err == nil {
 		result.Status = "restarted"
 	}
@@ -639,24 +754,15 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 	if _, err := c.owned(id); err != nil {
 		return err
 	}
-	_, err := c.lookup(ctx, id)
-	if err != nil && !errors.Is(err, sandbox.ErrNotFound) {
+	op, err := c.repo.BeginOperation("container", id, "delete", nil)
+	if err != nil {
 		return err
 	}
-	if err == nil {
-		if _, err = c.run(ctx, nil, "delete", "--force", id); err != nil {
-			return err
-		}
-	}
-	c.clearTimer(id)
-	c.changed(id)
-	if err := c.repo.DeleteCommandsBySandbox(id); err != nil {
-		return err
-	}
-	if err := c.repo.Delete(id); err != nil {
-		return err
-	}
-	delete(c.finished, id)
+	defer c.retryOperation(*op)
+	return c.reconcile(ctx, *op)
+}
+
+func (c *Client) clearCommands(id string) {
 	for cmdID, cmd := range c.commands {
 		if cmd.sandboxID == id {
 			// Guest deletion was confirmed above; release any CLI still waiting
@@ -669,7 +775,6 @@ func (c *Client) Remove(ctx context.Context, id string) error {
 			delete(c.commands, cmdID)
 		}
 	}
-	return nil
 }
 func (c *Client) Pause(ctx context.Context, id string) error {
 	if _, err := c.owned(id); err != nil {
@@ -695,10 +800,15 @@ func (c *Client) RenewExpiration(ctx context.Context, id string, timeout int) er
 	if _, err := c.lookup(ctx, id); err != nil {
 		return err
 	}
-	c.scheduleLocked(id, timeout)
+	deadline := c.now().Add(time.Duration(timeout) * time.Second)
+	if err := c.repo.SetDeadline(id, "container", &deadline); err != nil {
+		return err
+	}
+	c.scheduleDeadline(id, deadline, deadline.Sub(c.now()))
 	return nil
 }
 func (c *Client) Shutdown(ctx context.Context) {
+	c.recovery.Stop()
 	// A long-running API mutation must not make shutdown exceed its budget
 	// merely waiting to acquire the lifecycle lock.
 	for !c.mu.TryLock() {
@@ -720,8 +830,15 @@ func (c *Client) Shutdown(ctx context.Context) {
 		return
 	}
 	for _, row := range rows {
+		if row.RuntimeKind != "" && row.RuntimeKind != "container" {
+			continue
+		}
 		if ctx.Err() != nil {
 			break
+		}
+		if err := c.reconcileResource(ctx, row.ID); err != nil {
+			log.Printf("Apple shutdown recovery %s: %v", row.ID, err)
+			continue
 		}
 		if err := c.stopLocked(ctx, row.ID); err != nil && !errors.Is(err, sandbox.ErrAlreadyStopped) && !errors.Is(err, sandbox.ErrNotFound) {
 			log.Printf("Apple shutdown %s: %v", row.ID, err)

@@ -51,6 +51,7 @@ func (c *cacheFake) Materialize(_ context.Context, image sandbox.Image) (string,
 
 type runtimeCall struct{ op, id string }
 type runtimeEngineFake struct {
+	mu              sync.Mutex
 	repo            *database.Repository
 	calls           []runtimeCall
 	nativeID        string
@@ -60,6 +61,7 @@ type runtimeEngineFake struct {
 	running         *bool
 	networkValue    *runtimeio.SandboxNetwork
 	routeValue      *runtimeio.RoutingState
+	routeValues     map[string]runtimeio.RoutingState
 	routingErr      error
 	routingBlock    <-chan struct{}
 	routingEntered  chan struct{}
@@ -74,7 +76,11 @@ type runtimeEngineFake struct {
 	createErr       error
 }
 
-func (r *runtimeEngineFake) record(op, id string)       { r.calls = append(r.calls, runtimeCall{op, id}) }
+func (r *runtimeEngineFake) record(op, id string) {
+	r.mu.Lock()
+	r.calls = append(r.calls, runtimeCall{op, id})
+	r.mu.Unlock()
+}
 func (r *runtimeEngineFake) Ping(context.Context) error { r.record("ping", ""); return nil }
 func (r *runtimeEngineFake) Create(ctx context.Context, req runtimeio.CreateSandboxRequest) (runtimeio.CreateSandboxResponse, error) {
 	publicID := sandbox.CreationID(ctx, r.nativeID)
@@ -104,7 +110,10 @@ func (r *runtimeEngineFake) Create(ctx context.Context, req runtimeio.CreateSand
 func (r *runtimeEngineFake) DiscardCreated(_ context.Context, id string) error {
 	r.record("discard-created", id)
 	r.removedIDs = append(r.removedIDs, id)
-	return r.removeErr
+	if r.removeErr != nil {
+		return r.removeErr
+	}
+	return r.repo.NativeView().DeleteSandbox(id)
 }
 func (r *runtimeEngineFake) List(context.Context) ([]runtimeio.SandboxSummary, error) {
 	r.record("list", "")
@@ -163,6 +172,9 @@ func (r *runtimeEngineFake) Routing(_ context.Context, id string) (runtimeio.Rou
 	}
 	if r.routeValue != nil {
 		return *r.routeValue, nil
+	}
+	if route, ok := r.routeValues[id]; ok {
+		return route, nil
 	}
 	running := true
 	if r.running != nil {
@@ -698,7 +710,7 @@ func TestCreateCompensatesWhenRuntimeReturnsWithoutOwnershipRow(t *testing.T) {
 	}
 }
 
-func TestCreateCompensatesWhenPersistedNativeIdentityDoesNotMatchRuntimeResult(t *testing.T) {
+func TestCreateDoesNotDeleteUnrelatedOwnershipWhenPersistedNativeIdentityDoesNotMatch(t *testing.T) {
 	app, runtime, _, repo, _, _, _ := openPreparedService(t, sandbox.Capabilities{Runtime: "fake", Version: "1"})
 	runtime.savedNativeID = "native-wrong-resource"
 	_, err := app.Create(context.Background(), createOptions("example.test/team/app:stable"))
@@ -708,8 +720,8 @@ func TestCreateCompensatesWhenPersistedNativeIdentityDoesNotMatchRuntimeResult(t
 	if len(runtime.removedIDs) != 1 || runtime.removedIDs[0] != runtime.nativeID {
 		t.Fatalf("identity mismatch cleanup targeted wrong native resource: removed=%v want=%s", runtime.removedIDs, runtime.nativeID)
 	}
-	if row, err := repo.FindByID(runtime.createdPublicID); err != nil || row != nil {
-		t.Fatalf("identity-mismatch row survived successful compensation: row=%+v err=%v", row, err)
+	if row, err := repo.FindByID(runtime.createdPublicID); err != nil || row == nil || row.NativeID != "native-wrong-resource" {
+		t.Fatalf("identity-mismatch cleanup changed unrelated ownership: row=%+v err=%v", row, err)
 	}
 }
 
@@ -737,11 +749,21 @@ func TestCreateCompensatesAfterProvenancePersistenceFailure(t *testing.T) {
 }
 
 func TestCreatePersistsRecoveryOwnershipWhenCompensationFails(t *testing.T) {
-	app, runtime, cache, repo, store, platform, _ := openPreparedService(t, sandbox.Capabilities{Runtime: "fake", Version: "1"})
-	runtime.skipCreateRow = true
+	app, runtime, cache, repo, store, platform, dbPath := openPreparedService(t, sandbox.Capabilities{Runtime: "fake", Version: "1"})
 	runtime.removeErr = errors.New("native delete failed")
-	_, err := app.Create(context.Background(), createOptions("example.test/team/app:stable"))
-	if err == nil || !strings.Contains(err.Error(), "native delete failed") {
+	adminDB := database.New(dbPath)
+	adminSQL, err := adminDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminSQL.Close() })
+	if err := adminDB.Exec(`CREATE TRIGGER reject_adoption_once BEFORE UPDATE ON sandboxes
+		WHEN NEW.recovery_error = ''
+		BEGIN SELECT RAISE(FAIL, 'injected adoption persistence failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err = app.Create(context.Background(), createOptions("example.test/team/app:stable"))
+	if err == nil || !strings.Contains(err.Error(), "native delete failed") || !strings.Contains(err.Error(), "injected adoption persistence failure") {
 		t.Fatalf("combined create/compensation failure=%v", err)
 	}
 	if len(runtime.removedIDs) != 1 || runtime.removedIDs[0] != runtime.nativeID {
@@ -755,7 +777,7 @@ func TestCreatePersistsRecoveryOwnershipWhenCompensationFails(t *testing.T) {
 	if resolveErr != nil {
 		t.Fatal(resolveErr)
 	}
-	if row.NativeID != runtime.nativeID || row.ImageRoot != artifact.Root.Digest.String() || row.ImageManifest != artifact.Manifest.Digest.String() || row.NativeImage != "native-cache:"+artifact.Manifest.Digest.String() || row.CacheVersion != cache.caps.Runtime+":"+cache.caps.Version {
+	if row.NativeID != runtime.nativeID || row.ImageRoot != artifact.Root.Digest.String() || row.ImageManifest != artifact.Manifest.Digest.String() || row.NativeImage != "native-cache:"+artifact.Manifest.Digest.String() || row.CacheVersion != cache.caps.Runtime+":"+cache.caps.Version || row.RecoveryError == "" {
 		t.Fatalf("recovery row lost native ownership/provenance: %+v", row)
 	}
 }

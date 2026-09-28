@@ -36,6 +36,7 @@ func TestEndToEnd(t *testing.T) {
 		{"ConcurrentSandboxOperations", h.concurrentOperations},
 		{"MCPOverHTTP", h.mcpWorkflow},
 		{"AbruptProcessRecovery", h.abruptRecovery},
+		{"AbruptExpirationRecovery", h.abruptExpirationRecovery},
 		{"ShutdownAndPersistence", h.persistence},
 	} {
 		if !t.Run(scenario.name, scenario.run) {
@@ -109,9 +110,13 @@ func (h *harness) images(t *testing.T) {
 }
 
 func (h *harness) create(t *testing.T, ports []string) models.CreateSandboxResponse {
+	return h.createWithTimeout(t, ports, 300)
+}
+
+func (h *harness) createWithTimeout(t *testing.T, ports []string, timeout int) models.CreateSandboxResponse {
 	t.Helper()
 	var created models.CreateSandboxResponse
-	h.api(t, "POST", "/v1/sandboxes", models.CreateSandboxRequest{Image: importedImage, Ports: ports, Timeout: 300}, 201, &created)
+	h.api(t, "POST", "/v1/sandboxes", models.CreateSandboxRequest{Image: importedImage, Ports: ports, Timeout: timeout}, 201, &created)
 	require.NoError(t, h.captureOwnership())
 	require.Contains(t, h.owned, created.ID)
 	require.NotEqual(t, created.ID, h.owned[created.ID])
@@ -264,8 +269,9 @@ func (h *harness) expiration(t *testing.T) {
 		require.True(t, detail.Running, "sandbox stopped before renewed expiration")
 		return time.Now().After(old.Add(300 * time.Millisecond)), "waiting for original expiration"
 	})
-	eventually(t, 20*time.Second, "renewed expiration must stop the real sandbox", func() (bool, string) {
-		return !h.inspect(t, sb.ID).Running, "sandbox still running"
+	eventually(t, 55*time.Second, "renewed expiration must stop the sandbox and complete its durable stop intent", func() (bool, string) {
+		detail := h.inspect(t, sb.ID)
+		return !detail.Running && detail.ExpiresAt == nil, fmt.Sprintf("sandbox still running=%t or deadline/pending stop remains=%v", detail.Running, detail.ExpiresAt)
 	})
 	states, err := h.inventory()
 	require.NoError(t, err)
@@ -375,6 +381,36 @@ func (h *harness) abruptRecovery(t *testing.T) {
 	require.Contains(t, string(h.api(t, "GET", "/v1/sandboxes/"+sb.ID+"/cmd", nil, 200, nil)), command.Name)
 	h.api(t, "POST", "/v1/sandboxes/"+sb.ID+"/stop", nil, 200, nil)
 	require.False(t, h.inspect(t, sb.ID).Running)
+	h.remove(t, sb.ID)
+}
+
+func (h *harness) abruptExpirationRecovery(t *testing.T) {
+	const timeout = 15
+	sb := h.createWithTimeout(t, nil, timeout)
+	deadline := h.inspect(t, sb.ID).ExpiresAt
+	require.NotNil(t, deadline)
+	require.True(t, deadline.After(time.Now().Add(2*time.Second)), "test-owned TTL must remain in the future through setup")
+	states, err := h.inventory()
+	require.NoError(t, err)
+	require.Equal(t, "running", states[h.owned[sb.ID]], "resource must be running before SIGKILL")
+	require.NoError(t, h.crash(), "kill only the isolated OpenSBX process")
+	if wait := time.Until(*deadline) + 300*time.Millisecond; wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		<-timer.C
+	}
+
+	// The fresh process has a bounded warm-up and can serve while transient native
+	// stop work remains queued. Observe same-process recovery until it clears the
+	// durable deadline and stops this exact owned resource.
+	h.start(t)
+	eventually(t, 45*time.Second, "same-process recovery must stop the overdue sandbox after startup", func() (bool, string) {
+		detail := h.inspect(t, sb.ID)
+		return !detail.Running && detail.ExpiresAt == nil, fmt.Sprintf("running=%t expires_at=%v", detail.Running, detail.ExpiresAt)
+	})
+	states, err = h.inventory()
+	require.NoError(t, err)
+	require.Contains(t, []string{"stopped", "exited"}, states[h.owned[sb.ID]])
 	h.remove(t, sb.ID)
 }
 

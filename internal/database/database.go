@@ -18,7 +18,7 @@ func New(path string) *gorm.DB {
 		log.Fatalf("database: failed to open %s: %v", path, err)
 	}
 
-	if err := db.AutoMigrate(&Sandbox{}, &Command{}); err != nil {
+	if err := db.AutoMigrate(&Sandbox{}, &Command{}, &Operation{}); err != nil {
 		log.Fatalf("database: migration failed: %v", err)
 	}
 

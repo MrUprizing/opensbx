@@ -104,6 +104,7 @@ func runServer(args []string) error {
 		runtimeio.NativeCache
 		SetCacheInvalidator(func(string))
 		Shutdown(context.Context)
+		Recover(context.Context) error
 	}
 	if choice == "container" {
 		client := applecontainer.New(repo, appleRunner, nil)
@@ -128,6 +129,15 @@ func runServer(args []string) error {
 	if err != nil {
 		return fmt.Errorf("application setup: %w", err)
 	}
+	proxyServer := proxy.New(repo)
+	proxyServer.SetResolver(app.Route)
+	dc.SetCacheInvalidator(proxyServer.InvalidateCache)
+	// Recovery is intentionally not a constructor side effect. Runtime validation,
+	// process/database locks and image-store initialization have all succeeded.
+	err = dc.Recover(ctx)
+	if err != nil {
+		return fmt.Errorf("sandbox recovery incomplete (durable intents retained; restore runtime/database access and restart): %w", err)
+	}
 	// Open one loopback listener only after runtime and store validation.
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
@@ -135,9 +145,6 @@ func runServer(args []string) error {
 	}
 	defer listener.Close()
 	app.SetAddress(listener.Addr())
-	proxyServer := proxy.New(repo)
-	proxyServer.SetResolver(app.Route)
-	dc.SetCacheInvalidator(proxyServer.InvalidateCache)
 	proxyHandler := proxyServer.Handler()
 
 	log.Printf("logs file: %s", cfg.LogFile)

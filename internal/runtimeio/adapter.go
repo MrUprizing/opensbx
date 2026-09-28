@@ -67,6 +67,7 @@ func (a *Adapter) Create(ctx context.Context, opts sandbox.RunOptions) (sandbox.
 		return nil, fmt.Errorf("image was not prepared by this adapter")
 	}
 	ctx = sandbox.WithCreationImage(sandbox.WithCreationID(ctx, opts.ID), image.identity.Root)
+	ctx = context.WithValue(ctx, adoptionKey{}, true)
 	result, err := a.engine.Create(ctx, CreateSandboxRequest{Image: image.ref, Ports: sandbox.PortStrings(opts.Ports), Timeout: int(opts.Timeout / time.Second), Resources: &ResourceLimits{Memory: opts.Resources.MemoryMB, CPUs: opts.Resources.CPUs}, Env: opts.Env})
 	if err != nil {
 		return nil, err

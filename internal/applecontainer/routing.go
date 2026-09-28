@@ -23,26 +23,14 @@ func (c *Client) Routing(ctx context.Context, id string) (runtimeio.RoutingState
 	return runtimeio.RoutingState{Running: info.Status.State == "running", Network: runtimeio.SandboxNetwork{MainPort: row.Port, PortsMap: ports}}, nil
 }
 func (c *Client) DiscardCreated(ctx context.Context, id string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// Compensation must work even if the ownership DB write/read failed. The
-	// creation lease supplies the exact newly generated ID; rollback verifies
-	// its live label before deleting anything. Database cleanup belongs to lease.
-	if err := c.rollback(id); err != nil {
-		return err
+	// A returned creation lease already has ownership and a durable intent.
+	// Use the same transactional cleanup as explicit removal; if the database
+	// is unavailable, retain that intent rather than losing recovery evidence.
+	err := c.Remove(ctx, id)
+	if err != nil {
+		c.CreationFailed(id)
+	} else {
+		c.createAttempts.Delete(id)
 	}
-	c.clearTimer(id)
-	c.changed(id)
-	delete(c.finished, id)
-	for cmdID, cmd := range c.commands {
-		if cmd.sandboxID == id {
-			select {
-			case <-cmd.done:
-			default:
-				_ = cmd.process.Kill()
-			}
-			delete(c.commands, cmdID)
-		}
-	}
-	return nil
+	return err
 }

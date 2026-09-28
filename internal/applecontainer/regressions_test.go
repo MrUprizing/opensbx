@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"gorm.io/gorm"
 	"opensbx/internal/database"
 	"opensbx/internal/runtimeio"
 )
@@ -329,6 +330,73 @@ func TestRemoveKillsAttachedCLIWaitAndDoesNotRunGuestCleanupAfterSandboxDeletion
 	row, err := repo.FindByID(sandbox)
 	if err != nil || row != nil {
 		t.Fatalf("sandbox row after Remove = %+v, %v", row, err)
+	}
+}
+
+func TestRemoveDoesNotLeaveCommandHistoryWhenSandboxDeletionFails(t *testing.T) {
+	const id = "opensbx-19191919191919191919191919191919"
+	r := &synchronizedRunner{t: t, run: func(_ context.Context, args []string, _ io.Reader, out, _ io.Writer) error {
+		switch {
+		case reflect.DeepEqual(args, []string{"list", "--all", "--format", "json"}):
+			_, _ = io.WriteString(out, listJSON(id, "running", "[]"))
+		case reflect.DeepEqual(args, []string{"delete", "--force", id}):
+		default:
+			return fmt.Errorf("unexpected removal argv %#v", args)
+		}
+		return nil
+	}}
+	db := database.New(t.TempDir() + "/sandbox.db")
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	repo := database.NewRepository(db)
+	c := New(repo, r, time.Now)
+	if err := repo.Save(database.Sandbox{ID: id, Name: id}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveCommand(database.Command{ID: "cmd-1", SandboxID: id, Name: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("injected sandbox deletion failure")
+	if err := db.Callback().Delete().Before("gorm:delete").Register("test:sandbox-delete-failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "sandboxes" {
+			tx.AddError(failure)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(context.Background(), id); !errors.Is(err, failure) {
+		t.Fatalf("Remove() error = %v; want sandbox deletion failure", err)
+	}
+	row, err := repo.FindByID(id)
+	if err != nil || row == nil {
+		t.Fatalf("sandbox ownership after failed metadata deletion = %+v, %v; want row retained", row, err)
+	}
+	commands, err := repo.FindCommandsBySandbox(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 || commands[0].ID != "cmd-1" {
+		t.Fatalf("command history after failed metadata deletion = %+v; want original command retained", commands)
+	}
+	ops, err := repo.Operations("container")
+	if err != nil || len(ops) != 1 || ops[0].Kind != "delete" {
+		t.Fatalf("delete intent after failed metadata transaction=%+v err=%v", ops, err)
+	}
+	if err := db.Callback().Delete().Remove("test:sandbox-delete-failure"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.recovery.Run(context.Background(), ops[0].ID); err != nil {
+		t.Fatalf("same-process retry worker = %v", err)
+	}
+	if row, err := repo.FindByID(id); err != nil || row != nil {
+		t.Fatalf("successful retry left ownership row=%+v err=%v", row, err)
+	}
+	ops, err = repo.Operations("container")
+	if err != nil || len(ops) != 0 {
+		t.Fatalf("successful retry retained delete intent=%+v err=%v", ops, err)
 	}
 }
 
