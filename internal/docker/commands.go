@@ -6,12 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"regexp"
+	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,18 +25,24 @@ import (
 
 // runningCommand tracks a command that is currently executing.
 type runningCommand struct {
-	execID    string             // Docker exec instance ID
-	sandboxID string             // parent sandbox container ID
-	cmd       []string           // original command (for pkill pattern)
-	cancel    context.CancelFunc // cancels the exec context
-	stdout    *ringBuffer        // captures stdout
-	stderr    *ringBuffer        // captures stderr
-	done      chan struct{}      // closed when command finishes
-	attached  chan struct{}      // closed when the original attach attempt returns
-	mu        sync.Mutex
-	startErr  error
-	exitCode  int
-	finished  bool
+	execID        string             // Docker exec instance ID
+	sandboxID     string             // parent sandbox container ID
+	cmd           []string           // original argv; never a signaling identity
+	cancel        context.CancelFunc // cancels the exec context
+	stdout        *ringBuffer        // captures stdout
+	stderr        *ringBuffer        // captures stderr
+	done          chan struct{}      // closed when command finishes
+	attached      chan struct{}      // closed when the original attach attempt returns
+	mu            sync.Mutex
+	startErr      error
+	exitCode      int
+	finished      bool
+	identityReady chan struct{}
+	identityOnce  sync.Once
+	guestPID      int
+	guestStart    uint64
+	identityErr   error
+	streamErr     error
 }
 
 func (c *Client) clearCommands(id string) {
@@ -60,7 +66,8 @@ func generateCmdID() string {
 }
 
 // ExecCommand creates and starts a command asynchronously inside a sandbox.
-// Returns the CommandDetail immediately (no exit_code yet).
+// Returns after a bounded identity probe and registration, without waiting for
+// guest completion (no exit_code yet).
 func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimeio.ExecCommandRequest) (runtimeio.CommandDetail, error) {
 	if err := c.lockLifecycle(ctx); err != nil {
 		return runtimeio.CommandDetail{}, err
@@ -86,8 +93,26 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 
 	// Build env slice.
 	var envSlice []string
-	for k, v := range req.Env {
-		envSlice = append(envSlice, k+"="+v)
+	envKeys := make([]string, 0, len(req.Env))
+	for key := range req.Env {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	for _, key := range envKeys {
+		envSlice = append(envSlice, key+"="+req.Env[key])
+	}
+	if info.Container.Config == nil {
+		return runtimeio.CommandDetail{}, errors.New("Docker inspect did not return the original command environment")
+	}
+	restoreEnv, compatibleEnv := identityEnvironment(info.Container.Config.Env, req.Env)
+	wrapped := false
+	identityUnavailable := "shell-sensitive environment requires direct execution; command signals are unavailable"
+	if compatibleEnv {
+		wrapped, err = c.probeIdentity(ctx, sandboxID, cmdID, req.Cwd, envSlice)
+		if err != nil {
+			return runtimeio.CommandDetail{}, fmt.Errorf("Docker command identity probe: %w", err)
+		}
+		identityUnavailable = "guest /bin/sh, builtin kill/printf or readable /proc identity is unavailable; command signals are unsupported"
 	}
 
 	// Create Docker exec instance.
@@ -99,6 +124,13 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 	}
 	if req.Cwd != "" {
 		execOpts.WorkingDir = req.Cwd
+	}
+	if wrapped {
+		execOpts.Cmd = []string{"/bin/sh", "-c", identityWrapperScript, "opensbx-command", cmdID}
+		execOpts.Cmd = append(execOpts.Cmd, restoreEnv...)
+		execOpts.Cmd = append(execOpts.Cmd, "--")
+		execOpts.Cmd = append(execOpts.Cmd, fullCmd...)
+		execOpts.Env = internalShellEnv(envSlice)
 	}
 
 	execCfg, err := c.cli.ExecCreate(ctx, sandboxID, execOpts)
@@ -125,22 +157,30 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 	execCtx, cancel := context.WithCancel(context.Background())
 
 	rc := &runningCommand{
-		execID:    execCfg.ID,
-		sandboxID: sandboxID,
-		cmd:       fullCmd,
-		cancel:    cancel,
-		stdout:    stdoutBuf,
-		stderr:    stderrBuf,
-		done:      make(chan struct{}),
-		attached:  make(chan struct{}),
+		execID:        execCfg.ID,
+		sandboxID:     sandboxID,
+		cmd:           fullCmd,
+		cancel:        cancel,
+		stdout:        stdoutBuf,
+		stderr:        stderrBuf,
+		done:          make(chan struct{}),
+		attached:      make(chan struct{}),
+		identityReady: make(chan struct{}),
+	}
+	if !wrapped {
+		rc.publishIdentity(0, 0, fmt.Errorf("%w: %s", sandbox.ErrUnsupported, identityUnavailable))
 	}
 	c.commands.Store(cmdID, rc)
 
 	// Launch goroutine to attach and stream output.
 	go func() {
+		defer cancel()
 		defer func() {
-			stdoutBuf.Close()
-			stderrBuf.Close()
+			rc.mu.Lock()
+			streamErr := rc.streamErr
+			rc.mu.Unlock()
+			stdoutBuf.closeWithError(streamErr)
+			stderrBuf.closeWithError(streamErr)
 			close(rc.done)
 
 			// Schedule cleanup from map after 5 minutes.
@@ -157,30 +197,62 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 			rc.exitCode = -1
 			rc.finished = true
 			rc.mu.Unlock()
+			rc.publishIdentity(0, 0, err)
 			close(rc.attached)
 			c.repo.UpdateCommandFinished(cmdID, -1, time.Now().UnixMilli())
 			return
 		}
 		defer attached.Close()
+		stopClose := context.AfterFunc(execCtx, attached.Close)
+		defer stopClose()
 		close(rc.attached)
 
 		// Demux stdout/stderr into ring buffers.
-		stdcopy.StdCopy(stdoutBuf, stderrBuf, attached.Reader)
+		var stderrWriter io.Writer = stderrBuf
+		var identityFilter *identityStderr
+		if wrapped {
+			identityFilter = &identityStderr{rc: rc, nonce: cmdID}
+			stderrWriter = identityFilter
+		}
+		_, streamErr := stdcopy.StdCopy(stdoutBuf, stderrWriter, attached.Reader)
+		if identityFilter != nil {
+			streamErr = identityFilter.finish(streamErr)
+		}
+		if streamErr != nil {
+			rc.publishIdentity(0, 0, streamErr)
+		}
+		attached.Close()
+		if streamErr != nil {
+			rc.mu.Lock()
+			rc.streamErr = streamErr
+			rc.mu.Unlock()
+			stdoutBuf.closeWithError(streamErr)
+			stderrBuf.closeWithError(streamErr)
+		}
 
 		// Get exit code.
 		exitCode := -1
-		inspect, err := c.cli.ExecInspect(context.Background(), execCfg.ID, moby.ExecInspectOptions{})
-		if err == nil {
+		inspectCtx, cancelInspect := context.WithTimeout(context.Background(), 10*time.Second)
+		inspect, err := c.cli.ExecInspect(inspectCtx, execCfg.ID, moby.ExecInspectOptions{})
+		cancelInspect()
+		confirmed := err == nil && !inspect.Running
+		if confirmed {
 			exitCode = inspect.ExitCode
+		}
+		if !confirmed && streamErr == nil {
+			streamErr = errors.New("Docker command observation ended without confirmed termination")
 		}
 
 		finishedAt := time.Now().UnixMilli()
 		rc.mu.Lock()
 		rc.exitCode = exitCode
-		rc.finished = true
+		rc.finished = confirmed
+		rc.streamErr = streamErr
 		rc.mu.Unlock()
 
-		c.repo.UpdateCommandFinished(cmdID, exitCode, finishedAt)
+		if confirmed {
+			c.repo.UpdateCommandFinished(cmdID, exitCode, finishedAt)
+		}
 	}()
 
 	return runtimeio.CommandDetail{
@@ -247,6 +319,9 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signa
 		if dbCmd == nil {
 			return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 		}
+		if dbCmd.SandboxID != sandboxID {
+			return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
+		}
 		return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
 	}
 
@@ -256,34 +331,35 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signa
 		rc.mu.Unlock()
 		return runtimeio.CommandDetail{}, sandbox.ErrCommandNotFound
 	}
-	cmd := rc.cmd
 	rc.mu.Unlock()
 	if err := c.waitCommandRunning(ctx, rc); err != nil {
 		return runtimeio.CommandDetail{}, err
 	}
 
-	// pkill uses an extended regex over space-joined argv, not shell syntax.
-	// Quote the literal command and anchor the whole match; pass it as one argument
-	// without a shell so quotes, substitutions and newlines remain ordinary data.
-	pattern := "^" + regexp.QuoteMeta(strings.Join(cmd, " ")) + "$"
-	result, err := c.execWithStdin(ctx, sandboxID, []string{"pkill", "-" + strconv.Itoa(signal), "-f", "--", pattern}, nil)
+	if err := ctx.Err(); err != nil {
+		return runtimeio.CommandDetail{}, err
+	}
+	pid, start, err := c.waitGuestIdentity(ctx, rc)
 	if err != nil {
 		return runtimeio.CommandDetail{}, err
+	}
+	result, err := c.runIdentityHelper(ctx, sandboxID, moby.ExecCreateOptions{
+		Cmd: []string{"/bin/sh", "-c", identitySignalScript, "opensbx-signal", strconv.Itoa(pid), strconv.FormatUint(start, 10), strconv.Itoa(signal)},
+		Env: internalShellEnv(nil),
+	})
+	if err != nil {
+		return runtimeio.CommandDetail{}, fmt.Errorf("guest command signal was not confirmed: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return runtimeio.CommandDetail{}, err
 	}
 	if result.exitCode != 0 {
-		rc.mu.Lock()
-		finished := rc.finished
-		rc.mu.Unlock()
-		if finished {
-			return runtimeio.CommandDetail{}, sandbox.ErrCommandFinished
-		}
-		return runtimeio.CommandDetail{}, fmt.Errorf("command signal failed: pkill exited with code %d", result.exitCode)
+		return runtimeio.CommandDetail{}, fmt.Errorf("guest command signal was not confirmed: identity helper exited with status %d", result.exitCode)
 	}
-
-	// Wait briefly for the command to finish, then return current state.
+	expected := fmt.Sprintf("OPENSBX_SIGNAL %d %d %d\n", pid, start, signal)
+	if result.stdout != expected || result.stderr != "" {
+		return runtimeio.CommandDetail{}, errors.New("guest command signal was not confirmed: invalid helper acknowledgment")
+	}
 	select {
 	case <-rc.done:
 	case <-time.After(500 * time.Millisecond):
@@ -293,7 +369,6 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, cmdID string, signa
 	if err := ctx.Err(); err != nil {
 		return runtimeio.CommandDetail{}, err
 	}
-
 	return c.GetCommand(ctx, sandboxID, cmdID)
 }
 
@@ -309,6 +384,9 @@ func (c *Client) waitCommandRunning(ctx context.Context, rc *runningCommand) err
 		defer rc.mu.Unlock()
 		if rc.startErr != nil {
 			return rc.startErr
+		}
+		if rc.streamErr != nil {
+			return rc.streamErr
 		}
 		if rc.finished {
 			return sandbox.ErrCommandFinished
@@ -394,6 +472,11 @@ func (c *Client) GetCommandLogs(ctx context.Context, sandboxID, cmdID string) (r
 	}
 
 	rc.mu.Lock()
+	if rc.streamErr != nil {
+		err := rc.streamErr
+		rc.mu.Unlock()
+		return runtimeio.CommandLogsResponse{}, err
+	}
 	exitCode := (*int)(nil)
 	if rc.finished {
 		ec := rc.exitCode
@@ -421,6 +504,12 @@ func (c *Client) WaitCommand(ctx context.Context, sandboxID, cmdID string) (runt
 	case <-rc.done:
 	case <-ctx.Done():
 		return runtimeio.CommandDetail{}, ctx.Err()
+	}
+	rc.mu.Lock()
+	streamErr := rc.streamErr
+	rc.mu.Unlock()
+	if streamErr != nil {
+		return runtimeio.CommandDetail{}, streamErr
 	}
 
 	return c.GetCommand(ctx, sandboxID, cmdID)

@@ -84,6 +84,36 @@ func TestWriteFileRejectsMalformedBodyBeforeCallingBackend(t *testing.T) {
 	assert.NotEmpty(t, response.Message)
 }
 
+func TestWriteFileAcceptsExplicitEmptyContent(t *testing.T) {
+	called := false
+	r := newRouter(&stub{writeFile: func(_, _, content string) error {
+		called = true
+		assert.Empty(t, content)
+		return nil
+	}})
+	req := httptest.NewRequest(http.MethodPut, "/v1/sandboxes/sb/files?path=/work/file", strings.NewReader(`{"content":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	assert.True(t, called, "explicit empty content must reach the backend")
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestWriteFileRejectsMissingNullAndNonStringContentBeforeCallingBackend(t *testing.T) {
+	for _, body := range []string{`{}`, `{"content":null}`, `{"content":42}`, `{"content":true}`, `{"content":[]}`} {
+		t.Run(body, func(t *testing.T) {
+			called := false
+			r := newRouter(&stub{writeFile: func(string, string, string) error { called = true; return nil }})
+			req := httptest.NewRequest(http.MethodPut, "/v1/sandboxes/sb/files?path=/work/file", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			assert.False(t, called)
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+		})
+	}
+}
+
 func TestNetworkHandlerPropagatesDaemonFailure(t *testing.T) {
 	w := do(newRouter(&stub{getNetwork: func(id string) (models.SandboxNetwork, error) {
 		assert.Equal(t, "sandbox-7", id)
@@ -155,4 +185,24 @@ func TestWaitStreamCancellationStopsWaitingWithoutEmittingCompletion(t *testing.
 	assert.Nil(t, initial.Command.FinishedAt)
 	var extra models.CommandResponse
 	assert.ErrorIs(t, decoder.Decode(&extra), io.EOF, "cancellation must not fabricate a completed command")
+}
+
+func TestWaitStreamBackendFailureLeavesOnlyInitialStateAtEOF(t *testing.T) {
+	d := &cancelableWaitStub{
+		stub: &stub{getCommand: func(sandboxID, commandID string) (models.CommandDetail, error) {
+			return models.CommandDetail{ID: commandID, SandboxID: sandboxID, Name: "job", StartedAt: 10}, nil
+		}},
+		wait: func(context.Context, string, string) (models.CommandDetail, error) {
+			return models.CommandDetail{}, errors.New("wait failed")
+		},
+	}
+	w := do(newRouter(d), http.MethodGet, "/v1/sandboxes/sb/cmd/cmd-1?wait=true", nil)
+	assert.Equal(t, http.StatusOK, w.Code)
+	decoder := json.NewDecoder(w.Body)
+	var initial models.CommandResponse
+	require.NoError(t, decoder.Decode(&initial))
+	assert.Equal(t, "cmd-1", initial.Command.ID)
+	assert.Nil(t, initial.Command.ExitCode)
+	var extra models.CommandResponse
+	assert.ErrorIs(t, decoder.Decode(&extra), io.EOF, "failed wait may end the stream without a terminal state")
 }

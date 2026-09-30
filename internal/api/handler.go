@@ -1,12 +1,13 @@
 package api
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"opensbx/internal/sandbox"
@@ -402,13 +403,23 @@ func (h *Handler) streamLogs(c *gin.Context, sandboxID, cmdID string) {
 		internalError(c, err)
 		return
 	}
-	defer stdoutR.Close()
-	defer stderrR.Close()
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		wg.Wait()
+	}()
 
 	c.Header("Content-Type", "application/x-ndjson")
 	c.Status(http.StatusOK)
 	flusher, _ := c.Writer.(http.Flusher)
 	enc := json.NewEncoder(c.Writer)
+	// Quiet commands must publish stream headers before their first output.
+	if flusher != nil {
+		flusher.Flush()
+	}
 
 	type logLine struct {
 		Type string `json:"type"`
@@ -418,25 +429,82 @@ func (h *Handler) streamLogs(c *gin.Context, sandboxID, cmdID string) {
 	// Read from both streams concurrently, write as ND-JSON.
 	lines := make(chan logLine, 64)
 	readStream := func(r io.ReadCloser, streamType string) {
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			lines <- logLine{Type: streamType, Data: scanner.Text() + "\n"}
+		// Read available bytes, not lines: progress without a newline must be live.
+		// Only an incomplete final UTF-8 rune can carry into the next read.
+		buffer := make([]byte, 32*1024)
+		carry, emptyReads := 0, 0
+		send := func(kind, data string) bool {
+			select {
+			case lines <- logLine{Type: kind, Data: data}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		for {
+			n, err := r.Read(buffer[carry:])
+			if n == 0 && err == nil {
+				emptyReads++
+				if emptyReads < 100 {
+					continue
+				}
+				err = io.ErrNoProgress
+			} else {
+				emptyReads = 0
+			}
+			total, end := carry+n, 0
+			invalid := false
+			for end < total && utf8.FullRune(buffer[end:total]) {
+				rune, size := utf8.DecodeRune(buffer[end:total])
+				if rune == utf8.RuneError && size == 1 {
+					invalid = true
+					break
+				}
+				end += size
+			}
+			if end > 0 && !send(streamType, string(buffer[:end])) {
+				return
+			}
+			if invalid || errors.Is(err, io.EOF) && end != total {
+				send("error", streamType+" log source contains invalid or incomplete UTF-8 text")
+				return
+			}
+			carry = copy(buffer, buffer[end:total])
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					message := streamType + " log source read failed"
+					if errors.Is(err, sandbox.ErrLogTruncated) {
+						message = streamType + " logs truncated: retained output was overwritten; full history is unavailable"
+					}
+					send("error", message)
+				}
+				return
+			}
 		}
 	}
 
-	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); readStream(stdoutR, "stdout") }()
 	go func() { defer wg.Done(); readStream(stderrR, "stderr") }()
 	go func() { wg.Wait(); close(lines) }()
 
-	for line := range lines {
-		if c.IsAborted() {
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		enc.Encode(line)
-		if flusher != nil {
-			flusher.Flush()
+		case line, ok := <-lines:
+			if !ok || c.IsAborted() {
+				return
+			}
+			if err := enc.Encode(line); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if line.Type == "error" {
+				return
+			}
 		}
 	}
 }
@@ -520,13 +588,25 @@ func (h *Handler) writeFile(c *gin.Context) {
 		return
 	}
 
-	var req models.FileWriteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var req struct {
+		Content *string `json:"content"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	if err := decoder.Decode(&req); err != nil {
 		badRequest(c, err.Error())
 		return
 	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		badRequest(c, "body must contain exactly one JSON object")
+		return
+	}
 
-	if err := h.app.WriteFile(c.Request.Context(), c.Param("id"), path, req.Content); err != nil {
+	if req.Content == nil {
+		badRequest(c, "content must be a string (empty text is allowed)")
+		return
+	}
+	if err := h.app.WriteFile(c.Request.Context(), c.Param("id"), path, *req.Content); err != nil {
 		internalError(c, err)
 		return
 	}

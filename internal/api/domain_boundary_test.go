@@ -50,7 +50,7 @@ func TestDomainAndRuntimePackagesDoNotImportDTOsOrNativeAdapters(t *testing.T) {
 	}
 }
 
-func TestOnlyAPIProductionPackageImportsHTTPModelDTOs(t *testing.T) {
+func TestOnlyTransportPackagesImportHTTPModelDTOs(t *testing.T) {
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate boundary test source")
@@ -60,6 +60,7 @@ func TestOnlyAPIProductionPackageImportsHTTPModelDTOs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transportPackages := map[string]bool{"api": true, "client": true, "cli": true}
 	for _, dir := range packages {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
@@ -83,7 +84,7 @@ func TestOnlyAPIProductionPackageImportsHTTPModelDTOs(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if path == "opensbx/models" && pkg != "api" {
+				if path == "opensbx/models" && !transportPackages[pkg] {
 					t.Errorf("DTO import escaped API facade into package %s (%s)", pkg, file)
 				}
 			}

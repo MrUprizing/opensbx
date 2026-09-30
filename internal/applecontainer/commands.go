@@ -350,7 +350,8 @@ func (r *logReader) Read(p []byte) (int, error) {
 		r.buffer.mu.Lock()
 		first := r.buffer.total - uint64(len(r.buffer.data))
 		if r.offset < first {
-			r.offset = first
+			r.buffer.mu.Unlock()
+			return 0, domain.ErrLogTruncated
 		}
 		n := copy(p, r.buffer.data[int(r.offset-first):])
 		r.offset += uint64(n)

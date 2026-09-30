@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"opensbx/internal/applecontainer"
+	"opensbx/internal/cli"
 	"opensbx/internal/config"
-	"opensbx/internal/images"
 	"opensbx/internal/processctl"
 	"opensbx/internal/runtimechoice"
 
@@ -27,129 +27,16 @@ import (
 const startTimeout = 35 * time.Second
 
 func runCLI(args []string, out io.Writer) error {
-	if len(args) == 0 {
-		return runServer(args)
-	}
-	if isHelpFlag(args[0]) {
-		return writeRootHelp(out)
-	}
-	switch args[0] {
-	case "help":
-		return writeCommandHelp(out, args[1:])
-	case "start":
-		if containsHelpFlag(args[1:]) {
-			return writeStartHelp(out)
+	ctx, cancel := signal.NotifyContext(context.Background(), serverSignals()...)
+	defer cancel()
+	err := cli.Execute(ctx, args, os.Stdin, out, os.Stderr, cli.ServerHooks{Foreground: func(args []string, _ io.Writer) error { return runServer(args) }, Start: startServer, Stop: stopServer})
+	if ctx.Err() != nil && err != nil {
+		var exit *cli.ExitError
+		if !errors.As(err, &exit) {
+			return &cli.ExitError{Code: 130}
 		}
-		return startServer(args[1:], out)
-	case "stop":
-		if containsHelpFlag(args[1:]) {
-			return writeStopHelp(out)
-		}
-		return stopServer(args[1:], out)
-	case "image":
-		ctx, cancel := signal.NotifyContext(context.Background(), serverSignals()...)
-		defer cancel()
-		return images.CLI(ctx, args[1:], config.DefaultDataDir(), out)
-	default:
-		if strings.HasPrefix(args[0], "-") {
-			return runServer(args)
-		}
-		return fmt.Errorf("unknown command %q; run opensbx -h to see available commands", args[0])
 	}
-}
-
-func writeRootHelp(out io.Writer) error {
-	_, err := fmt.Fprint(out, `OpenSBX runs isolated local sandboxes and exposes them through an API.
-
-Usage:
-  opensbx <command> [options]
-
-Commands:
-  start   Start the API and MCP server in the background
-  stop    Gracefully stop the server and its managed sandboxes
-  image   Manage the local OCI image catalog
-  help    Show help for a command
-
-Server options (for start):
-  -runtime NAME       Runtime: docker or container (Apple Container)
-  -addr ADDRESS       Loopback API address (default 127.0.0.1:18089)
-  -data-dir PATH      Local image catalog and server state
-  -log-file PATH      Server log file
-  -legacy-db PATH     Explicit legacy execution database path
-
-Examples:
-  opensbx start
-  opensbx start -runtime container
-  opensbx stop
-  opensbx image pull node:22
-  opensbx start -h
-
-Shortcuts: -h, -help, --help show this help. The image commands are also
-available as `+"`opensbx image help`"+`.
-`)
 	return err
-}
-
-func writeStartHelp(out io.Writer) error {
-	_, err := fmt.Fprint(out, `Usage: opensbx start [server options]
-
-Start the OpenSBX API and MCP server in the background. With no runtime flag,
-Docker is selected by default (Apple Silicon Macs may prompt for a runtime).
-Use opensbx stop for a graceful shutdown. Server output is written to the log.
-
-Options:
-  -runtime NAME       Runtime: docker or container
-  -addr ADDRESS       Loopback API address (default 127.0.0.1:18089)
-  -data-dir PATH      Local image catalog and server state
-  -log-file PATH      Server log file
-  -legacy-db PATH     Explicit legacy execution database path
-
-Use -h or -help for this message.
-`)
-	return err
-}
-
-func writeStopHelp(out io.Writer) error {
-	_, err := fmt.Fprint(out, `Usage: opensbx stop [server options]
-
-Send a graceful shutdown signal to the server started with the same data
-directory. The server stops accepting requests and stops its managed sandboxes.
-
-Options:
-  -data-dir PATH      Data directory used by opensbx start
-  -addr ADDRESS       Accepted for consistency; the server address is not used
-                      to identify the process
-
-Use -h or -help for this message.
-`)
-	return err
-}
-
-func writeImageHelp(out io.Writer) error {
-	_, err := fmt.Fprint(out, `Usage: opensbx image <list|inspect|pull|import|export|remove> [options]
-
-Manage OpenSBX's local OCI image catalog. These commands do not need a running
-server or runtime. Use `+"`opensbx image <command> -h`"+` for command-specific options.
-
-Use -h or -help for this message.
-`)
-	return err
-}
-
-func writeCommandHelp(out io.Writer, args []string) error {
-	if len(args) == 0 {
-		return writeRootHelp(out)
-	}
-	switch args[0] {
-	case "start":
-		return writeStartHelp(out)
-	case "stop":
-		return writeStopHelp(out)
-	case "image":
-		return writeImageHelp(out)
-	default:
-		return fmt.Errorf("unknown command %q; run opensbx -h to see available commands", args[0])
-	}
 }
 
 func startServer(args []string, out io.Writer) error {
@@ -292,22 +179,4 @@ func startupError(logPath string, offset int64, childErr error) error {
 		return fmt.Errorf("OpenSBX could not start: %w (check log %s)", childErr, logPath)
 	}
 	return fmt.Errorf("OpenSBX exited before becoming ready; check log %s", logPath)
-}
-
-func isHelpFlag(value string) bool {
-	switch value {
-	case "-h", "-help", "--help", "--h":
-		return true
-	default:
-		return false
-	}
-}
-
-func containsHelpFlag(args []string) bool {
-	for _, arg := range args {
-		if isHelpFlag(arg) {
-			return true
-		}
-	}
-	return false
 }

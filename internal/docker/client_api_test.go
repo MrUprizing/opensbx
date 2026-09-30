@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -8,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -32,38 +35,77 @@ type dockerAPIFixture struct {
 	failAfterMutation map[string]int
 	// Sequential responses allow a preflight inspect to succeed and the
 	// post-mutation inspect to fail without changing state from a test goroutine.
-	responses         map[string][]int
-	requests          []string
-	execOptions       []string
-	createBody        container.Config
-	createHost        container.HostConfig
-	containerID       string
-	containerLabels   map[string]string
-	containerHostPort string
-	running           bool
-	paused            bool
-	stdin             []byte
-	execStdin         bool
-	statsBody         string
-	pullBody          string
-	attachBody        string
-	stopDone          chan struct{}
-	blockStopRequests bool
-	stopEntered       chan struct{}
-	cacheDigest       string
-	cacheTag          string
-	cacheNativeID     string
-	cacheLoaded       bool
-	loadedArchive     []byte
-	cacheSavedArchive []byte
-	cacheLoadBody     string
-	cacheInspectID    string
-	cacheSaveMode     string
-	cacheSaveEntered  chan struct{}
-	cacheSaveRelease  chan struct{}
-	execStartup       *execStartupFixture
-	execCreateEntered chan struct{}
-	releaseExecCreate chan struct{}
+	responses             map[string][]int
+	requests              []string
+	execOptions           []string
+	execCreates           []dockerExecCreate
+	execRecords           map[string]dockerExecRecord
+	execCount             int
+	containerEnv          []string
+	guestProcesses        map[int]fakeGuestProcess
+	signalTargets         []int
+	signalHelperStdout    string
+	signalHelperStderr    string
+	probeExitCode         int
+	probeStdout           string
+	probeStderr           string
+	probeCreateStatus     int
+	probeCreateError      string
+	probeStartStatus      int
+	probeBlock            bool
+	probeAttachEntered    chan struct{}
+	payloadPreamble       string
+	signalNoAck           bool
+	createBody            container.Config
+	createHost            container.HostConfig
+	containerID           string
+	containerLabels       map[string]string
+	containerHostPort     string
+	running               bool
+	paused                bool
+	stdin                 []byte
+	execStdin             bool
+	statsBody             string
+	pullBody              string
+	attachBody            string
+	stopDone              chan struct{}
+	blockStopRequests     bool
+	stopEntered           chan struct{}
+	cacheDigest           string
+	cacheTag              string
+	cacheNativeID         string
+	cacheLoaded           bool
+	loadedArchive         []byte
+	cacheSavedArchive     []byte
+	cacheLoadBody         string
+	cacheInspectID        string
+	cacheSaveMode         string
+	cacheSaveEntered      chan struct{}
+	cacheSaveRelease      chan struct{}
+	execStartup           *execStartupFixture
+	execCreateEntered     chan struct{}
+	releaseExecCreate     chan struct{}
+	execCreateBarrierUsed bool
+}
+
+type dockerExecCreate struct {
+	ID         string
+	Kind       string
+	Cmd        []string
+	Env        []string
+	WorkingDir string
+}
+
+type dockerExecRecord struct {
+	Kind     string
+	Nonce    string
+	ExitCode int
+	Cmd      []string
+}
+
+type fakeGuestProcess struct {
+	Start   uint64
+	Running bool
 }
 
 type execStartupFixture struct {
@@ -76,6 +118,8 @@ type execStartupFixture struct {
 	startedOnce                  sync.Once
 	startFailedOnce              sync.Once
 	finishOnce                   sync.Once
+	identityEnteredOnce          sync.Once
+	releaseIdentityOnce          sync.Once
 	signalAttachOnce             sync.Once
 	releaseStartOnce             sync.Once
 	runningReleaseOnce           sync.Once
@@ -100,11 +144,19 @@ type execStartupFixture struct {
 	releasePayloadRunning        chan struct{}
 	payloadPIDReady              chan struct{}
 	releasePayloadPID            chan struct{}
+	payloadPreamble              string
+	payloadPreambleChunks        [][]byte
+	payloadStderrTail            []byte
+	guestPID                     int
+	guestStart                   uint64
+	blockPayloadIdentity         bool
+	identityEntered              chan struct{}
+	releaseIdentity              chan struct{}
 }
 
 func newDockerFixture(t *testing.T) (*Client, *dockerAPIFixture) {
 	t.Helper()
-	fixture := &dockerAPIFixture{t: t, fail: map[string]int{}, containerID: "container-1", running: true, stopDone: make(chan struct{}, 8)}
+	fixture := &dockerAPIFixture{t: t, fail: map[string]int{}, containerID: "container-1", running: true, stopDone: make(chan struct{}, 8), execRecords: make(map[string]dockerExecRecord), guestProcesses: make(map[int]fakeGuestProcess)}
 	server := httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
 	t.Cleanup(server.Close)
 	dockerHost := strings.TrimPrefix(server.URL, "http://")
@@ -170,6 +222,28 @@ func writeBlockedImageSave(t *testing.T, w http.ResponseWriter, body []byte, ent
 	_, _ = buffered.Write(body[cut:])
 	_ = buffered.Flush()
 	_ = connection.Close()
+}
+
+func classifyDockerFixtureExec(cmd []string) string {
+	if len(cmd) >= 4 && cmd[0] == "/bin/sh" && cmd[1] == "-c" {
+		switch cmd[3] {
+		case "opensbx-probe":
+			return "probe"
+		case "opensbx-command":
+			return "payload"
+		case "opensbx-signal":
+			return "signal"
+		}
+	}
+	return "direct"
+}
+
+func dockerOutputFrame(stream byte, payload []byte) []byte {
+	frame := make([]byte, 8+len(payload))
+	frame[0] = stream
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(payload)))
+	copy(frame[8:], payload)
+	return frame
 }
 
 func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -278,17 +352,18 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`[{"Id":"container-1","Names":["/demo"],"Image":"alpine:latest","State":"running","Status":"Up","Ports":[{"PrivatePort":3000,"PublicPort":32768,"Type":"tcp"}]}]`))
 	case r.Method == http.MethodGet && path == "/containers/container-1/json":
 		f.mu.Lock()
-		running, paused, labels, hostPort := f.running, f.paused, f.containerLabels, f.containerHostPort
+		running, paused, labels, hostPort, env := f.running, f.paused, f.containerLabels, f.containerHostPort, append([]string(nil), f.containerEnv...)
 		f.mu.Unlock()
 		if hostPort == "" {
 			hostPort = "32768"
 		}
 		labelsJSON, _ := json.Marshal(labels)
+		envJSON, _ := json.Marshal(env)
 		status := "exited"
 		if running {
 			status = "running"
 		}
-		_, _ = fmt.Fprintf(w, `{"Id":"container-1","Name":"/demo","Config":{"Image":"alpine:latest","Labels":%s},"State":{"Status":%q,"Running":%t,"Paused":%t,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":%q}]}}}`, labelsJSON, status, running, paused, hostPort)
+		_, _ = fmt.Fprintf(w, `{"Id":"container-1","Name":"/demo","Config":{"Image":"alpine:latest","Labels":%s,"Env":%s},"State":{"Status":%q,"Running":%t,"Paused":%t,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":%q}]}}}`, labelsJSON, envJSON, status, running, paused, hostPort)
 	case r.Method == http.MethodGet && path == "/containers/container-2/json":
 		_, _ = w.Write([]byte(`{"Id":"container-2","Name":"/demo-two","Config":{"Image":"alpine:latest","Labels":{}},"State":{"Status":"running","Running":true,"Paused":false,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"},"HostConfig":{"Memory":1073741824,"NanoCpus":1000000000},"NetworkSettings":{"Ports":{}}}`))
 	case r.Method == http.MethodGet && path == "/containers/container-1/archive":
@@ -301,31 +376,74 @@ func (f *dockerAPIFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(body))
 	case r.Method == http.MethodPost && path == "/containers/container-1/exec":
-		if f.execCreateEntered != nil {
-			close(f.execCreateEntered)
-			<-f.releaseExecCreate
-		}
 		body, _ := io.ReadAll(r.Body)
 		var options struct {
 			AttachStdin bool     `json:"AttachStdin"`
 			Cmd         []string `json:"Cmd"`
+			Env         []string `json:"Env"`
+			WorkingDir  string   `json:"WorkingDir"`
 		}
 		_ = json.Unmarshal(body, &options)
+		kind := classifyDockerFixtureExec(options.Cmd)
+		if kind == "payload" || kind == "direct" {
+			f.mu.Lock()
+			var entered, release chan struct{}
+			if !f.execCreateBarrierUsed {
+				f.execCreateBarrierUsed = true
+				entered, release = f.execCreateEntered, f.releaseExecCreate
+			}
+			f.mu.Unlock()
+			if entered != nil {
+				close(entered)
+				<-release
+			}
+		}
+		if kind == "probe" {
+			f.mu.Lock()
+			probeCreateStatus, probeCreateError := f.probeCreateStatus, f.probeCreateError
+			if probeCreateStatus != 0 {
+				f.execOptions = append(f.execOptions, string(body))
+				f.execCreates = append(f.execCreates, dockerExecCreate{Kind: kind, Cmd: append([]string(nil), options.Cmd...), Env: append([]string(nil), options.Env...), WorkingDir: options.WorkingDir})
+			}
+			f.mu.Unlock()
+			if probeCreateStatus != 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(probeCreateStatus)
+				message := probeCreateError
+				if message == "" {
+					message = "fixture probe create failure"
+				}
+				_ = json.NewEncoder(w).Encode(map[string]string{"message": message})
+				return
+			}
+		}
 		execID := "exec-1"
 		f.mu.Lock()
 		f.execStdin = options.AttachStdin
 		f.execOptions = append(f.execOptions, string(body))
-		if f.execStartup != nil {
-			if len(options.Cmd) > 0 && options.Cmd[0] == "sleep" {
+		f.execCount++
+		switch kind {
+		case "probe":
+			execID = "exec-probe"
+		case "payload":
+			if f.execStartup != nil {
 				execID = "exec-payload"
-			} else {
-				execID = "exec-signal"
+			}
+		case "signal":
+			execID = "exec-signal"
+			if f.execStartup != nil {
 				f.execStartup.signalExecCreates++
 				if !f.execStartup.payloadRunning {
 					f.execStartup.prematureSignals++
 				}
 			}
 		}
+		nonce := ""
+		if (kind == "probe" || kind == "payload") && len(options.Cmd) > 4 {
+			nonce = options.Cmd[4]
+		}
+		f.execCreates = append(f.execCreates, dockerExecCreate{ID: execID, Kind: kind, Cmd: append([]string(nil), options.Cmd...), Env: append([]string(nil), options.Env...), WorkingDir: options.WorkingDir})
+		f.execRecords[execID] = dockerExecRecord{Kind: kind, Nonce: nonce, Cmd: append([]string(nil), options.Cmd...)}
 		f.mu.Unlock()
 		_, _ = fmt.Fprintf(w, `{"Id":%q}`, execID)
 	case r.Method == http.MethodPost && strings.HasPrefix(path, "/exec/") && strings.HasSuffix(path, "/start"):
@@ -477,36 +595,41 @@ func (f *dockerAPIFixture) serveExecAttach(w http.ResponseWriter, r *http.Reques
 func (f *dockerAPIFixture) serveExecStart(w http.ResponseWriter, r *http.Request, execID string) {
 	f.mu.Lock()
 	trace := f.execStartup
+	record, known := f.execRecords[execID]
 	f.mu.Unlock()
-	if trace == nil {
-		if execID == "exec-1" {
-			f.serveExecAttach(w, r)
-			return
-		}
+	if !known {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"message":"exec not found"}`))
 		return
 	}
-	switch execID {
-	case "exec-payload":
-		f.serveStartupPayload(w, r, trace)
-	case "exec-signal":
+	switch record.Kind {
+	case "probe":
 		f.mu.Lock()
-		finishPayload := trace.payloadRunning && trace.signalExecExitCode == 0 && !trace.blockSignalAttach
-		blockSignalAttach := trace.blockSignalAttach
-		if finishPayload {
-			trace.payloadRunning = false
-			trace.payloadPID = 0
-			trace.payloadExitCode = 143
-		}
+		startStatus := f.probeStartStatus
 		f.mu.Unlock()
-		if finishPayload {
-			trace.finishOnce.Do(func() { close(trace.finishPayload) })
-		}
-		if blockSignalAttach {
-			f.serveBlockedSignalAttach(w, r, trace)
+		if startStatus != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(startStatus)
+			_, _ = w.Write([]byte(`{"message":"fixture identity probe ExecStart failure"}`))
 			return
 		}
+		f.serveIdentityProbeAttach(w, r, execID, record)
+	case "payload":
+		if trace != nil {
+			f.serveStartupPayload(w, r, trace, record)
+		} else {
+			f.serveWrappedPayloadAttach(w, r, execID, record)
+		}
+	case "signal":
+		f.mu.Lock()
+		blockSignalAttach := trace != nil && trace.blockSignalAttach
+		f.mu.Unlock()
+		if blockSignalAttach {
+			f.serveBlockedSignalAttach(w, r, trace, record)
+		} else {
+			f.serveIdentitySignalAttach(w, r, execID, record, trace)
+		}
+	case "direct":
 		f.serveExecAttach(w, r)
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -514,7 +637,166 @@ func (f *dockerAPIFixture) serveExecStart(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Request, trace *execStartupFixture) {
+func (f *dockerAPIFixture) hijackExecAttach(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, bool) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
+		return nil, nil, false
+	}
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, nil, false
+	}
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+	_ = rw.Flush()
+	return conn, rw, true
+}
+
+func writeExecFrames(rw *bufio.ReadWriter, stdout, stderr []byte) {
+	for _, stream := range []struct {
+		id   byte
+		data []byte
+	}{{1, stdout}, {2, stderr}} {
+		if len(stream.data) == 0 {
+			continue
+		}
+		_, _ = rw.Write(dockerOutputFrame(stream.id, stream.data))
+	}
+	_ = rw.Flush()
+}
+
+func (f *dockerAPIFixture) serveIdentityProbeAttach(w http.ResponseWriter, r *http.Request, execID string, record dockerExecRecord) {
+	conn, rw, ok := f.hijackExecAttach(w, r)
+	if !ok {
+		return
+	}
+	defer conn.Close()
+	f.mu.Lock()
+	stdout, stderr, exitCode := f.probeStdout, f.probeStderr, f.probeExitCode
+	blockProbe, entered := f.probeBlock, f.probeAttachEntered
+	f.mu.Unlock()
+	if blockProbe {
+		if entered != nil {
+			close(entered)
+		}
+		<-r.Context().Done()
+		return
+	}
+	if stdout == "" && exitCode == 0 {
+		stdout = fmt.Sprintf("OPENSBX_PROBE %s 2222 987654\n", record.Nonce)
+	}
+	f.mu.Lock()
+	probe := f.execRecords[execID]
+	probe.ExitCode = exitCode
+	f.execRecords[execID] = probe
+	f.mu.Unlock()
+	writeExecFrames(rw, []byte(stdout), []byte(stderr))
+}
+
+func (f *dockerAPIFixture) serveWrappedPayloadAttach(w http.ResponseWriter, r *http.Request, execID string, record dockerExecRecord) {
+	conn, rw, ok := f.hijackExecAttach(w, r)
+	if !ok {
+		return
+	}
+	defer conn.Close()
+	line := f.payloadIdentityLine(record.Nonce, 4321, 987654)
+	writeExecFrames(rw, []byte("output\n"), append([]byte(line), []byte("warning\n")...))
+	f.mu.Lock()
+	process := f.execRecords[execID]
+	process.ExitCode = 0
+	f.execRecords[execID] = process
+	f.guestProcesses[4321] = fakeGuestProcess{Start: 987654, Running: false}
+	f.mu.Unlock()
+}
+
+func (f *dockerAPIFixture) payloadIdentityLine(nonce string, pid int, start uint64) string {
+	f.mu.Lock()
+	override := f.payloadPreamble
+	f.mu.Unlock()
+	if override != "" {
+		return override
+	}
+	return fmt.Sprintf("OPENSBX_EXEC %s %d %d\n", nonce, pid, start)
+}
+
+func fakeGuestIdentity(trace *execStartupFixture) (int, uint64) {
+	pid, start := trace.guestPID, trace.guestStart
+	if pid == 0 {
+		pid = 4321
+	}
+	if start == 0 {
+		start = 987654
+	}
+	return pid, start
+}
+
+func setFakeGuestIdentity(rc *runningCommand, pid int, start uint64, err error) {
+	rc.identityReady = make(chan struct{})
+	rc.guestPID, rc.guestStart, rc.identityErr = pid, start, err
+	close(rc.identityReady)
+}
+
+func (f *dockerAPIFixture) serveIdentitySignalAttach(w http.ResponseWriter, r *http.Request, execID string, record dockerExecRecord, trace *execStartupFixture) {
+	conn, rw, ok := f.hijackExecAttach(w, r)
+	if !ok {
+		return
+	}
+	defer conn.Close()
+	if len(record.Cmd) != 7 {
+		f.t.Errorf("identity signal helper argv shape = %#v", record.Cmd)
+		return
+	}
+	pid, pidErr := strconv.Atoi(record.Cmd[4])
+	start, startErr := strconv.ParseUint(record.Cmd[5], 10, 64)
+	signal, signalErr := strconv.Atoi(record.Cmd[6])
+	f.mu.Lock()
+	traceExit := 0
+	if trace != nil {
+		traceExit = trace.signalExecExitCode
+	}
+	noAck := f.signalNoAck
+	stdoutOverride, stderrOverride := f.signalHelperStdout, f.signalHelperStderr
+	process := f.guestProcesses[pid]
+	traceGuestPID, traceGuestStart := 0, uint64(0)
+	if trace != nil {
+		traceGuestPID, traceGuestStart = fakeGuestIdentity(trace)
+	}
+	if trace != nil && trace.payloadRunning && traceGuestPID == pid {
+		process = fakeGuestProcess{Start: traceGuestStart, Running: true}
+	}
+	valid := pidErr == nil && startErr == nil && signalErr == nil && process.Running && process.Start == start && traceExit == 0
+	if valid {
+		f.guestProcesses[pid] = fakeGuestProcess{Start: start, Running: false}
+		f.signalTargets = append(f.signalTargets, pid)
+		if trace != nil && traceGuestPID == pid {
+			trace.payloadRunning = false
+			trace.payloadExitCode = 143
+			trace.payloadPID = 0
+		}
+	}
+	result := f.execRecords[execID]
+	result.ExitCode = traceExit
+	if !valid && result.ExitCode == 0 {
+		result.ExitCode = 124
+	}
+	f.execRecords[execID] = result
+	f.mu.Unlock()
+	if valid && trace != nil {
+		trace.finishOnce.Do(func() { close(trace.finishPayload) })
+	}
+	stdout := []byte(nil)
+	if valid && !noAck {
+		if stdoutOverride != "" {
+			stdout = []byte(stdoutOverride)
+		} else {
+			stdout = []byte(fmt.Sprintf("OPENSBX_SIGNAL %d %d %d\n", pid, start, signal))
+		}
+	}
+	writeExecFrames(rw, stdout, []byte(stderrOverride))
+}
+
+func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Request, trace *execStartupFixture, record dockerExecRecord) {
 	_, _ = io.Copy(io.Discard, r.Body)
 	trace.startEnteredOnce.Do(func() { close(trace.payloadStartEntered) })
 	select {
@@ -537,6 +819,8 @@ func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Re
 	}
 	if trace.payloadRunning {
 		trace.payloadPID = 4321
+		guestPID, guestStart := fakeGuestIdentity(trace)
+		f.guestProcesses[guestPID] = fakeGuestProcess{Start: guestStart, Running: true}
 	}
 	trace.payloadWasStarted = true
 	if trace.payloadFinishOnStart {
@@ -558,6 +842,17 @@ func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Re
 	defer conn.Close()
 	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
 	_ = rw.Flush()
+	if trace.blockPayloadIdentity {
+		if trace.identityEntered != nil {
+			trace.identityEnteredOnce.Do(func() { close(trace.identityEntered) })
+		}
+		select {
+		case <-trace.releaseIdentity:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	f.writePayloadIdentity(rw, trace, record)
 	if finishOnStart {
 		return
 	}
@@ -570,6 +865,8 @@ func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Re
 				trace.payloadPID = 0
 			} else {
 				trace.payloadPID = 4321
+				guestPID, guestStart := fakeGuestIdentity(trace)
+				f.guestProcesses[guestPID] = fakeGuestProcess{Start: guestStart, Running: true}
 			}
 			f.mu.Unlock()
 			if trace.payloadRunningReady != nil {
@@ -580,6 +877,8 @@ func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Re
 				case <-trace.releasePayloadPID:
 					f.mu.Lock()
 					trace.payloadPID = 4321
+					guestPID, guestStart := fakeGuestIdentity(trace)
+					f.guestProcesses[guestPID] = fakeGuestProcess{Start: guestStart, Running: true}
 					f.mu.Unlock()
 					if trace.payloadPIDReady != nil {
 						close(trace.payloadPIDReady)
@@ -603,7 +902,27 @@ func (f *dockerAPIFixture) serveStartupPayload(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (f *dockerAPIFixture) serveBlockedSignalAttach(w http.ResponseWriter, r *http.Request, trace *execStartupFixture) {
+func (f *dockerAPIFixture) writePayloadIdentity(rw *bufio.ReadWriter, trace *execStartupFixture, record dockerExecRecord) {
+	chunks := trace.payloadPreambleChunks
+	if chunks == nil {
+		line := trace.payloadPreamble
+		if line == "" {
+			pid, start := fakeGuestIdentity(trace)
+			line = f.payloadIdentityLine(record.Nonce, pid, start)
+		}
+		chunks = [][]byte{[]byte(line)}
+	}
+	for i, part := range chunks {
+		part = bytes.ReplaceAll(part, []byte("{{NONCE}}"), []byte(record.Nonce))
+		if i == len(chunks)-1 && len(trace.payloadStderrTail) > 0 {
+			tail := bytes.ReplaceAll(trace.payloadStderrTail, []byte("{{NONCE}}"), []byte(record.Nonce))
+			part = append(append([]byte(nil), part...), tail...)
+		}
+		writeExecFrames(rw, nil, part)
+	}
+}
+
+func (f *dockerAPIFixture) serveBlockedSignalAttach(w http.ResponseWriter, r *http.Request, trace *execStartupFixture, _ dockerExecRecord) {
 	_, _ = io.Copy(io.Discard, r.Body)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -624,34 +943,41 @@ func (f *dockerAPIFixture) serveBlockedSignalAttach(w http.ResponseWriter, r *ht
 	case <-r.Context().Done():
 		return
 	}
-	for _, stream := range []struct {
-		id   byte
-		data []byte
-	}{{1, []byte("signal\n")}} {
-		frame := make([]byte, 8+len(stream.data))
-		frame[0] = stream.id
-		binary.BigEndian.PutUint32(frame[4:8], uint32(len(stream.data)))
-		copy(frame[8:], stream.data)
-		_, _ = rw.Write(frame)
-	}
-	_ = rw.Flush()
+	writeExecFrames(rw, []byte("signal\n"), nil)
 }
 
 func (f *dockerAPIFixture) serveExecInspect(w http.ResponseWriter, execID string) {
 	f.mu.Lock()
 	trace := f.execStartup
-	if trace == nil {
-		f.mu.Unlock()
-		if execID == "exec-1" {
-			_, _ = w.Write([]byte(`{"ID":"exec-1","Running":false,"ExitCode":0}`))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"message":"exec not found"}`))
+	record, ok := f.execRecords[execID]
+	if !ok && trace != nil {
+		switch execID {
+		case "exec-payload":
+			record, ok = dockerExecRecord{Kind: "payload"}, true
+		case "exec-signal":
+			record, ok = dockerExecRecord{Kind: "signal", ExitCode: trace.signalExecExitCode}, true
 		}
+	}
+	if !ok {
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"exec not found"}`))
 		return
 	}
-	switch execID {
-	case "exec-payload":
+	switch record.Kind {
+	case "probe", "signal":
+		exitCode := record.ExitCode
+		f.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":%d}`, execID, exitCode)
+	case "direct":
+		f.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":0}`, execID)
+	case "payload":
+		if trace == nil {
+			f.mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":0}`, execID)
+			return
+		}
 		running, started, pid, exitCode := trace.payloadRunning, trace.payloadWasStarted, trace.payloadPID, trace.payloadExitCode
 		trace.payloadInspectCalls++
 		f.mu.Unlock()
@@ -660,10 +986,6 @@ func (f *dockerAPIFixture) serveExecInspect(w http.ResponseWriter, execID string
 		} else {
 			_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"Pid":%d,"ExitCode":%d}`, execID, pid, exitCode)
 		}
-	case "exec-signal":
-		exitCode := trace.signalExecExitCode
-		f.mu.Unlock()
-		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":%d}`, execID, exitCode)
 	default:
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusNotFound)
@@ -690,6 +1012,12 @@ func (r *execStartupFixture) releasePID() {
 func (r *execStartupFixture) releaseSignal() {
 	if r.releaseSignalAttach != nil {
 		r.releaseSignalOnce.Do(func() { close(r.releaseSignalAttach) })
+	}
+}
+
+func (r *execStartupFixture) releaseIdentityPreamble() {
+	if r.releaseIdentity != nil {
+		r.releaseIdentityOnce.Do(func() { close(r.releaseIdentity) })
 	}
 }
 
@@ -1205,7 +1533,9 @@ func TestDockerClientKillRunningCommand(t *testing.T) {
 	stdout, stderr := newRingBuffer(32), newRingBuffer(32)
 	attached := make(chan struct{})
 	close(attached)
-	dc.commands.Store("cmd-live", &runningCommand{execID: "exec-payload", sandboxID: "container-1", cmd: []string{"sleep", "30"}, cancel: func() {}, stdout: stdout, stderr: stderr, done: make(chan struct{}), attached: attached})
+	rc := &runningCommand{execID: "exec-payload", sandboxID: "container-1", cmd: []string{"sleep", "30"}, cancel: func() {}, stdout: stdout, stderr: stderr, done: make(chan struct{}), attached: attached}
+	setFakeGuestIdentity(rc, 4321, 987654, nil)
+	dc.commands.Store("cmd-live", rc)
 	if _, err := dc.KillCommand(ctx, "container-1", "cmd-live", 15); err != nil {
 		t.Fatalf("KillCommand() running command error: %v", err)
 	}
@@ -1315,6 +1645,9 @@ func TestDockerKillHonorsContextWhileWaitingForPayloadCompletion(t *testing.T) {
 		done:      make(chan struct{}),
 		attached:  attached,
 	})
+	if value, ok := dc.commands.Load("cmd-running"); ok {
+		setFakeGuestIdentity(value.(*runningCommand), 4321, 987654, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	if _, err := dc.KillCommand(ctx, "container-1", "cmd-running", 15); !errors.Is(err, context.DeadlineExceeded) {
@@ -1503,6 +1836,85 @@ func TestDockerKillDoesNotSignalOrReportSuccessWhenPayloadAttachStartFails(t *te
 	}
 }
 
+func TestDockerKillWaitsForWrapperIdentityBeforeCreatingSignalExec(t *testing.T) {
+	trace := &execStartupFixture{
+		blockPayloadIdentity: true,
+		identityEntered:      make(chan struct{}),
+		releaseIdentity:      make(chan struct{}),
+		payloadRunning:       true,
+		payloadWasStarted:    true,
+		payloadPID:           4321,
+	}
+	dc, fixture, command := startFakePayloadExec(t, trace)
+	select {
+	case <-trace.payloadStartEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("payload did not enter its attach barrier")
+	}
+	trace.releaseStart()
+	select {
+	case <-trace.identityEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wrapper did not reach the withheld identity record")
+	}
+	rc := waitForFakeExecAttached(t, dc, command.ID)
+	if !inspectFakePayloadRunning(t, dc) {
+		t.Fatal("payload should be Running while its identity record is withheld")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err := dc.KillCommand(ctx, "container-1", command.ID, 15)
+	cancel()
+	fixture.mu.Lock()
+	signals, stillRunning := trace.signalExecCreates, trace.payloadRunning
+	fixture.mu.Unlock()
+	if !errors.Is(err, context.DeadlineExceeded) || signals != 0 || !stillRunning {
+		t.Fatalf("pre-identity kill: err=%v helpers=%d payloadRunning=%t; want timeout without signal", err, signals, stillRunning)
+	}
+	trace.releaseIdentityPreamble()
+	select {
+	case <-rc.identityReady:
+	case <-time.After(time.Second):
+		t.Fatal("identity readiness was not published after releasing its record")
+	}
+	if _, err := dc.KillCommand(context.Background(), "container-1", command.ID, 15); err != nil {
+		t.Fatalf("kill after identity became ready: %v", err)
+	}
+	fixture.mu.Lock()
+	signals, stillRunning = trace.signalExecCreates, trace.payloadRunning
+	fixture.mu.Unlock()
+	if signals != 1 || stillRunning {
+		t.Fatalf("post-readiness kill helpers=%d payloadRunning=%t", signals, stillRunning)
+	}
+}
+
+func TestDockerKillRejectsSignalHelperExitWithoutAck(t *testing.T) {
+	trace := &execStartupFixture{}
+	dc, fixture, command := startFakePayloadExec(t, trace)
+	select {
+	case <-trace.payloadStartEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("payload did not enter its attach barrier")
+	}
+	trace.releaseStart()
+	waitForFakeExecAttached(t, dc, command.ID)
+	if !inspectFakePayloadRunning(t, dc) {
+		t.Fatal("payload is not running before missing-ack test")
+	}
+	fixture.mu.Lock()
+	fixture.signalNoAck = true
+	fixture.mu.Unlock()
+	if _, err := dc.KillCommand(context.Background(), "container-1", command.ID, 15); err == nil || !strings.Contains(err.Error(), "invalid helper acknowledgment") {
+		t.Fatalf("missing signal acknowledgment error=%v; helper exit zero must not confirm success", err)
+	}
+	fixture.mu.Lock()
+	creates := trace.signalExecCreates
+	targets := append([]int(nil), fixture.signalTargets...)
+	fixture.mu.Unlock()
+	if creates != 1 || !reflect.DeepEqual(targets, []int{4321}) {
+		t.Fatalf("missing-ack helper trace creates=%d targeted guest pids=%v", creates, targets)
+	}
+}
+
 func TestDockerKillWaitsWhileExecAttachIsUpgradedButPayloadIsNotRunning(t *testing.T) {
 	race := execStartupFixture{
 		payloadWaitForRunningRelease: true,
@@ -1643,7 +2055,7 @@ func TestDockerKillPropagatesSignalStartFailureAndNonzeroExit(t *testing.T) {
 		want       string
 	}{
 		{name: "signal ExecStart error", startError: true, want: "500"},
-		{name: "signal exec nonzero exit", exitCode: 9, want: "command signal failed"},
+		{name: "signal exec nonzero exit", exitCode: 9, want: "was not confirmed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			race := execStartupFixture{signalExecExitCode: tc.exitCode}
@@ -1680,83 +2092,145 @@ func TestDockerKillPropagatesSignalStartFailureAndNonzeroExit(t *testing.T) {
 	}
 }
 
-func TestDockerKillPassesLiteralRegexMetacharactersAsDirectPkillArguments(t *testing.T) {
-	dc, fixture := newDockerFixture(t)
-	race := &execStartupFixture{
-		payloadStartEntered: make(chan struct{}),
-		releasePayloadStart: make(chan struct{}),
-		payloadStarted:      make(chan struct{}),
-		payloadStartFailed:  make(chan struct{}),
-		finishPayload:       make(chan struct{}),
-		payloadRunning:      true,
-		payloadWasStarted:   true,
-		payloadPID:          4321,
-	}
-	fixture.mu.Lock()
-	fixture.execStartup = race
-	fixture.mu.Unlock()
-	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
-		t.Fatal(err)
-	}
-	original := []string{"node", "-e", "emit (a|b)[x]+?\\$HOME 'single' \"double\" `ticks`"}
-	argsJSON, err := json.Marshal(original[1:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dc.repo.SaveCommand(database.Command{ID: "cmd-literal", SandboxID: "container-1", Name: original[0], Args: string(argsJSON)}); err != nil {
-		t.Fatal(err)
-	}
-	attached := make(chan struct{})
-	close(attached)
-	dc.commands.Store("cmd-literal", &runningCommand{
-		execID:    "exec-payload",
-		sandboxID: "container-1",
-		cmd:       original,
-		cancel:    func() {},
-		stdout:    newRingBuffer(32),
-		stderr:    newRingBuffer(32),
-		done:      make(chan struct{}),
-		attached:  attached,
-	})
-	if _, err := dc.KillCommand(context.Background(), "container-1", "cmd-literal", 15); err != nil {
-		t.Fatalf("KillCommand() literal command: %v", err)
-	}
-	fixture.mu.Lock()
-	if len(fixture.execOptions) == 0 {
-		fixture.mu.Unlock()
-		t.Fatal("KillCommand() did not create a native signal exec")
-	}
-	lastOptions := fixture.execOptions[len(fixture.execOptions)-1]
-	fixture.mu.Unlock()
-	var signalExec struct {
-		Cmd []string `json:"Cmd"`
-	}
-	if err := json.Unmarshal([]byte(lastOptions), &signalExec); err != nil {
-		t.Fatal(err)
-	}
-	if len(signalExec.Cmd) != 5 || signalExec.Cmd[0] != "pkill" || signalExec.Cmd[1] != "-15" || signalExec.Cmd[2] != "-f" || signalExec.Cmd[3] != "--" {
-		t.Fatalf("signal command must be direct pkill argv without a shell: %q", signalExec.Cmd)
-	}
-	pattern := signalExec.Cmd[4]
-	if !strings.HasPrefix(pattern, "^") || !strings.HasSuffix(pattern, "$") {
-		t.Fatalf("literal pkill expression is not anchored: %q", pattern)
-	}
-	compiled, err := regexp.Compile(pattern)
-	if err != nil {
-		t.Fatalf("literal argv pattern is not POSIX-ERE-compatible for this fixture: %q: %v", pattern, err)
-	}
-	joined := strings.Join(original, " ")
-	if !compiled.MatchString(joined) {
-		t.Fatalf("escaped signal expression did not match original argv %q: %q", joined, pattern)
-	}
-	for _, nearby := range []string{
-		strings.Replace(joined, "a|b", "a|c", 1),
-		strings.Replace(joined, "$HOME", "HOME", 1),
-		strings.Replace(joined, "ticks", "tick", 1),
+func TestDockerKillDoesNotConfirmSignalWithoutExactHelperAcknowledgment(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config func(*dockerAPIFixture)
+	}{
+		{"missing acknowledgment", func(f *dockerAPIFixture) { f.signalNoAck = true }},
+		{"wrong guest identity acknowledgment", func(f *dockerAPIFixture) { f.signalHelperStdout = "OPENSBX_SIGNAL 9999 987654 15\n" }},
+		{"unexpected helper stderr", func(f *dockerAPIFixture) { f.signalHelperStderr = "warning\n" }},
 	} {
-		if compiled.MatchString(nearby) {
-			t.Errorf("literal signal expression matched nearby command line %q with pattern %q", nearby, pattern)
+		t.Run(tc.name, func(t *testing.T) {
+			trace := &execStartupFixture{}
+			dc, fixture, command := startFakePayloadExec(t, trace)
+			select {
+			case <-trace.payloadStartEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("payload did not enter its attach barrier")
+			}
+			trace.releaseStart()
+			waitForFakeExecAttached(t, dc, command.ID)
+			if !inspectFakePayloadRunning(t, dc) {
+				t.Fatal("payload is not running before invalid-ack signal case")
+			}
+			fixture.mu.Lock()
+			tc.config(fixture)
+			fixture.mu.Unlock()
+			if _, err := dc.KillCommand(context.Background(), "container-1", command.ID, 15); err == nil || !strings.Contains(err.Error(), "invalid helper acknowledgment") {
+				t.Fatalf("invalid signal helper response = %v; must not confirm success", err)
+			}
+			fixture.mu.Lock()
+			created := trace.signalExecCreates
+			targets := append([]int(nil), fixture.signalTargets...)
+			fixture.mu.Unlock()
+			if created != 1 || !reflect.DeepEqual(targets, []int{4321}) {
+				t.Fatalf("invalid-ack native helper trace creates=%d targeted guest pids=%v", created, targets)
+			}
+		})
+	}
+}
+
+func TestDockerKillUsesGuestIdentityAndPreservesWrappedExecData(t *testing.T) {
+	trace := &execStartupFixture{guestPID: 7777, guestStart: 555123}
+	cwd := "/work/with spaces"
+	payload := []string{"node", "-e", "emit (a|b)[x]+?\\$HOME 'single' \"double\" `ticks`", "", "--help", "line\nnext", "$(touch /tmp/not-executed)"}
+	env := map[string]string{"ENV": "hook; value", "BASH_ENV": "hook $(false)", "A_KEY": "value; $(false) 'quoted'"}
+	dc, fixture, command := startFakeCommandExecWithImageEnv(t, trace, runtimeio.ExecCommandRequest{Command: payload[0], Args: payload[1:], Cwd: cwd, Env: env}, []string{"BASE=image", "A_KEY=container"})
+	select {
+	case <-trace.payloadStartEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wrapped payload did not enter its deterministic attach barrier")
+	}
+	trace.releaseStart()
+	rc := waitForFakeExecAttached(t, dc, command.ID)
+	if pid, start, err := dc.waitGuestIdentity(context.Background(), rc); err != nil || pid != 7777 || start != 555123 {
+		t.Fatalf("published wrapped guest identity = %d/%d err=%v", pid, start, err)
+	}
+	if host := inspectFakePayload(t, dc); host.PID != 4321 || host.PID == 7777 {
+		t.Fatalf("fixture must distinguish Docker host startup PID from guest identity: %+v", host)
+	}
+
+	// Create a live sibling with the same guest argv but a distinct identity.
+	const siblingID = "cmd-identical-sibling"
+	argsJSON, _ := json.Marshal(payload[1:])
+	if err := dc.repo.SaveCommand(database.Command{ID: siblingID, SandboxID: "container-1", Name: payload[0], Args: string(argsJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	siblingDone := make(chan struct{})
+	siblingAttached := make(chan struct{})
+	close(siblingAttached)
+	sibling := &runningCommand{execID: "exec-sibling", sandboxID: "container-1", cmd: append([]string(nil), payload...), cancel: func() {}, stdout: newRingBuffer(32), stderr: newRingBuffer(32), done: siblingDone, attached: siblingAttached}
+	setFakeGuestIdentity(sibling, 8888, 555124, nil)
+	dc.commands.Store(siblingID, sibling)
+	fixture.mu.Lock()
+	fixture.guestProcesses[8888] = fakeGuestProcess{Start: 555124, Running: true}
+	fixture.mu.Unlock()
+
+	if _, err := dc.KillCommand(context.Background(), "container-1", command.ID, 15); err != nil {
+		t.Fatalf("KillCommand() for one identical-argv command: %v", err)
+	}
+	finished, err := dc.WaitCommand(context.Background(), "container-1", command.ID)
+	if err != nil || finished.ExitCode == nil || *finished.ExitCode != 143 {
+		t.Fatalf("selected command terminal detail=%+v err=%v; want SIGTERM exit", finished, err)
+	}
+	fixture.mu.Lock()
+	selected, siblingState := fixture.guestProcesses[7777], fixture.guestProcesses[8888]
+	targets := append([]int(nil), fixture.signalTargets...)
+	creates := append([]dockerExecCreate(nil), fixture.execCreates...)
+	fixture.mu.Unlock()
+	if selected.Running || !siblingState.Running || !reflect.DeepEqual(targets, []int{7777}) {
+		t.Fatalf("signal isolation failed: selected=%+v sibling=%+v targets=%v", selected, siblingState, targets)
+	}
+
+	var probe, wrapped, signal *dockerExecCreate
+	for i := range creates {
+		record := &creates[i]
+		switch record.Kind {
+		case "probe":
+			probe = record
+		case "payload":
+			wrapped = record
+		case "signal":
+			signal = record
 		}
+	}
+	if probe == nil || wrapped == nil || signal == nil {
+		t.Fatalf("native helper roles were not distinguished: %#v", creates)
+	}
+	internalEnv := []string{"A_KEY=value; $(false) 'quoted'", "ENV=", "BASH_ENV="}
+	if probe.Cmd[2] != identityProbeScript || probe.Cmd[3] != "opensbx-probe" || probe.Cmd[4] != command.ID || probe.WorkingDir != cwd || !reflect.DeepEqual(probe.Env, internalEnv) {
+		t.Fatalf("probe exec lost nonce/cwd contract: %+v", *probe)
+	}
+	if wrapped.Cmd[3] != "opensbx-command" || wrapped.Cmd[4] != command.ID || wrapped.WorkingDir != cwd || wrapped.Cmd[2] != identityWrapperScript {
+		t.Fatalf("wrapped payload helper metadata changed: %+v", *wrapped)
+	}
+	separator := -1
+	for i, arg := range wrapped.Cmd {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 || !reflect.DeepEqual(wrapped.Cmd[separator+1:], payload) {
+		t.Fatalf("guest argv after wrapper separator = %#v, want %#v", wrapped.Cmd[separator+1:], payload)
+	}
+	if !reflect.DeepEqual(wrapped.Cmd[5:separator], []string{"A_KEY=value; $(false) 'quoted'", "BASE=image", "BASH_ENV=hook $(false)", "ENV=hook; value"}) {
+		t.Fatalf("wrapper did not carry the effective sorted original environment as data: %#v", wrapped.Cmd[5:separator])
+	}
+	for _, untrusted := range []string{payload[2], payload[4], payload[5], env["A_KEY"], env["ENV"], env["BASH_ENV"]} {
+		if strings.Contains(wrapped.Cmd[2], untrusted) {
+			t.Fatalf("untrusted argument/environment was interpolated into wrapper source: %q", untrusted)
+		}
+	}
+	if !reflect.DeepEqual(wrapped.Env, internalEnv) {
+		t.Fatalf("internal payload hook-suppression environment = %#v", wrapped.Env)
+	}
+	if signal.Cmd[3] != "opensbx-signal" || !reflect.DeepEqual(signal.Cmd[4:], []string{"7777", "555123", "15"}) || !reflect.DeepEqual(signal.Env, []string{"ENV=", "BASH_ENV="}) {
+		t.Fatalf("signal helper did not carry the one verified guest identity: %+v", *signal)
+	}
+	if strings.Contains(signal.Cmd[2], payload[2]) || strings.Contains(signal.Cmd[2], env["A_KEY"]) {
+		t.Fatal("payload-controlled text was interpolated into signal helper source")
 	}
 }
 
@@ -1825,6 +2299,14 @@ func TestDockerKillPropagatesSignalStreamContextCancellation(t *testing.T) {
 }
 
 func startFakePayloadExec(t *testing.T, trace *execStartupFixture) (*Client, *dockerAPIFixture, runtimeio.CommandDetail) {
+	return startFakeCommandExec(t, trace, runtimeio.ExecCommandRequest{Command: "sleep", Args: []string{"3600"}})
+}
+
+func startFakeCommandExec(t *testing.T, trace *execStartupFixture, request runtimeio.ExecCommandRequest) (*Client, *dockerAPIFixture, runtimeio.CommandDetail) {
+	return startFakeCommandExecWithImageEnv(t, trace, request, nil)
+}
+
+func startFakeCommandExecWithImageEnv(t *testing.T, trace *execStartupFixture, request runtimeio.ExecCommandRequest, imageEnv []string) (*Client, *dockerAPIFixture, runtimeio.CommandDetail) {
 	t.Helper()
 	if trace.payloadStartEntered == nil {
 		trace.payloadStartEntered = make(chan struct{})
@@ -1844,6 +2326,7 @@ func startFakePayloadExec(t *testing.T, trace *execStartupFixture) (*Client, *do
 	dc, fixture := newDockerFixture(t)
 	fixture.mu.Lock()
 	fixture.execStartup = trace
+	fixture.containerEnv = append([]string(nil), imageEnv...)
 	fixture.mu.Unlock()
 	if err := dc.repo.Save(database.Sandbox{ID: "container-1", Name: "demo"}); err != nil {
 		t.Fatal(err)
@@ -1853,6 +2336,7 @@ func startFakePayloadExec(t *testing.T, trace *execStartupFixture) (*Client, *do
 		trace.releaseRunning()
 		trace.releasePID()
 		trace.releaseSignal()
+		trace.releaseIdentityPreamble()
 		fixture.mu.Lock()
 		trace.payloadRunning = false
 		if trace.payloadExitCode == 0 {
@@ -1861,7 +2345,7 @@ func startFakePayloadExec(t *testing.T, trace *execStartupFixture) (*Client, *do
 		fixture.mu.Unlock()
 		trace.finishOnce.Do(func() { close(trace.finishPayload) })
 	})
-	command, err := dc.ExecCommand(context.Background(), "container-1", runtimeio.ExecCommandRequest{Command: "sleep", Args: []string{"3600"}})
+	command, err := dc.ExecCommand(context.Background(), "container-1", request)
 	if err != nil {
 		t.Fatalf("create fake payload exec: %v", err)
 	}

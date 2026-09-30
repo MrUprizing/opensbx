@@ -29,6 +29,14 @@ type lockedLog struct {
 	buf bytes.Buffer
 }
 
+type processChunkCapture struct{ chunks chan []byte }
+
+func (w processChunkCapture) Write(p []byte) (int, error) {
+	chunk := append([]byte(nil), p...)
+	w.chunks <- chunk
+	return len(p), nil
+}
+
 func (l *lockedLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -42,6 +50,7 @@ func (l *lockedLog) text() string {
 
 type harness struct {
 	root, bin, runtime, data, endpoint, key, platform string
+	cliSandboxID                                      string
 	cmd                                               *exec.Cmd
 	done                                              chan struct{}
 	waitErr                                           error
@@ -231,6 +240,25 @@ func (h *harness) cli(t *testing.T, args ...string) []byte {
 	b, err := cmd.CombinedOutput()
 	require.NoError(t, err, "image CLI %v: %s", args, b)
 	return b
+}
+
+func (h *harness) commandCLI(t *testing.T, input []byte, args ...string) ([]byte, []byte, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	endpoint := strings.TrimPrefix(h.endpoint, "http://")
+	args = append([]string{"--addr", endpoint}, args...)
+	cmd := exec.CommandContext(ctx, h.bin, args...)
+	cmd.Dir = h.root
+	cmd.Env = append(cleanEnv(), "API_KEY="+h.key)
+	cmd.Stdin = bytes.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return stdout.Bytes(), stderr.Bytes(), ctx.Err()
+	}
+	return stdout.Bytes(), stderr.Bytes(), err
 }
 
 // curl implements localhost routing itself. Pass the exact public URL, without

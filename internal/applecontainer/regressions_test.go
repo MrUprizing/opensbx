@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"opensbx/internal/database"
 	"opensbx/internal/runtimeio"
+	"opensbx/internal/sandbox"
 )
 
 // synchronizedRunner records argv safely across concurrent backend operations.
@@ -287,13 +288,14 @@ func TestCommandLogAPIReturnsNewest256KiBPerStream(t *testing.T) {
 	}
 	defer outReader.Close()
 	defer errReader.Close()
-	outBytes, err := io.ReadAll(outReader)
-	if err != nil || string(outBytes) != wantOut {
-		t.Fatalf("bounded stdout stream length=%d err=%v", len(outBytes), err)
+	frame := make([]byte, commandLogLimit+1)
+	n, err := outReader.Read(frame)
+	if n != 0 || !errors.Is(err, sandbox.ErrLogTruncated) {
+		t.Fatalf("stdout stream after retention loss returned bytes=%d err=%v; want truncation", n, err)
 	}
-	errBytes, err := io.ReadAll(errReader)
-	if err != nil || string(errBytes) != wantErr {
-		t.Fatalf("bounded stderr stream length=%d err=%v", len(errBytes), err)
+	n, err = errReader.Read(frame)
+	if n != 0 || !errors.Is(err, sandbox.ErrLogTruncated) {
+		t.Fatalf("stderr stream after retention loss returned bytes=%d err=%v; want truncation", n, err)
 	}
 }
 

@@ -3,6 +3,8 @@ package docker
 import (
 	"io"
 	"sync"
+
+	"opensbx/internal/sandbox"
 )
 
 // ringBuffer is a fixed-size circular buffer for command stdout/stderr.
@@ -14,6 +16,7 @@ type ringBuffer struct {
 	written int  // total bytes written (monotonic, may exceed size)
 	closed  bool // set when no more writes will happen
 	cond    *sync.Cond
+	readErr error // terminal source failure, returned only after retained data
 }
 
 const defaultRingSize = 1 << 20 // 1MB
@@ -36,7 +39,11 @@ func (r *ringBuffer) Write(p []byte) (int, error) {
 	n := len(p)
 	if n >= r.size {
 		// Data exceeds buffer size; keep only the last `size` bytes.
-		copy(r.buf, p[n-r.size:])
+		// Align the retained tail with the monotonic write position, not index 0.
+		start := (r.written + n) % r.size
+		tail := p[n-r.size:]
+		copy(r.buf[start:], tail[:r.size-start])
+		copy(r.buf[:start], tail[r.size-start:])
 		r.written += n
 		r.cond.Broadcast()
 		return n, nil
@@ -58,9 +65,16 @@ func (r *ringBuffer) Write(p []byte) (int, error) {
 
 // Close marks the buffer as done, waking all waiting readers.
 func (r *ringBuffer) Close() {
+	r.closeWithError(nil)
+}
+
+func (r *ringBuffer) closeWithError(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
+	if r.readErr == nil {
+		r.readErr = err
+	}
 	r.cond.Broadcast()
 }
 
@@ -99,6 +113,9 @@ type ringReader struct {
 }
 
 func (rr *ringReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	rr.ring.mu.Lock()
 	defer rr.ring.mu.Unlock()
 
@@ -107,9 +124,10 @@ func (rr *ringReader) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// If our read position has fallen behind the buffer's oldest data, skip ahead.
+		// Never present an overwritten tail (possibly starting mid-rune) as a
+		// complete stream. Initial attachment and active overrun both fail closed.
 		if rr.ring.written > rr.ring.size && rr.pos < rr.ring.written-rr.ring.size {
-			rr.pos = rr.ring.written - rr.ring.size
+			return 0, sandbox.ErrLogTruncated
 		}
 
 		available := rr.ring.written - rr.pos
@@ -133,6 +151,9 @@ func (rr *ringReader) Read(p []byte) (int, error) {
 		}
 
 		if rr.ring.closed {
+			if rr.ring.readErr != nil {
+				return 0, rr.ring.readErr
+			}
 			return 0, io.EOF
 		}
 
@@ -145,5 +166,8 @@ func (rr *ringReader) Close() error {
 	rr.ring.mu.Lock()
 	defer rr.ring.mu.Unlock()
 	rr.closed = true
+	// The condition is shared: wake all readers so this one's blocked Read can
+	// observe its own closed flag. Other readers recheck their independent state.
+	rr.ring.cond.Broadcast()
 	return nil
 }

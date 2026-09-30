@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ func TestEndToEnd(t *testing.T) {
 	}{
 		{"AuthenticationAndOrigins", h.authentication},
 		{"ImagesPullExportImport", h.images},
+		{"CLITransportWorkflow", h.cliWorkflow},
 		{"SandboxCommandsFilesDomainAndLifecycle", h.sandboxWorkflow},
 		{"ExpirationRenewal", h.expiration},
 		{"ConcurrentSandboxOperations", h.concurrentOperations},
@@ -107,6 +109,182 @@ func (h *harness) images(t *testing.T) {
 	imported, err := store.Resolve(ctx, importedImage, *platform)
 	require.NoError(t, err)
 	require.Equal(t, artifact.Manifest.Digest, imported.Manifest.Digest, "archive round trip must retain the executable artifact")
+}
+
+func (h *harness) cliWorkflow(t *testing.T) {
+	unauthenticated := exec.Command(h.bin, "--addr", strings.TrimPrefix(h.endpoint, "http://"), "ls")
+	unauthenticated.Dir = h.root
+	unauthenticated.Env = cleanEnv()
+	unauthenticatedOutput, unauthenticatedErr := unauthenticated.CombinedOutput()
+	require.Error(t, unauthenticatedErr, "management CLI must not bypass API authentication")
+	require.Contains(t, string(unauthenticatedOutput), "HTTP 401")
+
+	created, stderr, err := h.commandCLI(t, nil, "create", importedImage, "--ttl", "300s", "--quiet")
+	require.NoError(t, err, "CLI create stderr=%s", stderr)
+	id := strings.TrimSpace(string(created))
+	require.NotEmpty(t, id)
+	h.cliSandboxID = id
+	require.NoError(t, h.captureOwnership())
+	require.Contains(t, h.owned, id)
+
+	var detail models.SandboxDetail
+	h.api(t, "GET", "/v1/sandboxes/"+id, nil, 200, &detail)
+	require.Equal(t, id, detail.ID, "API must inspect the resource created by CLI")
+	listed, stderr, err := h.commandCLI(t, nil, "ls", "--json")
+	require.NoError(t, err, "CLI list stderr=%s", stderr)
+	require.Contains(t, string(listed), id)
+
+	// Exact empty and large Unicode text cross the CLI HTTP transport and remain
+	// observable through the independent REST interface without newline changes.
+	for name, content := range map[string][]byte{
+		"empty.txt": nil,
+		"large.txt": []byte(strings.Repeat("a", 70*1024) + "終€"),
+	} {
+		path := "/tmp/cli-" + name
+		stdout, stderr, err := h.commandCLI(t, content, "file", "write", id, path)
+		require.NoError(t, err, "CLI file write %s stdout=%s stderr=%s", name, stdout, stderr)
+		var read models.FileReadResponse
+		h.api(t, "GET", "/v1/sandboxes/"+id+"/files?path="+url.QueryEscape(path), nil, 200, &read)
+		require.Equal(t, string(content), read.Content)
+		stdout, stderr, err = h.commandCLI(t, nil, "file", "read", id, path)
+		require.NoError(t, err, "CLI file read %s stderr=%s", name, stderr)
+		require.Equal(t, string(content), string(stdout), "CLI read must not add a newline")
+	}
+
+	// Foreground JSON is exactly one final object even when the guest exits nonzero.
+	stdout, stderr, err := h.commandCLI(t, nil, "exec", id, "--json", "--", "sh", "-c", "printf out; printf err >&2; exit 7")
+	var guestExit *exec.ExitError
+	require.ErrorAs(t, err, &guestExit, "foreground exec must propagate guest status; stdout=%s stderr=%s", stdout, stderr)
+	require.Equal(t, 7, guestExit.ExitCode(), "foreground exec exit mismatch stdout=%s stderr=%s", stdout, stderr)
+	var result struct {
+		Command models.CommandDetail `json:"command"`
+		Stdout  string               `json:"stdout"`
+		Stderr  string               `json:"stderr"`
+	}
+	require.NoError(t, json.Unmarshal(stdout, &result), "JSON stdout must contain one complete result: %s", stdout)
+	require.Equal(t, "out", result.Stdout)
+	require.Equal(t, "err", result.Stderr)
+	require.NotEmpty(t, result.Command.ID)
+	require.NotNil(t, result.Command.ExitCode)
+	require.Equal(t, 7, *result.Command.ExitCode)
+
+	// Follow a command whose log stream is initially silent for longer than the
+	// stream-header budget, then emits unterminated chunks while still running.
+	streamCommand, stderr, err := h.commandCLI(t, nil, "exec", id, "--detach", "--quiet", "--", "sh", "-c", "sleep 13; printf partial; sleep 2; printf '終€'")
+	require.NoError(t, err, "silent detached exec stderr=%s", stderr)
+	streamID := strings.TrimSpace(string(streamCommand))
+	require.NotEmpty(t, streamID)
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer streamCancel()
+	streamArgs := []string{"--addr", strings.TrimPrefix(h.endpoint, "http://"), "logs", id, streamID, "--follow"}
+	streamCLI := exec.CommandContext(streamCtx, h.bin, streamArgs...)
+	streamCLI.Dir = h.root
+	streamCLI.Env = append(cleanEnv(), "API_KEY="+h.key)
+	chunks := make(chan []byte, 16)
+	var streamStderr lockedLog
+	streamCLI.Stdout, streamCLI.Stderr = processChunkCapture{chunks: chunks}, &streamStderr
+	require.NoError(t, streamCLI.Start())
+	streamDone := make(chan error, 1)
+	go func() { streamDone <- streamCLI.Wait() }()
+	select {
+	case data := <-chunks:
+		t.Fatalf("follow emitted guest data during the expected silent interval: %q", data)
+	case err := <-streamDone:
+		t.Fatalf("silent log observer exited before guest output: %v stderr=%q", err, streamStderr.text())
+	case <-time.After(10*time.Second + 500*time.Millisecond):
+	}
+	var stillRunning models.CommandResponse
+	h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+streamID, nil, 200, &stillRunning)
+	require.Nil(t, stillRunning.Command.ExitCode, "long-silent guest must remain active after stream headers were received")
+	var streamed strings.Builder
+	select {
+	case data := <-chunks:
+		streamed.Write(data)
+	case err := <-streamDone:
+		require.NoError(t, err, "follow exited before first partial chunk; stderr=%s", streamStderr.text())
+	case <-time.After(5 * time.Second):
+		streamCancel()
+		t.Fatal("follow did not emit partial log bytes after the silent interval")
+	}
+	var partialStillRunning models.CommandResponse
+	h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+streamID, nil, 200, &partialStillRunning)
+	require.Nil(t, partialStillRunning.Command.ExitCode, "partial output must arrive before the command completes")
+	streamEnded := false
+	for !streamEnded {
+		select {
+		case data := <-chunks:
+			streamed.Write(data)
+		case err := <-streamDone:
+			require.NoError(t, err, "follow stderr=%s", streamStderr.text())
+			streamEnded = true
+		case <-time.After(20 * time.Second):
+			streamCancel()
+			t.Fatal("follow did not complete after the guest closed its log streams")
+		}
+	}
+	for {
+		select {
+		case data := <-chunks:
+			streamed.Write(data)
+		default:
+			goto streamCollected
+		}
+	}
+streamCollected:
+	require.Equal(t, "partial終€", streamed.String(), "raw follow concatenation must preserve unterminated Unicode output")
+	var streamFinished models.CommandResponse
+	h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+streamID, nil, 200, &streamFinished)
+	require.NotNil(t, streamFinished.Command.ExitCode)
+	require.Zero(t, *streamFinished.Command.ExitCode)
+
+	// A separate interactive command remains detachable, killable and waitable.
+	commandID, stderr, err := h.commandCLI(t, nil, "exec", id, "--detach", "--quiet", "--", "sleep", "60")
+	require.NoError(t, err, "detached exec stderr=%s", stderr)
+	commandIDText := strings.TrimSpace(string(commandID))
+	require.NotEmpty(t, commandIDText)
+	_, stderr, err = h.commandCLI(t, nil, "command", "kill", id, commandIDText, "--signal", "TERM")
+	require.NoError(t, err, "command kill stderr=%s", stderr)
+	_, stderr, err = h.commandCLI(t, nil, "command", "wait", id, commandIDText)
+	var waitExit *exec.ExitError
+	require.ErrorAs(t, err, &waitExit, "wait must return the guest's nonzero status; stderr=%s", stderr)
+	require.NotZero(t, waitExit.ExitCode())
+
+	// Identical guest argv must not make a targeted kill affect its sibling.
+	firstDuplicate := h.command(t, id, "sleep", "60")
+	siblingDuplicate := h.command(t, id, "sleep", "60")
+	_, stderr, err = h.commandCLI(t, nil, "command", "kill", id, firstDuplicate.ID, "--signal", "TERM")
+	require.NoError(t, err, "supported node:25-alpine image must permit precise command signaling; stderr=%s", stderr)
+	eventually(t, 5*time.Second, "the selected duplicate command must finish", func() (bool, string) {
+		status := h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+firstDuplicate.ID, nil, 200, nil)
+		var result models.CommandResponse
+		if err := json.Unmarshal(status, &result); err != nil {
+			return false, err.Error()
+		}
+		return result.Command.ExitCode != nil, fmt.Sprintf("selected command=%+v", result.Command)
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		status := h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+siblingDuplicate.ID, nil, 200, nil)
+		var sibling models.CommandResponse
+		require.NoError(t, json.Unmarshal(status, &sibling))
+		require.Nil(t, sibling.Command.ExitCode, "killing one command must leave identical-argv sibling running: %+v", sibling.Command)
+		time.Sleep(50 * time.Millisecond)
+	}
+	h.api(t, "POST", "/v1/sandboxes/"+id+"/cmd/"+siblingDuplicate.ID+"/kill", map[string]int{"signal": 15}, 200, nil)
+	eventually(t, 5*time.Second, "remaining duplicate command cleanup", func() (bool, string) {
+		status := h.api(t, "GET", "/v1/sandboxes/"+id+"/cmd/"+siblingDuplicate.ID, nil, 200, nil)
+		var result models.CommandResponse
+		if err := json.Unmarshal(status, &result); err != nil {
+			return false, err.Error()
+		}
+		return result.Command.ExitCode != nil, fmt.Sprintf("sibling command=%+v", result.Command)
+	})
+
+	// API management of the CLI-owned resource remains visible to CLI callers.
+	h.api(t, "POST", "/v1/sandboxes/"+id+"/stop", nil, 200, nil)
+	_, stderr, err = h.commandCLI(t, nil, "sandbox", "start", id)
+	require.NoError(t, err, "CLI sandbox start stderr=%s", stderr)
+	require.True(t, h.inspect(t, id).Running)
 }
 
 func (h *harness) create(t *testing.T, ports []string) models.CreateSandboxResponse {

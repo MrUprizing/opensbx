@@ -51,6 +51,37 @@ func TestLogReaderClosesAndReturnsEOFAfterBufferedOutput(t *testing.T) {
 	}
 }
 
+func TestLogReaderReportsTruncationOnInitialAttachAndWhenConsumerFallsBehind(t *testing.T) {
+	t.Run("initial attach after overflow", func(t *testing.T) {
+		buffer := &boundedBuffer{limit: 4, tail: true}
+		_, _ = io.WriteString(buffer, "abcdef")
+		r := &logReader{buffer: buffer, done: make(chan struct{}), closed: make(chan struct{})}
+		defer r.Close()
+		data := make([]byte, 8)
+		n, err := r.Read(data)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "truncat") {
+			t.Fatalf("initial read = %q, %v; want an explicit truncation error", data[:n], err)
+		}
+	})
+
+	t.Run("consumer falls behind", func(t *testing.T) {
+		buffer := &boundedBuffer{limit: 4, tail: true}
+		r := &logReader{buffer: buffer, done: make(chan struct{}), closed: make(chan struct{})}
+		defer r.Close()
+		_, _ = io.WriteString(buffer, "ab")
+		first := make([]byte, 2)
+		if n, err := r.Read(first); err != nil || string(first[:n]) != "ab" {
+			t.Fatalf("initial read = %q, %v", first[:n], err)
+		}
+		_, _ = io.WriteString(buffer, "cdefgh")
+		next := make([]byte, 8)
+		n, err := r.Read(next)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "truncat") {
+			t.Fatalf("read after overwrite = %q, %v; want an explicit truncation error", next[:n], err)
+		}
+	})
+}
+
 func TestSafeErrorDoesNotExposeNativeDiagnostics(t *testing.T) {
 	tests := []struct {
 		name string

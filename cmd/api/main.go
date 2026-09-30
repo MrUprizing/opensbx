@@ -15,6 +15,7 @@ import (
 
 	"opensbx/internal/api"
 	"opensbx/internal/applecontainer"
+	"opensbx/internal/cli"
 	"opensbx/internal/config"
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
@@ -25,6 +26,7 @@ import (
 	"opensbx/internal/runtimechoice"
 	"opensbx/internal/runtimeio"
 	"opensbx/internal/service"
+	"opensbx/internal/terminaltext"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofrs/flock"
@@ -48,7 +50,11 @@ import (
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
-		log.Printf("opensbx: %v", err)
+		var exit *cli.ExitError
+		if errors.As(err, &exit) {
+			os.Exit(exit.Code)
+		}
+		fmt.Fprintf(os.Stderr, "opensbx: %s\n", terminaltext.Escape(err.Error(), false))
 		os.Exit(1)
 	}
 }

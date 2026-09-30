@@ -48,6 +48,7 @@ image. Use an isolated Docker daemon for that case.
 | --- | --- |
 | AuthenticationAndOrigins | Health/readiness, valid API key, missing/wrong keys rejected on REST and MCP, foreign Origin rejected |
 | ImagesPullExportImport | Missing image rejected, explicit pull/list/inspect, CLI export/remove/import/inspect, selected OCI manifest preserved |
+| CLITransportWorkflow | Real binary CLI authentication/create/exec/file operations, empty and large Unicode text, guest exit status, detached kill/wait, a >10-second silent `logs --follow`, API/MCP visibility of the CLI-owned resource, and two identical-argv commands where CLI signaling must terminate only the selected command |
 | SandboxCommandsFilesDomainAndLifecycle | Actual running resource and public/native identities, inventory/network/stats, stdout/stderr/exit code, log streaming, kill, file CRUD, app URL, stop/start/restart and file persistence; Docker pause/resume or Apple unsupported response |
 | ExpirationRenewal | Sandbox survives the superseded deadline, then really stops after the renewed deadline; native state confirms the stop |
 | ConcurrentSandboxOperations | Three real sandboxes receive overlapping renew-expiration and exec requests, then each must stay running and return its own successful command result |

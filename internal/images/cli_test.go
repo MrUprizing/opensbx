@@ -88,6 +88,31 @@ func TestImageCLIHelpAliasesShowUsage(t *testing.T) {
 	}
 }
 
+func TestImageCLIInterspersedFlagsAndForcedMissingRemoval(t *testing.T) {
+	archive, platform := testsupport.OCIArchive(t)
+	dataDir := t.TempDir()
+	const ref = "example.test/team/interspersed:latest"
+	var output bytes.Buffer
+	if err := CLI(context.Background(), []string{"import", archive, "-reference", ref, "-data-dir", dataDir, "-platform", platform.String()}, t.TempDir(), &output); err != nil {
+		t.Fatalf("import with flags after positional archive: %v", err)
+	}
+	output.Reset()
+	if err := CLI(context.Background(), []string{"inspect", ref, "--data-dir", dataDir, "--platform", platform.String()}, t.TempDir(), &output); err != nil {
+		t.Fatalf("inspect with flags after positional reference: %v", err)
+	}
+	var inspected cliImageDetail
+	if err := json.Unmarshal(output.Bytes(), &inspected); err != nil || inspected.ID == "" {
+		t.Fatalf("interspersed inspect output=%q decode=%v", output.String(), err)
+	}
+	missing := "example.test/team/not-present:latest"
+	if err := CLI(context.Background(), []string{"remove", missing, "--data-dir", dataDir, "--platform", platform.String()}, t.TempDir(), &output); err == nil {
+		t.Fatal("non-forced remove accepted an absent catalog reference")
+	}
+	if err := CLI(context.Background(), []string{"remove", missing, "--force", "--data-dir", dataDir, "--platform", platform.String()}, t.TempDir(), &output); err != nil {
+		t.Fatalf("forced removal of absent catalog reference: %v", err)
+	}
+}
+
 func TestImageCLIRejectsInvalidCommandArgumentsAndPlatforms(t *testing.T) {
 	for _, args := range [][]string{
 		{"unknown"}, {"unknown", "image"}, {"inspect", "--platform", "linux", "image"}, {"inspect", "--platform", "linux/amd64", "one", "two"},
@@ -128,8 +153,8 @@ func TestImageCLIPropagatesHelpAndFlagOutputFailures(t *testing.T) {
 	}
 	var output bytes.Buffer
 	err := CLI(context.Background(), []string{"list", "--unknown-option"}, t.TempDir(), &output)
-	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
-		t.Fatalf("unknown option error=%v", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown flag") || !strings.Contains(err.Error(), "--unknown-option") {
+		t.Fatalf("Cobra unknown-option error=%v; want an actionable flag diagnostic", err)
 	}
 }
 

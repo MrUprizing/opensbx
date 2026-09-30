@@ -29,5 +29,8 @@ var ErrCommandNotFound = errors.New("command not found")
 // ErrCommandFinished is returned when trying to kill a command that has already exited.
 var ErrCommandFinished = errors.New("command has already finished")
 
+// ErrLogTruncated means a streaming reader missed overwritten retained output.
+var ErrLogTruncated = errors.New("command logs truncated: retained output was overwritten")
+
 var ErrUnsupported = errors.New("runtime capability is unsupported")
 var ErrInvalidInput = errors.New("invalid input")

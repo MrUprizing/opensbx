@@ -56,6 +56,17 @@ func (h *harness) mcpWorkflow(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(text.Text), into))
 		}
 	}
+	if h.cliSandboxID != "" {
+		var fromCLI models.SandboxDetail
+		call("sandbox_get", map[string]any{"id": h.cliSandboxID}, &fromCLI)
+		require.Equal(t, h.cliSandboxID, fromCLI.ID, "MCP must inspect the resource created and used by CLI")
+		call("sandbox_delete", map[string]any{"id": h.cliSandboxID}, nil)
+		h.api(t, "GET", "/v1/sandboxes/"+h.cliSandboxID, nil, 404, nil)
+		states, err := h.inventory()
+		require.NoError(t, err)
+		require.NotContains(t, states, h.owned[h.cliSandboxID], "MCP must delete the same CLI-owned native resource")
+		h.cliSandboxID = ""
+	}
 	var sb models.CreateSandboxResponse
 	call("sandbox_create", map[string]any{"image": importedImage, "timeout": 300}, &sb)
 	require.NoError(t, h.captureOwnership())
