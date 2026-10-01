@@ -42,6 +42,14 @@ cache tag, the suite rejects that ambiguous ownership case before creating a
 sandbox: deleting the new tag could otherwise also remove an existing untagged
 image. Use an isolated Docker daemon for that case.
 
+## Performance data collection
+
+The separate `TestPerformance` requires both `e2e` and `performance` tags and uses
+a native Go HTTP load generator. See [performance documentation](../docs/performance.md)
+for exact commands, bounded settings, report interpretation and sequential
+Docker/Apple runs without race instrumentation. It emits data only, without
+latency thresholds or an automatic CI load job; ordinary E2E runs do not execute it.
+
 ## Scenarios
 
 | Subtest | Assertions |

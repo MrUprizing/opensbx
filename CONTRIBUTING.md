@@ -71,6 +71,14 @@ runtime. The CI Apple job uses the `macos-26` arm64 runner, installs signed Appl
 Container 1.4.1, prepares the recommended kernel and vminit, and stops the
 ephemeral runtime afterward.
 
+## Performance data collection
+
+See [performance commands, prerequisites and measurement scopes](docs/performance.md)
+for runtime-free benchmarks and opt-in Docker/Apple collection. These emit data
+only: no latency thresholds, regression gates, or automatic CI load job. Live
+timing runs use the Go load generator in `e2e` and run sequentially without race
+instrumentation.
+
 ## API documentation
 
 Swagger is generated from annotations in the API handlers. When changing those
