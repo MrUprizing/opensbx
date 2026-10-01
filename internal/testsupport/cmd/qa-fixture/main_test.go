@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -77,8 +78,13 @@ func TestSyntheticFixtureUsesProductionHostRouterAndProxyWithoutRuntimeResources
 }
 
 func TestQAFixtureCommandPrintsBrowserURLsAndShutsDownOnSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the subprocess shutdown assertion sends Unix SIGTERM")
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestQAFixtureProcessHelper$")
-	if coverageDir := flag.Lookup("test.gocoverdir"); coverageDir != nil && coverageDir.Value.String() != "" { cmd.Args = append(cmd.Args, "-test.gocoverdir="+coverageDir.Value.String()) }
+	if coverageDir := flag.Lookup("test.gocoverdir"); coverageDir != nil && coverageDir.Value.String() != "" {
+		cmd.Args = append(cmd.Args, "-test.gocoverdir="+coverageDir.Value.String())
+	}
 	cmd.Env = append(os.Environ(), "OPENSBX_QA_FIXTURE_HELPER=1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -63,8 +63,7 @@ func TestRegistryPolicyAllowsOnlyExplicitOriginAndStripsCredentialsFromStorageCD
 
 func TestDockerHubCloudFrontRedirectAllowsOnlySafeReadsAndStripsSensitiveHeaders(t *testing.T) {
 	var originRequests, cdnRequests int
-	var policy *registryPolicy
-	policy = &registryPolicy{primary: "registry-1.docker.io", hub: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	policy := &registryPolicy{primary: "registry-1.docker.io", hub: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Hostname() {
 		case "registry-1.docker.io":
 			originRequests++

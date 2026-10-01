@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -85,6 +86,9 @@ func TestImageListAndHelpCommandsBypassRuntimeSelection(t *testing.T) {
 }
 
 func TestMainUsesOneLoopbackListenerForControlAndSandboxHosts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("graceful child termination uses Unix SIGTERM")
+	}
 	var engineMu sync.Mutex
 	engineRequests := []string{}
 	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -359,6 +363,9 @@ func TestExplicitApplePreflightFailureOccursBeforeOpeningListeners(t *testing.T)
 }
 
 func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("graceful child termination uses Unix SIGTERM")
+	}
 	db := database.New(":memory:")
 	if err := docker.New(database.NewRepository(db)).Ping(context.Background()); err != nil {
 		if sqlDB, dbErr := db.DB(); dbErr == nil {

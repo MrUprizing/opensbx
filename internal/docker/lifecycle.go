@@ -32,12 +32,6 @@ const (
 	defaultCPUs     = 1.0  // 1 vCPU
 )
 
-// Maximum resource limits (4 vCPU, 8GB RAM)
-const (
-	maxMemoryMB = 8192 // 8GB
-	maxCPUs     = 4.0  // 4 vCPU
-)
-
 // Create creates and starts a sandbox. Docker assigns host ports automatically.
 // Applies optional resource limits and schedules auto-stop with a default TTL of 15 minutes.
 // Returns ErrImageNotFound if the image does not exist locally.
@@ -548,7 +542,7 @@ func (c *Client) lockLifecycle(ctx context.Context) error {
 		if c.lifecycleMu.TryLock() {
 			if c.closing {
 				c.lifecycleMu.Unlock()
-				return errors.New("Docker backend is shutting down")
+				return errors.New("runtime: Docker backend is shutting down")
 			}
 			return nil
 		}

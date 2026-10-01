@@ -52,7 +52,7 @@ func startServer(args []string, out io.Writer) error {
 	}
 	if choice == "container" {
 		if _, err := applecontainer.Resolve(ctx); err != nil {
-			return fmt.Errorf("Apple Container is not ready: %w", err)
+			return fmt.Errorf("runtime: Apple Container is not ready: %w", err)
 		}
 	}
 	if pid, running, err := processctl.Running(cfg.DataDir); err != nil {

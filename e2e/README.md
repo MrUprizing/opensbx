@@ -6,11 +6,21 @@ listener. Runtime operations use actual Docker containers or Apple containers.
 The `e2e` build tag keeps these tests out of `go test ./...`.
 
 CI packages the release archive with GoReleaser, extracts the native artifact,
-and runs this suite against that exact executable with `-race`. Both Docker and
-Apple Container jobs are required; the Apple job provisions its ephemeral
+and runs this suite against that exact executable with a race-instrumented
+harness. The packaged daemon uses `CGO_ENABLED=0`: `go test -race` does **not**
+instrument that child. CI then builds a complementary daemon with
+`CGO_ENABLED=1 go build -race` and runs the suite again using `OPENSBX_E2E_BINARY`,
+sequentially after packaged-run cleanup. Both Docker and Apple Container jobs
+are required; the Apple job provisions its ephemeral
 [GitHub-hosted macOS 26 arm64 runner](https://github.com/actions/runner-images)
 with the pinned signed runtime and kernel prerequisites.
 When `OPENSBX_E2E_BINARY` is unset, local runs build `cmd/api` directly.
+
+CI sets `GORACE=halt_on_error=1 exitcode=66` for the harness; the harness explicitly
+sets the same options on daemon children. Cleanup rejects `WARNING: DATA RACE`
+in every child log (also abrupt kill/restart scenarios), rather than relying
+only on the final daemon exit status. These assertions are separate from building
+the race daemon; hosted execution is not certified by the workflow definition.
 
 ## Run
 

@@ -34,6 +34,7 @@ func TestServerProcessHelper(t *testing.T) {
 func TestStopGracefullySignalsLockedServerAndWaits(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestServerProcessHelper$")
+	configureTestServerCommand(cmd)
 	cmd.Env = append(os.Environ(), "OPENSBX_PROCESSCTL_HELPER=1", "OPENSBX_PROCESSCTL_DIR="+dir)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

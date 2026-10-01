@@ -75,11 +75,11 @@ func (c *Client) sample(ctx context.Context, id string) (statsSample, time.Time,
 	}
 	var samples []statsSample
 	if err := json.Unmarshal(b, &samples); err != nil || len(samples) != 1 {
-		return statsSample{}, at, errors.New("Apple stats sample is missing or invalid")
+		return statsSample{}, at, errors.New("runtime: Apple stats sample is missing or invalid")
 	}
 	s := samples[0]
 	if s.ID != id || s.CPU == nil || s.Memory == nil || s.Limit == nil || s.PIDs == nil || *s.Limit == 0 {
-		return statsSample{}, at, errors.New("Apple stats sample is incomplete")
+		return statsSample{}, at, errors.New("runtime: Apple stats sample is incomplete")
 	}
 	return s, at, nil
 }
@@ -105,7 +105,7 @@ func (c *Client) Stats(ctx context.Context, id string) (runtimeio.SandboxStats, 
 	}
 	elapsed := t2.Sub(t1).Seconds() * 1e6
 	if elapsed <= 0 || *b.CPU < *a.CPU {
-		return result, errors.New("Apple CPU counters reset or sampling clock did not advance")
+		return result, errors.New("runtime: Apple CPU counters reset or sampling clock did not advance")
 	}
 	// Sampling is read-only and holds no lifecycle lock. Reject a result if
 	// ownership disappeared or the sandbox stopped/restarted during sampling.

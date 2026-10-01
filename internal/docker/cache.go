@@ -116,7 +116,7 @@ func (c *Client) Materialize(ctx context.Context, image sandbox.Image) (string, 
 func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir string) (string, error) {
 	h, err := v1.NewHash(id)
 	if err != nil || h.Algorithm != "sha256" || len(h.Hex) != 64 || strings.Trim(h.Hex, "0123456789abcdef") != "" {
-		return "", errors.New("Docker cache has no immutable image ID")
+		return "", errors.New("runtime: Docker cache has no immutable image ID")
 	}
 	// Bind the expected config to the selected source manifest, not just to a
 	// caller-supplied config digest. Docker archives can change compression and
@@ -130,7 +130,7 @@ func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir s
 		return "", err
 	}
 	if manifest.String() != image.ManifestDigest || config.String() != image.ConfigDigest {
-		return "", errors.New("Docker cache source manifest/config mismatch")
+		return "", errors.New("runtime: Docker cache source manifest/config mismatch")
 	}
 	saved, err := c.cli.ImageSave(ctx, []string{id})
 	if err != nil {
@@ -144,6 +144,11 @@ func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir s
 	}
 	n, copyErr := io.Copy(f, io.LimitReader(saved, images.MaxArchiveBytes+1))
 	closeErr := f.Close()
+	// Cancellation can close the HTTP body while Copy is blocked. Preserve the
+	// caller's context error instead of leaking the resulting transport error.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if copyErr != nil {
 		return "", copyErr
 	}
@@ -151,7 +156,7 @@ func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir s
 		return "", closeErr
 	}
 	if n > images.MaxArchiveBytes {
-		return "", errors.New("Docker cache export exceeds disk budget")
+		return "", errors.New("runtime: Docker cache export exceeds disk budget")
 	}
 	exported, err := tarball.ImageFromPath(path, nil)
 	if err != nil {
@@ -162,7 +167,7 @@ func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir s
 		return "", err
 	}
 	if actualConfig != config {
-		return "", errors.New("Docker cache config digest mismatch")
+		return "", errors.New("runtime: Docker cache config digest mismatch")
 	}
 	cfg, err := exported.ConfigFile()
 	if err != nil {
@@ -177,14 +182,14 @@ func (c *Client) verifyCache(ctx context.Context, image sandbox.Image, id, dir s
 		wantVariant = ""
 	}
 	if cfg.OS != image.Platform.OS || cfg.Architecture != image.Platform.Architecture || variant != wantVariant {
-		return "", errors.New("Docker cache platform mismatch")
+		return "", errors.New("runtime: Docker cache platform mismatch")
 	}
 	archiveManifest, err := tarball.LoadManifest(func() (io.ReadCloser, error) { return os.Open(path) })
 	if err != nil {
 		return "", err
 	}
 	if len(archiveManifest) != 1 || cfg.RootFS.Type != "layers" || len(archiveManifest[0].Layers) != len(cfg.RootFS.DiffIDs) {
-		return "", errors.New("Docker cache layer count mismatch")
+		return "", errors.New("runtime: Docker cache layer count mismatch")
 	}
 	if err := verifyCacheLayers(ctx, path, archiveManifest[0].Layers, cfg.RootFS.DiffIDs); err != nil {
 		return "", err
@@ -203,7 +208,7 @@ func verifyCacheLayers(ctx context.Context, path string, paths []string, diffIDs
 	for i, path := range paths {
 		path = strings.TrimPrefix(path, "./")
 		if previous, ok := wanted[path]; ok && previous != diffIDs[i] {
-			return errors.New("Docker cache conflicting layer identities")
+			return errors.New("runtime: Docker cache conflicting layer identities")
 		}
 		wanted[path] = diffIDs[i]
 	}
@@ -228,7 +233,7 @@ func verifyCacheLayers(ctx context.Context, path string, paths []string, diffIDs
 			continue
 		}
 		if seen[entry] || h.Typeflag != tar.TypeReg {
-			return errors.New("Docker cache layers must be unique regular files")
+			return errors.New("runtime: Docker cache layers must be unique regular files")
 		}
 		seen[entry] = true
 		actual, err := cacheLayerHash(ctx, tr)
@@ -236,11 +241,11 @@ func verifyCacheLayers(ctx context.Context, path string, paths []string, diffIDs
 			return err
 		}
 		if actual != want {
-			return errors.New("Docker cache layer content mismatch")
+			return errors.New("runtime: Docker cache layer content mismatch")
 		}
 	}
 	if len(seen) != len(wanted) {
-		return errors.New("Docker cache layer missing")
+		return errors.New("runtime: Docker cache layer missing")
 	}
 	return nil
 }
@@ -266,7 +271,7 @@ func cacheLayerHash(ctx context.Context, input io.Reader) (v1.Hash, error) {
 	}
 	hash, size, err := v1.SHA256(io.LimitReader(cacheContextReader{ctx, r}, images.MaxArchiveBytes+1))
 	if err == nil && size > images.MaxArchiveBytes {
-		err = errors.New("Docker cache expanded layer exceeds budget")
+		err = errors.New("runtime: Docker cache expanded layer exceeds budget")
 	}
 	return hash, err
 }

@@ -421,6 +421,75 @@ type imageDigestError struct {
 
 func (i imageDigestError) Digest() (v1.Hash, error) { return v1.Hash{}, i.err }
 
+var errSyntheticCacheBodyRead = errors.New("synthetic Docker response-body transport error")
+
+type cacheBodyReadGate struct {
+	source      io.ReadCloser
+	entered     chan struct{}
+	closed      chan struct{}
+	release     chan struct{}
+	readFailure chan struct{}
+	readOnce    sync.Once
+	closeOnce   sync.Once
+	readErr     error
+	closeErr    error
+}
+
+func (b *cacheBodyReadGate) Read([]byte) (int, error) {
+	b.readOnce.Do(func() { close(b.entered) })
+	select {
+	case <-b.release:
+	case <-b.closed:
+	}
+	close(b.readFailure)
+	return 0, b.readErr
+}
+
+func (b *cacheBodyReadGate) Close() error {
+	b.closeOnce.Do(func() {
+		close(b.closed)
+		b.closeErr = b.source.Close()
+	})
+	return b.closeErr
+}
+
+type cacheBodyReadGateTransport struct {
+	base http.RoundTripper
+	body *cacheBodyReadGate
+}
+
+func (t *cacheBodyReadGateTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err == nil && request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/images/get") {
+		t.body.source = response.Body
+		response.Body = t.body
+	}
+	return response, err
+}
+
+func newCacheBodyReadGateClient(t *testing.T, image sandbox.Image) (*Client, *dockerAPIFixture, *cacheBodyReadGate) {
+	t.Helper()
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.Proxy = nil
+	t.Cleanup(base.CloseIdleConnections)
+	body := &cacheBodyReadGate{
+		entered:     make(chan struct{}),
+		closed:      make(chan struct{}),
+		release:     make(chan struct{}),
+		readFailure: make(chan struct{}),
+		readErr:     errSyntheticCacheBodyRead,
+	}
+	client, fixture := newDockerFixtureWithRoundTripper(t, &cacheBodyReadGateTransport{base: base, body: body})
+	configureDockerCacheFixture(fixture, image)
+	archive := dockerArchiveForImage(t, image)
+	fixture.mu.Lock()
+	fixture.cacheLoaded = true
+	fixture.loadedArchive = archive
+	fixture.cacheSavedArchive = archive
+	fixture.mu.Unlock()
+	return client, fixture, body
+}
+
 func TestDockerVerifyCachePropagatesDigestAndExportFileErrors(t *testing.T) {
 	image := dockerCacheTestImage(t)
 	client, fixture, _ := seedDockerCacheFixture(t, image)
@@ -431,21 +500,14 @@ func TestDockerVerifyCachePropagatesDigestAndExportFileErrors(t *testing.T) {
 		t.Fatalf("verifyCache() digest error=%v want source read error", err)
 	}
 	missingParent := filepath.Join(t.TempDir(), "missing", "nested")
-	if _, err := client.verifyCache(context.Background(), image, fixture.cacheNativeID, missingParent); err == nil || !strings.Contains(err.Error(), "no such file or directory") {
-		t.Fatalf("verifyCache() export path error=%v want missing-parent error", err)
+	if _, err := client.verifyCache(context.Background(), image, fixture.cacheNativeID, missingParent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verifyCache() export path error=%v want os.ErrNotExist", err)
 	}
 }
 
 func TestDockerMaterializeHonorsCancellationDuringCacheExport(t *testing.T) {
 	image := dockerCacheTestImage(t)
-	client, fixture, archive := seedDockerCacheFixture(t, image)
-	entered, release := make(chan struct{}), make(chan struct{})
-	fixture.mu.Lock()
-	fixture.cacheSaveMode = "block-reader"
-	fixture.cacheSaveEntered = entered
-	fixture.cacheSaveRelease = release
-	fixture.cacheSavedArchive = archive
-	fixture.mu.Unlock()
+	client, _, body := newCacheBodyReadGateClient(t, image)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -453,22 +515,69 @@ func TestDockerMaterializeHonorsCancellationDuringCacheExport(t *testing.T) {
 		done <- err
 	}()
 	select {
-	case <-entered:
+	case <-body.entered:
 	case <-time.After(5 * time.Second):
 		cancel()
-		close(release)
-		t.Fatal("Docker image export did not reach the deterministic blocked reader")
+		t.Fatal("Docker image-save body Read did not reach its synchronization barrier")
 	}
 	cancel()
 	select {
+	case <-body.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceling the caller did not close the image-save response body")
+	}
+	select {
+	case <-body.readFailure:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closed response-body Read did not return the synthetic transport error")
+	}
+	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Materialize() cancellation error=%v want context.Canceled", err)
+			t.Fatalf("Materialize() after response-body transport error=%v, want context.Canceled", err)
+		}
+		if errors.Is(err, errSyntheticCacheBodyRead) {
+			t.Fatalf("Materialize() leaked the transport error instead of caller cancellation: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Docker cache export ignored context cancellation")
+		t.Fatal("Materialize() did not return after its response body was closed")
 	}
-	close(release)
+}
+
+func TestDockerVerifyCachePreservesTransportReadErrorWithActiveContext(t *testing.T) {
+	image := dockerCacheTestImage(t)
+	client, fixture, body := newCacheBodyReadGateClient(t, image)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	dir := t.TempDir()
+	go func() {
+		_, err := client.verifyCache(ctx, image, fixture.cacheNativeID, dir)
+		done <- err
+	}()
+	select {
+	case <-body.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Docker image-save response body was not read")
+	}
+	close(body.release)
+	select {
+	case <-body.readFailure:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active-context read did not return the synthetic transport error")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errSyntheticCacheBodyRead) {
+			t.Fatalf("verifyCache() active-context transport error=%v, want original error %v", err, errSyntheticCacheBodyRead)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifyCache() did not return the active-context transport error")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("fixture unexpectedly canceled caller context: %v", ctx.Err())
+	}
 }
 
 func TestDockerMaterializeDoesNotSerializeDifferentImageCacheExports(t *testing.T) {

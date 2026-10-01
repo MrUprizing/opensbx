@@ -42,11 +42,24 @@ func TestRecoveryQueueAutomaticallyRetriesAfterThirtySeconds(t *testing.T) {
 			t.Fatalf("scheduled intent %q did not run", key)
 		}
 	}
-	queue.mu.Lock()
-	remaining := len(queue.jobs)
-	queue.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("successful scheduled work remained queued: jobs=%d", remaining)
+	// The work callback signals completion immediately before returning; allow
+	// Run to reacquire its lock and remove the final completed job.
+	cleanupDeadline := time.NewTimer(time.Second)
+	defer cleanupDeadline.Stop()
+	cleanupPoll := time.NewTicker(time.Millisecond)
+	defer cleanupPoll.Stop()
+	for {
+		queue.mu.Lock()
+		remaining := len(queue.jobs)
+		queue.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		select {
+		case <-cleanupPoll.C:
+		case <-cleanupDeadline.C:
+			t.Fatalf("successful scheduled work remained queued after completion: jobs=%d", remaining)
+		}
 	}
 }
 

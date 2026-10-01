@@ -89,7 +89,7 @@ func (c *Client) Materialize(ctx context.Context, image sandbox.Image) (string, 
 		return "", err
 	}
 	if a.Manifest.Digest.String() != image.ManifestDigest || config.String() != image.ConfigDigest {
-		return "", errors.New("Apple 1.4.1 cache manifest/config verification failed")
+		return "", errors.New("runtime: Apple 1.4.1 cache manifest/config verification failed")
 	}
 	return ref, nil
 }

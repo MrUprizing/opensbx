@@ -64,7 +64,7 @@ func (c *Client) changed(id string) {
 func (c *Client) Ping(ctx context.Context) error {
 	b, err := c.run(ctx, nil, "system", "status", "--format", "json")
 	if err != nil {
-		return fmt.Errorf("Apple Container service is unavailable. Start it with `container system start`; install the CLI from https://github.com/apple/container/releases if needed: %w", err)
+		return fmt.Errorf("runtime: Apple Container service is unavailable. Start it with `container system start`; install the CLI from https://github.com/apple/container/releases if needed: %w", err)
 	}
 	var status struct {
 		Status string
@@ -75,11 +75,11 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("invalid Apple container health JSON: %w", err)
 	}
 	if status.Status != "running" {
-		return fmt.Errorf("Apple Container service is not running (status %q); start it with `container system start`", status.Status)
+		return fmt.Errorf("runtime: Apple Container service is not running (status %q); start it with `container system start`", status.Status)
 	}
 	// CLI JSON is not a stable API. Fail closed on unvalidated schema versions.
 	if status.Client.Version != "1.4.1" || status.Server.Version != "1.4.1" {
-		return errors.New("Apple Container CLI and service version 1.4.1 are required. Install the matching signed release from https://github.com/apple/container/releases, then run `container system start`")
+		return errors.New("runtime: Apple Container CLI and service version 1.4.1 are required. Install the matching signed release from https://github.com/apple/container/releases, then run `container system start`")
 	}
 	return nil
 }
@@ -312,7 +312,7 @@ func normalizePorts(ports []string) ([]string, error) {
 		}
 		n, err := strconv.Atoi(parts[0])
 		if err != nil || n < 2 || n > 65535 {
-			return nil, errors.New("Apple container ports must be between 2 and 65535")
+			return nil, errors.New("runtime: Apple container ports must be between 2 and 65535")
 		}
 		proto := "tcp"
 		if len(parts) == 2 {
@@ -417,7 +417,7 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		return result, errors.New("memory must be between 1 and 8192 MiB")
 	}
 	if math.IsNaN(cpus) || math.IsInf(cpus, 0) || cpus < 1 || cpus > 4 || math.Trunc(cpus) != cpus {
-		return result, errors.New("Apple container requires whole CPUs between 1 and 4; fractional CPUs are unsupported")
+		return result, errors.New("runtime: Apple container requires whole CPUs between 1 and 4; fractional CPUs are unsupported")
 	}
 	if req.Timeout < 0 || int64(req.Timeout) > int64(math.MaxInt64/int64(time.Second)) {
 		return result, errors.New("invalid sandbox timeout")
@@ -519,7 +519,7 @@ func (c *Client) Create(ctx context.Context, req runtimeio.CreateSandboxRequest)
 		c.scheduleDeadline(id, deadline, deadline.Sub(c.now()))
 		return runtimeio.CreateSandboxResponse{ID: id, Name: id, Ports: ports}, nil
 	}
-	return result, fmt.Errorf("Apple container create/start failed after 3 attempts: %w", lastErr)
+	return result, fmt.Errorf("runtime: Apple container create/start failed after 3 attempts: %w", lastErr)
 }
 
 func (c *Client) rollback(id string) error {

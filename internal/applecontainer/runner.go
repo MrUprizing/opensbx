@@ -125,10 +125,10 @@ func (c *Client) run(ctx context.Context, in io.Reader, args ...string) ([]byte,
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && offlineImageUnavailable(args, diagnostic, truncated) {
 			return nil, errOfflineImageUnavailable
 		}
-		return nil, runtimeio.DeferRecovery(fmt.Errorf("Apple container %s failed: %w", args[0], safeError(err)))
+		return nil, runtimeio.DeferRecovery(fmt.Errorf("runtime: Apple container %s failed: %w", args[0], safeError(err)))
 	}
 	if overflow {
-		return nil, fmt.Errorf("Apple container output exceeds %d bytes", outputLimit)
+		return nil, fmt.Errorf("runtime: Apple container output exceeds %d bytes", outputLimit)
 	}
 	return []byte(s), nil
 }
@@ -147,7 +147,7 @@ func safeError(err error) error {
 // software or starts system services. Health/version validation is done by Ping.
 func Resolve(ctx context.Context) (Runner, error) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		return nil, errors.New("Apple container requires Apple Silicon macOS 26 or later; choose `-runtime docker` on this host. Setup: https://github.com/apple/container")
+		return nil, errors.New("runtime: Apple container requires Apple Silicon macOS 26 or later; choose `-runtime docker` on this host. Setup: https://github.com/apple/container")
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/sw_vers", "-productVersion")
 	var out bytes.Buffer
@@ -157,11 +157,11 @@ func Resolve(ctx context.Context) (Runner, error) {
 	}
 	major, err := strconv.Atoi(strings.Split(strings.TrimSpace(out.String()), ".")[0])
 	if err != nil || major < 26 {
-		return nil, errors.New("Apple Container requires macOS 26 or later; upgrade macOS or choose `-runtime docker`. Setup: https://github.com/apple/container")
+		return nil, errors.New("runtime: Apple Container requires macOS 26 or later; upgrade macOS or choose `-runtime docker`. Setup: https://github.com/apple/container")
 	}
 	path, err := exec.LookPath("container")
 	if err != nil {
-		return nil, errors.New("Apple container CLI not found in PATH (`container`). Install the signed package from https://github.com/apple/container/releases, then run `container system start` and retry `opensbx start -runtime container`")
+		return nil, errors.New("runtime: Apple container CLI not found in PATH (`container`). Install the signed package from https://github.com/apple/container/releases, then run `container system start` and retry `opensbx start -runtime container`")
 	}
 	return cliRunner{path}, nil
 }

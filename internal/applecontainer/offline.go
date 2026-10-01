@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-var errOfflineImageUnavailable = errors.New("Apple container cannot create offline: the workload or configured vminit image is not fully available locally; explicitly prepare the missing local images before retrying; automatic downloads remain disabled")
+var errOfflineImageUnavailable = errors.New("runtime: Apple container cannot create offline: the workload or configured vminit image is not fully available locally; explicitly prepare the missing local images before retrying; automatic downloads remain disabled")
 
 // Apple 1.4.1 Utility.containerConfigFromFlags fetches both the workload and
 // vminit with the same download limit. ClientImage.fetch first resolves locally;

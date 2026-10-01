@@ -35,57 +35,64 @@ type dockerAPIFixture struct {
 	failAfterMutation map[string]int
 	// Sequential responses allow a preflight inspect to succeed and the
 	// post-mutation inspect to fail without changing state from a test goroutine.
-	responses             map[string][]int
-	requests              []string
-	execOptions           []string
-	execCreates           []dockerExecCreate
-	execRecords           map[string]dockerExecRecord
-	execCount             int
-	containerEnv          []string
-	guestProcesses        map[int]fakeGuestProcess
-	signalTargets         []int
-	signalHelperStdout    string
-	signalHelperStderr    string
-	probeExitCode         int
-	probeStdout           string
-	probeStderr           string
-	probeCreateStatus     int
-	probeCreateError      string
-	probeStartStatus      int
-	probeBlock            bool
-	probeAttachEntered    chan struct{}
-	payloadPreamble       string
-	signalNoAck           bool
-	createBody            container.Config
-	createHost            container.HostConfig
-	containerID           string
-	containerLabels       map[string]string
-	containerHostPort     string
-	running               bool
-	paused                bool
-	stdin                 []byte
-	execStdin             bool
-	statsBody             string
-	pullBody              string
-	attachBody            string
-	stopDone              chan struct{}
-	blockStopRequests     bool
-	stopEntered           chan struct{}
-	cacheDigest           string
-	cacheTag              string
-	cacheNativeID         string
-	cacheLoaded           bool
-	loadedArchive         []byte
-	cacheSavedArchive     []byte
-	cacheLoadBody         string
-	cacheInspectID        string
-	cacheSaveMode         string
-	cacheSaveEntered      chan struct{}
-	cacheSaveRelease      chan struct{}
-	execStartup           *execStartupFixture
-	execCreateEntered     chan struct{}
-	releaseExecCreate     chan struct{}
-	execCreateBarrierUsed bool
+	responses              map[string][]int
+	requests               []string
+	execOptions            []string
+	execCreates            []dockerExecCreate
+	execRecords            map[string]dockerExecRecord
+	execCount              int
+	containerEnv           []string
+	guestProcesses         map[int]fakeGuestProcess
+	signalTargets          []int
+	signalHelperStdout     string
+	signalHelperStderr     string
+	probeExitCode          int
+	probeStdout            string
+	probeStderr            string
+	probeCreateStatus      int
+	probeCreateError       string
+	probeStartStatus       int
+	probeBlock             bool
+	probeAttachEntered     chan struct{}
+	payloadPreamble        string
+	signalNoAck            bool
+	createBody             container.Config
+	createHost             container.HostConfig
+	containerID            string
+	containerLabels        map[string]string
+	containerHostPort      string
+	running                bool
+	paused                 bool
+	stdin                  []byte
+	execStdin              bool
+	statsBody              string
+	pullBody               string
+	attachBody             string
+	directExecStdout       []byte
+	directExecStderr       []byte
+	directExecExitCode     int
+	directExecExitCodes    []int
+	directExecInspectCount int
+	directExecBlockEntered chan struct{}
+	directExecBlockRelease chan struct{}
+	stopDone               chan struct{}
+	blockStopRequests      bool
+	stopEntered            chan struct{}
+	cacheDigest            string
+	cacheTag               string
+	cacheNativeID          string
+	cacheLoaded            bool
+	loadedArchive          []byte
+	cacheSavedArchive      []byte
+	cacheLoadBody          string
+	cacheInspectID         string
+	cacheSaveMode          string
+	cacheSaveEntered       chan struct{}
+	cacheSaveRelease       chan struct{}
+	execStartup            *execStartupFixture
+	execCreateEntered      chan struct{}
+	releaseExecCreate      chan struct{}
+	execCreateBarrierUsed  bool
 }
 
 type dockerExecCreate struct {
@@ -155,16 +162,24 @@ type execStartupFixture struct {
 }
 
 func newDockerFixture(t *testing.T) (*Client, *dockerAPIFixture) {
+	return newDockerFixtureWithRoundTripper(t, nil)
+}
+
+func newDockerFixtureWithRoundTripper(t *testing.T, roundTripper http.RoundTripper) (*Client, *dockerAPIFixture) {
 	t.Helper()
 	fixture := &dockerAPIFixture{t: t, fail: map[string]int{}, containerID: "container-1", running: true, stopDone: make(chan struct{}, 8), execRecords: make(map[string]dockerExecRecord), guestProcesses: make(map[int]fakeGuestProcess)}
 	server := httptest.NewServer(http.HandlerFunc(fixture.serveHTTP))
 	t.Cleanup(server.Close)
 	dockerHost := strings.TrimPrefix(server.URL, "http://")
-	cli, err := moby.NewClientWithOpts(
-		moby.WithHost("tcp://"+dockerHost),
-		moby.WithVersion("1.53"),
-		moby.WithHTTPClient(server.Client()),
-	)
+	options := []moby.Opt{
+		moby.WithHost("tcp://" + dockerHost),
+		moby.WithScheme("http"),
+		moby.WithAPIVersion("1.53"),
+	}
+	if roundTripper != nil {
+		options = append(options, moby.WithHTTPClient(&http.Client{Transport: roundTripper}))
+	}
+	cli, err := moby.New(options...)
 	if err != nil {
 		t.Fatalf("create Docker SDK client: %v", err)
 	}
@@ -559,6 +574,9 @@ func (f *dockerAPIFixture) serveExecAttach(w http.ResponseWriter, r *http.Reques
 	}
 	f.mu.Lock()
 	attachBody := f.attachBody
+	stdoutOverride := append([]byte(nil), f.directExecStdout...)
+	stderrOverride := append([]byte(nil), f.directExecStderr...)
+	blockEntered, blockRelease := f.directExecBlockEntered, f.directExecBlockRelease
 	f.mu.Unlock()
 	f.mu.Lock()
 	readStdin := f.execStdin
@@ -578,6 +596,20 @@ func (f *dockerAPIFixture) serveExecAttach(w http.ResponseWriter, r *http.Reques
 		_, _ = rw.WriteString(attachBody)
 		_ = rw.Flush()
 		return
+	}
+	if blockEntered != nil {
+		close(blockEntered)
+		select {
+		case <-blockRelease:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	if stdoutOverride != nil {
+		stdout = stdoutOverride
+	}
+	if stderrOverride != nil {
+		stderr = stderrOverride
 	}
 	for _, stream := range []struct {
 		id   byte
@@ -970,8 +1002,13 @@ func (f *dockerAPIFixture) serveExecInspect(w http.ResponseWriter, execID string
 		f.mu.Unlock()
 		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":%d}`, execID, exitCode)
 	case "direct":
+		exitCode := f.directExecExitCode
+		if f.directExecInspectCount < len(f.directExecExitCodes) {
+			exitCode = f.directExecExitCodes[f.directExecInspectCount]
+		}
+		f.directExecInspectCount++
 		f.mu.Unlock()
-		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":0}`, execID)
+		_, _ = fmt.Fprintf(w, `{"ID":%q,"Running":false,"ExitCode":%d}`, execID, exitCode)
 	case "payload":
 		if trace == nil {
 			f.mu.Unlock()
@@ -1721,7 +1758,6 @@ func TestDockerKillWaitsForPayloadExecStartAndHonorsCancellation(t *testing.T) {
 	cancelKill()
 	fixture.mu.Lock()
 	signalsBeforePayloadStarted := race.signalExecCreates
-	prematureSignals := race.prematureSignals
 	fixture.mu.Unlock()
 
 	// Allow the original exec-start to acknowledge Running only after the
@@ -1744,7 +1780,7 @@ func TestDockerKillWaitsForPayloadExecStartAndHonorsCancellation(t *testing.T) {
 	finished, waitErr := dc.WaitCommand(completionCtx, "container-1", command.ID)
 	fixture.mu.Lock()
 	signalExecCreates := race.signalExecCreates
-	prematureSignals = race.prematureSignals
+	prematureSignals := race.prematureSignals
 	fixture.mu.Unlock()
 
 	if !firstKillReturned || !errors.Is(firstKill.err, context.DeadlineExceeded) || signalsBeforePayloadStarted != 0 || prematureSignals != 0 {

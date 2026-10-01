@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -46,6 +47,9 @@ func realRouter(t *testing.T) *gin.Engine {
 	repo := database.NewRepository(db)
 	dc := docker.New(repo)
 	if err := dc.Ping(context.Background()); err != nil {
+		if os.Getenv("OPENSBX_REQUIRE_DOCKER_INTEGRATION") == "1" {
+			t.Fatalf("mandatory Docker integration: Docker unavailable (%v)", err)
+		}
 		t.Skipf("skipping integration test: Docker unavailable (%v)", err)
 	}
 	baselineCacheTags, err := dockerCacheTags()
@@ -110,6 +114,28 @@ func realRouter(t *testing.T) *gin.Engine {
 		}
 	})
 	return r
+}
+
+func TestIntegrationStrictModeFailsInsteadOfSkippingUnavailableDocker(t *testing.T) {
+	if os.Getenv("OPENSBX_STRICT_DOCKER_CHILD") == "1" {
+		t.Setenv("OPENSBX_REQUIRE_DOCKER_INTEGRATION", "1")
+		t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+		realRouter(t)
+		return
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestIntegrationStrictModeFailsInsteadOfSkippingUnavailableDocker$")
+	var env []string
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "DOCKER_HOST=") || strings.HasPrefix(entry, "OPENSBX_REQUIRE_DOCKER_INTEGRATION=") || strings.HasPrefix(entry, "OPENSBX_STRICT_DOCKER_CHILD=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	command.Env = append(env, "DOCKER_HOST=tcp://127.0.0.1:1", "OPENSBX_REQUIRE_DOCKER_INTEGRATION=1", "OPENSBX_STRICT_DOCKER_CHILD=1")
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "mandatory Docker integration: Docker unavailable") {
+		t.Fatalf("strict unavailable-Docker child error=%v output=%s; want explicit failure, not skip", err, output)
+	}
 }
 
 func dockerCacheTags() (map[string]bool, error) {

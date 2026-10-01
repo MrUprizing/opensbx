@@ -264,7 +264,7 @@ func (c *Client) KillCommand(ctx context.Context, sandbox, id string, signal int
 		return zero, domain.ErrCommandFinished
 	}
 	if signal < 1 || signal > 64 {
-		return zero, errors.New("Linux signal must be between 1 and 64")
+		return zero, errors.New("invalid Linux signal: must be between 1 and 64")
 	}
 	r := c.commands[id]
 	if r == nil {

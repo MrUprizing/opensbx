@@ -80,9 +80,9 @@ func (h *harness) images(t *testing.T) {
 	require.NoError(t, err)
 	platform, err := v1.ParsePlatform(h.platform)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	artifact, err := store.Resolve(ctx, workload, *platform)
+	resolveCtx, cancelResolve := context.WithTimeout(context.Background(), 30*time.Second)
+	artifact, err := store.Resolve(resolveCtx, workload, *platform)
+	cancelResolve()
 	require.NoError(t, err)
 	h.cache = "localhost/opensbx-cache:" + strings.TrimPrefix(artifact.Manifest.Digest.String(), "sha256:")
 	if h.runtime == "container" {
@@ -106,7 +106,9 @@ func (h *harness) images(t *testing.T) {
 	h.api(t, "GET", "/v1/images/"+importedImage, nil, 200, &image)
 	require.Equal(t, "linux", image.OS)
 	require.Equal(t, platform.Architecture, image.Architecture)
-	imported, err := store.Resolve(ctx, importedImage, *platform)
+	importedResolveCtx, cancelImportedResolve := context.WithTimeout(context.Background(), 30*time.Second)
+	imported, err := store.Resolve(importedResolveCtx, importedImage, *platform)
+	cancelImportedResolve()
 	require.NoError(t, err)
 	require.Equal(t, artifact.Manifest.Digest, imported.Manifest.Digest, "archive round trip must retain the executable artifact")
 }

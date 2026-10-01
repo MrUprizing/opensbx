@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os/exec"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,9 @@ import (
 )
 
 func TestDockerIdentityScriptsHaveValidPOSIXShellSyntax(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell syntax validation requires /bin/sh")
+	}
 	for _, tc := range []struct {
 		name   string
 		script string

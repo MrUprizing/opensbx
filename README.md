@@ -9,7 +9,7 @@ manage files, and expose app ports on your local machine.
 
 ## Quick start
 
-Requirements: Go **1.25.6+** only when building from source, and a running local
+Requirements: Go **1.25.13+** only when building from source, and a running local
 [Docker runtime or supported Apple container runtime](docs/runtimes.md).
 
 ```sh

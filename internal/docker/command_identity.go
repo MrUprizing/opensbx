@@ -162,7 +162,7 @@ type helperBuffer struct{ bytes.Buffer }
 
 func (b *helperBuffer) Write(p []byte) (int, error) {
 	if len(p) > identityPreambleLimit-b.Len() {
-		return 0, errors.New("Docker identity helper exceeded its bounded output limit")
+		return 0, errors.New("runtime: Docker identity helper exceeded its bounded output limit")
 	}
 	return b.Buffer.Write(p)
 }
@@ -200,7 +200,7 @@ func (c *Client) runIdentityHelper(ctx context.Context, sandboxID string, opts m
 		return execResult{}, ctx.Err()
 	}
 	if state.Running {
-		return execResult{}, errors.New("Docker identity helper observation ended before confirmed completion")
+		return execResult{}, errors.New("runtime: Docker identity helper observation ended before confirmed completion")
 	}
 	return execResult{stdout: stdout.String(), stderr: stderr.String(), exitCode: state.ExitCode}, nil
 }
@@ -229,7 +229,7 @@ func (c *Client) probeIdentity(ctx context.Context, sandboxID, nonce, cwd string
 		return false, nil
 	}
 	if result.exitCode != 0 || result.stderr != "" {
-		return false, errors.New("Docker guest identity capability probe failed")
+		return false, errors.New("runtime: Docker guest identity capability probe failed")
 	}
 	if _, _, err := parseIdentity([]byte(result.stdout), "OPENSBX_PROBE", nonce); err != nil {
 		return false, err
@@ -265,7 +265,7 @@ func (w *identityStderr) Write(p []byte) (int, error) {
 		prefix = end + 1
 	}
 	if prefix > identityPreambleLimit-len(w.preamble) || end < 0 && prefix == identityPreambleLimit-len(w.preamble) {
-		err := errors.New("Docker guest identity preamble exceeded its bounded size")
+		err := errors.New("runtime: Docker guest identity preamble exceeded its bounded size")
 		w.rc.publishIdentity(0, 0, err)
 		return 0, err
 	}
@@ -287,7 +287,7 @@ func (w *identityStderr) Write(p []byte) (int, error) {
 func (w *identityStderr) finish(err error) error {
 	if !w.complete {
 		if err == nil {
-			err = errors.New("Docker guest identity preamble was not received before stderr closed")
+			err = errors.New("runtime: Docker guest identity preamble was not received before stderr closed")
 		}
 		w.rc.publishIdentity(0, 0, err)
 	}
@@ -321,7 +321,7 @@ func (c *Client) waitGuestIdentity(ctx context.Context, rc *runningCommand) (int
 		return 0, 0, sandbox.ErrCommandFinished
 	}
 	if rc.guestPID <= 1 || rc.guestStart == 0 {
-		return 0, 0, errors.New("Docker guest command identity is not ready")
+		return 0, 0, errors.New("runtime: Docker guest command identity is not ready")
 	}
 	return rc.guestPID, rc.guestStart, nil
 }

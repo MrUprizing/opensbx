@@ -36,11 +36,6 @@ func requestTimeout(c *gin.Context, msg string) {
 	c.JSON(http.StatusRequestTimeout, ErrorResponse{Code: "TIMEOUT", Message: msg})
 }
 
-// rateLimited writes a 429 response with code RATE_LIMITED when the caller exceeds request limits.
-func rateLimited(c *gin.Context, msg string) {
-	c.JSON(http.StatusTooManyRequests, ErrorResponse{Code: "RATE_LIMITED", Message: msg})
-}
-
 // internalError writes a 500 response with code INTERNAL_ERROR.
 // It first checks for well-known sentinel errors and downgrades to the appropriate status code.
 func internalError(c *gin.Context, err error) {

@@ -24,6 +24,8 @@ import (
 
 const workload = "node:25-alpine"
 
+const childRaceDetectorOptions = "halt_on_error=1 exitcode=66"
+
 type lockedLog struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -107,6 +109,8 @@ func cleanEnv() []string {
 		switch key {
 		case "ADDR", "API_KEY", "OPENSBX_DATA_DIR", "LOG_FILE", "PROXY_ADDR", "BASE_DOMAIN", "GIN_MODE":
 			continue
+		case "GORACE":
+			continue
 		}
 		env = append(env, item)
 	}
@@ -122,7 +126,7 @@ func (h *harness) start(t *testing.T) {
 	h.cmd = exec.Command(h.bin, "-runtime", h.runtime, "-addr", "127.0.0.1:0", "-data-dir", h.data,
 		"-log-file", filepath.Join(h.root, "server.log"))
 	h.cmd.Dir = h.root
-	h.cmd.Env = append(cleanEnv(), "API_KEY="+h.key, "GIN_MODE=release")
+	h.cmd.Env = append(cleanEnv(), "API_KEY="+h.key, "GIN_MODE=release", "GORACE="+childRaceDetectorOptions)
 	h.cmd.Stdout, h.cmd.Stderr = h.log, h.log
 	require.NoError(t, h.cmd.Start())
 	h.done = make(chan struct{})
@@ -293,4 +297,17 @@ func eventually(t *testing.T, timeout time.Duration, description string, check f
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("%s: %s", description, detail)
+}
+
+// raceReportProcessIDs checks every child log after all process lifetimes have
+// ended. A child may be deliberately killed or exit nonzero in crash/restart
+// scenarios; neither outcome makes a race-detector report acceptable.
+func raceReportProcessIDs(logs []string) []int {
+	var processIDs []int
+	for i, output := range logs {
+		if strings.Contains(output, "WARNING: DATA RACE") {
+			processIDs = append(processIDs, i+1)
+		}
+	}
+	return processIDs
 }

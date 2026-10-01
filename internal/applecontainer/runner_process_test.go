@@ -6,12 +6,16 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
 
 func writeExecutableFixture(t *testing.T, body string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the native CLI process fixture uses a POSIX shell shebang")
+	}
 	path := filepath.Join(t.TempDir(), "fixture-cli")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0700); err != nil {
 		t.Fatal(err)

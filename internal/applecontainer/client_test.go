@@ -322,8 +322,8 @@ func TestImageReferenceNormalizationAndArchitectureSelection(t *testing.T) {
 
 func TestClientUsesInjectedClockForDeterministicLifecycleTiming(t *testing.T) {
 	clock := time.Date(2026, time.September, 26, 12, 30, 0, 0, time.UTC)
-	client, repo := testClient(t, &scriptedRunner{t: t})
-	client = New(repo, &scriptedRunner{t: t}, func() time.Time { return clock })
+	_, repo := testClient(t, &scriptedRunner{t: t})
+	client := New(repo, &scriptedRunner{t: t}, func() time.Time { return clock })
 	if got := client.now(); !got.Equal(clock) {
 		t.Fatalf("injected clock=%s want %s", got, clock)
 	}

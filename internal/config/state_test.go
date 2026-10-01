@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -26,7 +27,9 @@ func TestExecutionPathSeparatesRuntimeDatabases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Mode().Perm()&0077 != 0 {
+		// Windows synthesizes mode permissions instead of preserving Unix ACLs;
+		// the per-runtime path and existence contract still applies there.
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 			t.Errorf("runtime state directory %q mode=%#o exposes owner data", path, info.Mode().Perm())
 		}
 	}

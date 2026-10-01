@@ -102,7 +102,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 		envSlice = append(envSlice, key+"="+req.Env[key])
 	}
 	if info.Container.Config == nil {
-		return runtimeio.CommandDetail{}, errors.New("Docker inspect did not return the original command environment")
+		return runtimeio.CommandDetail{}, errors.New("runtime: Docker inspect did not return the original command environment")
 	}
 	restoreEnv, compatibleEnv := identityEnvironment(info.Container.Config.Env, req.Env)
 	wrapped := false
@@ -110,7 +110,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 	if compatibleEnv {
 		wrapped, err = c.probeIdentity(ctx, sandboxID, cmdID, req.Cwd, envSlice)
 		if err != nil {
-			return runtimeio.CommandDetail{}, fmt.Errorf("Docker command identity probe: %w", err)
+			return runtimeio.CommandDetail{}, fmt.Errorf("runtime: Docker command identity probe: %w", err)
 		}
 		identityUnavailable = "guest /bin/sh, builtin kill/printf or readable /proc identity is unavailable; command signals are unsupported"
 	}
@@ -240,7 +240,7 @@ func (c *Client) ExecCommand(ctx context.Context, sandboxID string, req runtimei
 			exitCode = inspect.ExitCode
 		}
 		if !confirmed && streamErr == nil {
-			streamErr = errors.New("Docker command observation ended without confirmed termination")
+			streamErr = errors.New("runtime: Docker command observation ended without confirmed termination")
 		}
 
 		finishedAt := time.Now().UnixMilli()
@@ -554,8 +554,22 @@ type execResult struct {
 	exitCode int
 }
 
+const synchronousOutputLimit = 4 << 20
+
+type synchronousBuffer struct{ bytes.Buffer }
+
+func (b *synchronousBuffer) Write(p []byte) (int, error) {
+	if len(p) > synchronousOutputLimit-b.Len() {
+		return 0, errors.New("docker synchronous exec output exceeds 4 MiB")
+	}
+	return b.Buffer.Write(p)
+}
+
 // execWithStdin runs a command with optional stdin, returning separated stdout/stderr and exit code.
+// This synchronous helper is not the asynchronous guest command execution API.
 func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, stdin io.Reader) (execResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	attachStdin := stdin != nil
 	execCfg, err := c.cli.ExecCreate(ctx, id, moby.ExecCreateOptions{
 		AttachStdin:  attachStdin,
@@ -573,7 +587,7 @@ func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, std
 	}
 	defer attached.Close()
 	// Hijacked streams outlive the HTTP request. Close explicitly on cancellation
-	// so a stalled signal exec cannot hide the caller's canceled/deadline error.
+	// so a stalled file exec cannot hide the caller's canceled/deadline error.
 	stopClose := context.AfterFunc(ctx, attached.Close)
 	defer stopClose()
 
@@ -587,7 +601,7 @@ func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, std
 		attached.CloseWrite()
 	}
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr synchronousBuffer
 	if _, err := stdcopy.StdCopy(&stdout, &stderr, attached.Reader); err != nil && err != io.EOF {
 		if ctx.Err() != nil {
 			return execResult{}, ctx.Err()
@@ -602,6 +616,12 @@ func (c *Client) execWithStdin(ctx context.Context, id string, cmd []string, std
 	inspect, err := c.cli.ExecInspect(ctx, execCfg.ID, moby.ExecInspectOptions{})
 	if err != nil {
 		return execResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return execResult{}, err
+	}
+	if inspect.Running {
+		return execResult{}, errors.New("docker synchronous exec ended before confirmed completion")
 	}
 
 	return execResult{

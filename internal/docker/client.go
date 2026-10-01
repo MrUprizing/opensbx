@@ -41,7 +41,7 @@ var (
 // but each Client gets its own repository.
 func New(repo *database.Repository) *Client {
 	once.Do(func() {
-		cli, err := moby.NewClientWithOpts(moby.FromEnv, moby.WithAPIVersionNegotiation())
+		cli, err := moby.New(moby.FromEnv)
 		if err != nil {
 			panic(err)
 		}
@@ -74,7 +74,7 @@ func ValidateEndpoint(raw string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("Docker endpoint %q is not a local socket or loopback endpoint", raw)
+	return fmt.Errorf("runtime: Docker endpoint %q is not a local socket or loopback endpoint", raw)
 }
 
 // Ping checks connectivity with the Docker daemon.

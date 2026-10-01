@@ -185,6 +185,13 @@ func (h *harness) cleanup(t *testing.T) {
 	if err := h.stop(); err != nil {
 		t.Errorf("cleanup server termination: %v", err)
 	}
+	processLogs := make([]string, len(h.logs))
+	for i, log := range h.logs {
+		processLogs[i] = log.text()
+	}
+	if processIDs := raceReportProcessIDs(processLogs); len(processIDs) > 0 {
+		t.Errorf("Go race detector WARNING: DATA RACE found in server process log(s) %v", processIDs)
+	}
 	if len(h.owned) > 0 {
 		states, err := h.inventory()
 		if err != nil {
@@ -251,8 +258,8 @@ func (h *harness) cleanup(t *testing.T) {
 		}
 	}
 	var logs strings.Builder
-	for i, log := range h.logs {
-		fmt.Fprintf(&logs, "\n--- server process %d ---\n%s", i+1, log.text())
+	for i, processLog := range processLogs {
+		fmt.Fprintf(&logs, "\n--- server process %d ---\n%s", i+1, processLog)
 	}
 	if t.Failed() {
 		t.Log(logs.String())
