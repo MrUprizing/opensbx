@@ -132,8 +132,10 @@ func TestDockerHubCloudFrontPolicyRejectsNearbyAuthoritiesMethodsAndBearerRealms
 		t.Fatal("POST to approved CloudFront hostname was accepted")
 	}
 	origin, _ := http.NewRequest(http.MethodGet, "https://registry-1.docker.io/v2/library/node/manifests/latest", nil)
-	if _, err := policy.RoundTrip(origin); err == nil || !strings.Contains(err.Error(), "untrusted bearer realm") {
-		t.Fatalf("Docker Hub bearer realm pointing to a storage CDN error=%v", err)
+	if _, err := policy.RoundTrip(origin); err == nil {
+		t.Fatal("Docker Hub bearer realm pointing to a storage CDN was accepted")
+	} else {
+		assertSafeRegistryDiagnostic(t, err, "policy", "manifest", http.StatusUnauthorized)
 	}
 	if baseCalls != 1 {
 		t.Fatalf("rejected authorities/methods reached base transport %d times; only the origin challenge should", baseCalls)
@@ -154,8 +156,10 @@ func TestRegistryPolicyRejectsUntrustedBearerRealmsBeforeFollowingThem(t *testin
 		return &http.Response{StatusCode: http.StatusUnauthorized, Header: h, Body: closeTrackingBody{Reader: strings.NewReader("challenge"), closed: &closed}, Request: r}, nil
 	})}
 	req, _ := http.NewRequest(http.MethodGet, "https://registry.example.test/v2/team/app/manifests/latest", nil)
-	if _, err := policy.RoundTrip(req); err == nil || !strings.Contains(err.Error(), "untrusted bearer realm") {
-		t.Fatalf("untrusted realm error=%v", err)
+	if _, err := policy.RoundTrip(req); err == nil {
+		t.Fatal("untrusted bearer realm was accepted")
+	} else {
+		assertSafeRegistryDiagnostic(t, err, "policy", "manifest", http.StatusUnauthorized)
 	}
 	if !closed {
 		t.Fatal("rejected bearer challenge body was not closed")
@@ -218,29 +222,52 @@ func TestRegistryPolicyPropagatesTransportErrorsAndRejectsMalformedBearerRealms(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := policy.RoundTrip(request); !errors.Is(err, baseErr) {
-		t.Fatalf("base transport error=%v, want original transport failure", err)
+	if _, err := policy.RoundTrip(request); err == nil {
+		t.Fatal("base transport failure was discarded")
+	} else {
+		assertSafeRegistryDiagnostic(t, err, "unknown", "registry-ping", 0)
+		if errors.Is(err, baseErr) {
+			t.Fatal("sanitized transport error unwraps the original low-level cause")
+		}
 	}
-	for _, realm := range []string{
-		"%invalid",
-		"https://user:secret@registry.example.test/token",
-		"https://registry.example.test/token#fragment",
-		"http://registry.example.test/token",
+	for _, tc := range []struct{ name, realm string }{
+		{name: "malformed", realm: "%invalid"},
+		{name: "userinfo", realm: "https://user:secret@registry.example.test/token"},
+		{name: "fragment", realm: "https://registry.example.test/token#fragment"},
+		{name: "insecure", realm: "http://registry.example.test/token"},
 	} {
-		t.Run(realm, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			closed := false
 			policy.base = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				h := make(http.Header)
-				h.Set("WWW-Authenticate", `Bearer realm="`+realm+`"`)
+				h.Set("WWW-Authenticate", `Bearer realm="`+tc.realm+`"`)
 				return &http.Response{StatusCode: http.StatusUnauthorized, Header: h, Body: closeTrackingBody{Reader: strings.NewReader("challenge"), closed: &closed}, Request: r}, nil
 			})
-			if _, err := policy.RoundTrip(request); err == nil || !strings.Contains(err.Error(), "untrusted bearer realm") {
-				t.Fatalf("malformed bearer realm %q error=%v", realm, err)
+			if _, err := policy.RoundTrip(request); err == nil {
+				t.Fatalf("malformed bearer realm %q was accepted", tc.name)
+			} else {
+				assertSafeRegistryDiagnostic(t, err, "policy", "registry-ping", http.StatusUnauthorized)
 			}
 			if !closed {
-				t.Fatalf("rejected bearer challenge %q body was not closed", realm)
+				t.Fatalf("rejected bearer challenge %q body was not closed", tc.name)
 			}
 		})
+	}
+}
+
+func assertSafeRegistryDiagnostic(t *testing.T, err error, wantCategory, wantStage string, wantStatus int) {
+	t.Helper()
+	if got := err.Error(); got != publicRegistryError {
+		t.Errorf("public diagnostic error=%q; want generic sanitized message", got)
+	}
+	var diagnostic registryDiagnostic
+	if !errors.As(err, &diagnostic) {
+		t.Errorf("error %T does not expose RegistryDiagnostic()", err)
+		return
+	}
+	category, stage, status := diagnostic.RegistryDiagnostic()
+	if category != wantCategory || stage != wantStage || status != wantStatus {
+		t.Errorf("RegistryDiagnostic()=(%q, %q, %d), want (%q, %q, %d)", category, stage, status, wantCategory, wantStage, wantStatus)
 	}
 }
 

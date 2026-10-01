@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -27,6 +28,35 @@ type registryPolicy struct {
 	hub      bool
 	insecure bool
 	base     http.RoundTripper
+	realmMu  sync.RWMutex
+	realms   map[registryRealmEndpoint]struct{}
+}
+
+type registryRealmEndpoint struct {
+	scheme    string
+	authority string
+	path      string
+}
+
+func registryRealm(u *url.URL) registryRealmEndpoint {
+	// Token exchange adds query parameters to the validated realm URL.
+	return registryRealmEndpoint{u.Scheme, registryAuthority(u), u.EscapedPath()}
+}
+
+func (p *registryPolicy) rememberRealm(u *url.URL) {
+	p.realmMu.Lock()
+	defer p.realmMu.Unlock()
+	if p.realms == nil {
+		p.realms = make(map[registryRealmEndpoint]struct{})
+	}
+	p.realms[registryRealm(u)] = struct{}{}
+}
+
+func (p *registryPolicy) isAuthRealm(u *url.URL) bool {
+	p.realmMu.RLock()
+	defer p.realmMu.RUnlock()
+	_, ok := p.realms[registryRealm(u)]
+	return ok
 }
 
 func (p *registryPolicy) registry(host string) bool {
@@ -69,15 +99,21 @@ func publicRegistryIP(ip net.IP) bool {
 
 func (p *registryPolicy) RoundTrip(r *http.Request) (*http.Response, error) {
 	host := registryAuthority(r.URL)
+	stage := registryRequestStage(r)
+	if p.cdn(host) && !p.token(host) {
+		stage = "blob"
+	} else if p.isAuthRealm(r.URL) {
+		stage = "auth"
+	}
 	if r.URL.User != nil || r.URL.Fragment != "" || r.URL.Scheme != "https" && !(p.insecure && p.registry(host) && r.URL.Scheme == "http") {
-		return nil, errors.New("registry URL policy rejected scheme or authority")
+		return nil, boundedRegistryFailure("policy", policyFailureStage(stage), 0)
 	}
 	if !p.token(host) && !p.cdn(host) {
-		return nil, errors.New("registry URL policy rejected external host")
+		return nil, boundedRegistryFailure("policy", policyFailureStage(stage), 0)
 	}
 	if !p.token(host) {
 		if r.Method != "GET" && r.Method != "HEAD" {
-			return nil, errors.New("registry URL policy rejected external method")
+			return nil, boundedRegistryFailure("policy", policyFailureStage(stage), 0)
 		}
 		r = r.Clone(r.Context())
 		r.Header.Del("Authorization")
@@ -86,8 +122,22 @@ func (p *registryPolicy) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	resp, err := p.base.RoundTrip(r)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, safeRegistryError(err)
+		}
+		d := registryErrorDiagnostic(err)
+		return nil, boundedRegistryFailure(d.category, stage, d.status)
 	}
+	if resp.Body != nil {
+		resp.Body = registryResponseBody{ReadCloser: resp.Body, stage: stage, status: resp.StatusCode}
+	}
+	// Carry the controlled stage into the SDK's structured HTTP errors without
+	// mutating the live request or propagating it to later redirect requests.
+	responseRequest := resp.Request
+	if responseRequest == nil {
+		responseRequest = r
+	}
+	resp.Request = responseRequest.WithContext(context.WithValue(responseRequest.Context(), registryStageKey{}, stage))
 	for _, challenge := range resp.Header.Values("WWW-Authenticate") {
 		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(challenge)), "bearer ") {
 			continue
@@ -101,13 +151,23 @@ func (p *registryPolicy) RoundTrip(r *http.Request) (*http.Response, error) {
 			}
 			u, e := url.Parse(raw)
 			valid = e == nil && u.User == nil && u.Fragment == "" && p.token(registryAuthority(u)) && (u.Scheme == "https" || p.insecure && u.Scheme == "http" && p.registry(registryAuthority(u)))
+			if valid {
+				p.rememberRealm(u)
+			}
 		}
 		if !valid {
 			resp.Body.Close()
-			return nil, errors.New("registry URL policy rejected untrusted bearer realm")
+			return nil, boundedRegistryFailure("policy", stage, resp.StatusCode)
 		}
 	}
 	return resp, nil
+}
+
+func policyFailureStage(stage string) string {
+	if stage == "unknown" {
+		return "transport"
+	}
+	return stage
 }
 
 func (s *Store) registryOptionsFor(ctx context.Context, r name.Reference) ([]remote.Option, func(), error) {
@@ -133,7 +193,7 @@ func (s *Store) registryOptionsFor(ctx context.Context, r name.Reference) ([]rem
 			}
 			for _, ip := range ips {
 				if !allowPrivate && !publicRegistryIP(ip.IP) {
-					return nil, errors.New("registry URL policy rejected non-public address")
+					return nil, boundedRegistryFailure("policy", "transport", 0)
 				}
 			}
 			// Pin the checked addresses, with bounded fallback instead of another
@@ -159,7 +219,7 @@ func (s *Store) registryOptionsFor(ctx context.Context, r name.Reference) ([]rem
 	auth, err := authn.DefaultKeychain.Resolve(r.Context())
 	if err != nil {
 		close()
-		return nil, func() {}, errors.New("registry credential resolution failed")
+		return nil, func() {}, boundedRegistryFailure("authentication", "auth", 0)
 	}
 	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth), remote.WithTransport(p), remote.WithRetryPredicate(func(error) bool { return false })}, close, nil
 }

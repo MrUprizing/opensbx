@@ -53,3 +53,23 @@ OpenSBX does not download either runtime prerequisite during sandbox creation.
 
 Containers provide isolation but are not a complete security boundary against all
 hostile workloads. Keep the host OS and selected runtime up to date.
+
+## Registry failure diagnostics
+
+A failed image pull emits one `registry_pull_failed` log event with only
+`category`, `stage`, and `status` fields. No debug environment variable is needed.
+Categories are `upstream_status`, `authentication`, `dns`, `timeout`, `read`,
+`policy`, or `unknown`. Stages are `registry-ping`, `auth`, `manifest`, `blob`,
+`transport`, or `unknown`. Status is the actual HTTP response code when available,
+including `200` when a successful response body fails to read; `0` means no
+response status is available. Local non-registry pull failures have unknown
+metadata. These fields do not identify a host, image reference, URL, or credential.
+
+Registry errors retain the public message
+`registry request failed or was rejected by local URL policy`; context cancellation
+and deadline errors retain their context semantics. Internal Go callers can use
+`errors.As` with an interface declaring
+`RegistryDiagnostic() (category string, stage string, status int)`. Sanitized
+errors do not unwrap upstream causes. Classification uses typed failures and
+controlled request stages, never upstream error-message substrings. A diagnostic
+is evidence about the failed operation, not proof of an external outage.

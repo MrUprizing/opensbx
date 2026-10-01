@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -16,7 +17,13 @@ import (
 
 // Pull retains the source root and all nested index metadata but downloads
 // layer/config blobs only for the explicitly requested platform.
-func (s *Store) Pull(ctx context.Context, ref string, p v1.Platform) error {
+func (s *Store) Pull(ctx context.Context, ref string, p v1.Platform) (pullErr error) {
+	defer func() {
+		if pullErr != nil {
+			d := registryErrorDiagnostic(pullErr)
+			log.Printf("registry_pull_failed category=%s stage=%s status=%d", d.category, d.stage, d.status)
+		}
+	}()
 	p = canonicalPlatform(p)
 	r, err := name.ParseReference(ref)
 	if err != nil {
@@ -202,16 +209,6 @@ func (s *Store) Pull(ctx context.Context, ref string, p v1.Platform) error {
 		return err
 	}
 	return target.publish(ctx, stage, c.References)
-}
-
-func safeRegistryError(err error) error {
-	if errors.Is(err, context.Canceled) {
-		return context.Canceled
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return context.DeadlineExceeded
-	}
-	return errors.New("registry request failed or was rejected by local URL policy")
 }
 
 type safeRegistryReader struct{ io.Reader }
