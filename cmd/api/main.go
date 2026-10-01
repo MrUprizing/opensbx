@@ -157,7 +157,7 @@ func runServer(args []string) error {
 
 	// --- API server ---
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery())
+	r.Use(logging.RequestLogger(), gin.Recovery())
 
 	v1 := r.Group("/v1")
 	if cfg.APIKey != "" {

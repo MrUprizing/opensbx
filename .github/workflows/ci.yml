@@ -29,10 +29,17 @@ jobs:
       - name: Run race tests
         run: go test -race ./...
 
+      - name: Run runtime-free performance regressions
+        env:
+          SYNTHETIC_TESTS: '^Test(Performance.+|HTTPPerformance.+|Lifecycle(Measurements|Verification).+|ReadFirstLogContent.+|FirstLogReadCancellation.+|WritePerformanceReport.+)$'
+        run: |
+          go test -tags='e2e performance' ./e2e -run "$SYNTHETIC_TESTS" -count=1
+          go test -race -tags='e2e performance' ./e2e -run "$SYNTHETIC_TESTS" -count=1
+
       - name: Vet default and tagged builds
         run: |
           go vet ./...
-          go vet -tags='integration,appleintegration,e2e' ./...
+          go vet -tags='integration,appleintegration,e2e,performance' ./...
 
   integration-tests:
     name: Integration Tests

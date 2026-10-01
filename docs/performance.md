@@ -9,6 +9,22 @@ Normal `go test ./...` does not run benchmarks or live performance tests.
 Defaults are short exploratory runs; small sample sets do not provide reliable
 tail estimates. Percentiles are descriptive, not performance conclusions.
 
+## Runtime-free regression checks
+
+CI runs the existing synthetic collector, lifecycle, stream and report tests
+both normally and with the race detector. These use fixtures/local HTTP servers,
+not a sandbox runtime, live load collection or latency thresholds:
+
+```sh
+synthetic_tests='^Test(Performance.+|HTTPPerformance.+|Lifecycle(Measurements|Verification).+|ReadFirstLogContent.+|FirstLogReadCancellation.+|WritePerformanceReport.+)$'
+go test -tags='e2e performance' ./e2e -run "$synthetic_tests" -count=1
+go test -race -tags='e2e performance' ./e2e -run "$synthetic_tests" -count=1
+```
+
+The selector includes lifecycle verification-error accounting and excludes the
+live `TestPerformance` and `TestEndToEnd` entry points. Keep the families in sync
+when adding synthetic tests. Tagged vet also includes `performance` code.
+
 ## Runtime-free benchmarks
 
 From the repository root:

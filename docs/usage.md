@@ -345,6 +345,20 @@ runtime connections, SQLite locks, recovery and TTL management.
 The MCP server also exposes `opensbx://docs/quickstart` and
 `opensbx://docs/how-it-works` resources to connected clients.
 
+MCP request bodies are limited to **1 MiB** and must finish reading within
+**10 seconds** before SDK handling. Oversized bodies return HTTP 413; read
+timeouts return 408 and other body-read errors return 400. Accepted bytes and
+request context are preserved. This read deadline is cleared after body reading;
+it does not limit response streaming or sandbox reverse-proxy requests. MCP
+metadata logs sanitize controls/whitespace and bound method batches, paths and
+client IPs; request bodies are not logged.
+
+The global HTTP access logger also quotes, escapes and bounds method, path/query,
+client IP and private error metadata, including requests rejected by authentication
+before MCP middleware runs. Access log lines are at most **2048 bytes**, including
+their trailing newline, and do not use terminal colors. Status and duration remain
+available; request bodies and headers are not included.
+
 ## Existing installations
 
 If you have an older working-directory database, stop OpenSBX and make a
