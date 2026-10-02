@@ -1234,6 +1234,7 @@ func TestRouteCancellationStopsOnlyTheWaitingCaller(t *testing.T) {
 func TestServicePropagatesRepositoryReadFailures(t *testing.T) {
 	app, _, _, _, _, _, dbPath := openPreparedService(t, sandbox.Capabilities{Runtime: "fixture", Version: "1"})
 	admin := database.New(dbPath)
+	cleanupServiceTestDB(t, admin)
 	if err := admin.Exec("DROP TABLE sandboxes").Error; err != nil {
 		t.Fatal(err)
 	}

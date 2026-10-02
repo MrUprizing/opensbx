@@ -159,6 +159,26 @@ runtime. The CI Apple job uses the `macos-26` arm64 runner, installs signed Appl
 Container 1.4.1, prepares the recommended kernel and vminit, and stops the
 ephemeral runtime afterward.
 
+After checkout and before Go setup/builds or the Container installer, the Apple E2E job
+performs a two-minute-bounded native Swift preflight using
+[`VZVirtualMachine.isSupported`](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/issupported).
+Apple defines this as "A Boolean value that indicates whether the system supports
+virtualization" and notes that, when unavailable, "no configuration is valid."
+The job requires Apple Silicon hardware with usable Virtualization.framework;
+a virtualized runner also needs its host to expose supported nested virtualization.
+Host/Swift details, the framework result and (when unsupported) its validation
+error are uploaded under `diagnostics/apple-virtualization*.log`. CPU counts and
+`hw.optional` flags are not used as evidence of support.
+
+The hosted `macos-26` runner in run `36944478244` reported `VZErrorDomain Code=2`
+("Virtualization is not available on this hardware") despite successful service
+bootstrap. The preflight makes this infrastructure failure early and actionable;
+it does **not** fix hardware or prove that a VM will successfully boot. Selecting
+and provisioning an approved capable runner remains an external maintainer
+decision. The runner label, signed installer and mandatory E2E gates are unchanged;
+unsupported hardware fails, never skips. Hermetic macOS tests do not require
+virtualization and are unaffected.
+
 On a fresh CI runner, preparation first starts the service with
 `--disable-kernel-install --timeout 60`, avoiding the interactive kernel prompt
 and waiting up to 60 seconds for the API. It then explicitly installs the

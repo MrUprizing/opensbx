@@ -70,6 +70,8 @@ func TestStatsForOneSandboxDoesNotBlockUnrelatedLifecycleOperation(t *testing.T)
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	stopCompleted := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStats := func() { releaseOnce.Do(func() { close(release) }) }
 	var stateMu sync.Mutex
 	state := map[string]string{a: "running", b: "running"}
 	r := &synchronizedRunner{t: t}
@@ -105,6 +107,29 @@ func TestStatsForOneSandboxDoesNotBlockUnrelatedLifecycleOperation(t *testing.T)
 		return nil
 	}
 	c, repo := testClient(t, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	statsDone := make(chan error, 1)
+	stopDone := make(chan error, 1)
+	var statsStarted, stopStarted bool
+	var statsJoined, stopJoined bool
+	t.Cleanup(func() {
+		releaseStats()
+		if statsStarted && !statsJoined {
+			select {
+			case <-statsDone:
+			case <-time.After(time.Second):
+				t.Errorf("Stats goroutine did not exit during cleanup")
+			}
+		}
+		if stopStarted && !stopJoined {
+			select {
+			case <-stopDone:
+			case <-time.After(time.Second):
+				t.Errorf("Stop goroutine did not exit during cleanup")
+			}
+		}
+	})
 	for _, id := range []string{a, b} {
 		if err := repo.Save(database.Sandbox{ID: id, Name: id}); err != nil {
 			t.Fatal(err)
@@ -119,41 +144,45 @@ func TestStatsForOneSandboxDoesNotBlockUnrelatedLifecycleOperation(t *testing.T)
 		tick++
 		return base.Add(time.Duration(tick) * time.Second)
 	}
-	statsDone := make(chan error, 1)
-	go func() { _, err := c.Stats(context.Background(), a); statsDone <- err }()
+	statsStarted = true
+	go func() { _, err := c.Stats(ctx, a); statsDone <- err }()
 	select {
 	case <-entered:
-	case <-time.After(2 * time.Second):
-		close(release)
+	case <-ctx.Done():
 		t.Fatal("Stats did not reach its blocked first sample")
 	}
-	stopDone := make(chan error, 1)
-	go func() { err := c.Stop(context.Background(), b); stopDone <- err }()
+	stopStarted = true
+	go func() { stopDone <- c.Stop(ctx, b) }()
+	var stopErr error
 	completedBeforeRelease := false
 	select {
-	case err := <-stopDone:
-		completedBeforeRelease = err == nil
-	case <-time.After(250 * time.Millisecond):
+	case stopErr = <-stopDone:
+		completedBeforeRelease = true
+		stopJoined = true
+	case <-ctx.Done():
 	}
-	close(release)
+	releaseStats()
+	var statsErr error
 	select {
-	case err := <-statsDone:
-		if err != nil {
-			t.Errorf("Stats() = %v", err)
-		}
-	case <-time.After(2 * time.Second):
+	case statsErr = <-statsDone:
+		statsJoined = true
+	case <-ctx.Done():
 		t.Fatal("Stats did not finish after releasing sample")
 	}
 	if !completedBeforeRelease {
 		select {
-		case err := <-stopDone:
-			if err != nil {
-				t.Errorf("Stop(unrelated sandbox) = %v", err)
-			}
-		case <-time.After(2 * time.Second):
+		case stopErr = <-stopDone:
+			stopJoined = true
+		case <-ctx.Done():
 			t.Fatal("unrelated Stop remained blocked after stats release")
 		}
-		t.Fatal("Stats held the global lifecycle lock while waiting for CLI samples; unrelated Stop completed only after release")
+		t.Fatalf("Stats held the global lifecycle lock while waiting for CLI samples; unrelated Stop completed only after release (Stop error: %v)", stopErr)
+	}
+	if statsErr != nil {
+		t.Errorf("Stats() = %v", statsErr)
+	}
+	if stopErr != nil {
+		t.Errorf("Stop(unrelated sandbox) = %v", stopErr)
 	}
 	select {
 	case <-stopCompleted:

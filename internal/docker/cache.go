@@ -72,7 +72,7 @@ func (c *Client) Materialize(ctx context.Context, image sandbox.Image) (string, 
 		archive.Close()
 		return "", inspectErr
 	}
-	err = tarball.Write(tag, image.Content, archive)
+	err = writeImageArchive(tag, image.Content, archive)
 	closeErr := archive.Close()
 	if err != nil {
 		return "", err

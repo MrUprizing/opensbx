@@ -208,6 +208,39 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
+      - name: Require Apple hardware virtualization
+        if: ${{ matrix.runtime == 'container' }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          {
+            sw_vers
+            uname -m
+            sysctl hw.model
+            xcrun swift --version
+          } 2>&1 | tee diagnostics/apple-virtualization-host.log
+          # Query the framework itself; CPU counts and hw.optional are not proof.
+          if ! xcrun swift - <<'SWIFT' 2>&1 | tee diagnostics/apple-virtualization.log
+          import Foundation
+          import Virtualization
+
+          let supported = VZVirtualMachine.isSupported
+          print("VZVirtualMachine.isSupported=\(supported)")
+          guard supported else {
+              do {
+                  try VZVirtualMachineConfiguration().validate()
+              } catch {
+                  print("Virtualization.framework diagnostic: \(error as NSError)")
+              }
+              exit(1)
+          }
+          SWIFT
+          then
+            printf '%s\n' '::error::Apple E2E requires an Apple Silicon runner with usable Virtualization.framework (including nested virtualization when hosted in a VM). Select approved capable runner hardware; installing Container or changing CPU counts cannot enable unsupported hardware. See diagnostics/apple-virtualization*.log.'
+            exit 1
+          fi
+          test "$(uname -m)" = arm64 || { printf '%s\n' '::error::Apple E2E requires an Apple Silicon arm64 runner.'; exit 1; }
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod

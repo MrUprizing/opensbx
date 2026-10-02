@@ -20,7 +20,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/klauspost/compress/zstd"
 	"opensbx/internal/images"
 	"opensbx/internal/sandbox"
@@ -122,6 +121,112 @@ func TestDockerMaterializeLoadsAndReusesVerifiedDaemonNativeImageID(t *testing.T
 		t.Fatalf("verified cache hit must inspect/export actual daemon content without import: requests=%v", finalRequests)
 	}
 }
+
+func TestDockerMaterializeClosesLayerStreamsAfterArchiveConversion(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		readError error
+	}{
+		{name: "success"},
+		{name: "archive conversion error", readError: errors.New("injected compressed layer read failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := dockerCacheTestImage(t)
+			layers, err := base.Content.Layers()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(layers) == 0 {
+				t.Fatal("fixture image has no layers")
+			}
+			tracked := &trackedCompressedLayer{Layer: layers[0], readError: tc.readError}
+			content := &trackedLayerImage{Image: base.Content, layer: tracked}
+			base.Content = content
+			client, fixture := newDockerFixture(t)
+			configureDockerCacheFixture(fixture, base)
+
+			_, materializeErr := client.Materialize(context.Background(), base)
+			if tc.readError == nil && materializeErr != nil {
+				t.Fatalf("Materialize() error = %v", materializeErr)
+			}
+			if tc.readError != nil && !errors.Is(materializeErr, tc.readError) {
+				t.Fatalf("Materialize() error = %v, want original layer read error", materializeErr)
+			}
+			if opened, closed := tracked.counts(); opened != 1 || closed != 1 {
+				t.Fatalf("compressed layer stream opened/closed = %d/%d, want 1/1 before Materialize returns", opened, closed)
+			}
+		})
+	}
+}
+
+type trackedLayerImage struct {
+	v1.Image
+	layer v1.Layer
+}
+
+func (i *trackedLayerImage) Layers() ([]v1.Layer, error) {
+	layers, err := i.Image.Layers()
+	if err != nil {
+		return nil, err
+	}
+	if len(layers) == 0 {
+		return layers, nil
+	}
+	return append([]v1.Layer{i.layer}, layers[1:]...), nil
+}
+
+type trackedCompressedLayer struct {
+	v1.Layer
+	mu        sync.Mutex
+	opened    int
+	closed    int
+	readError error
+}
+
+func (l *trackedCompressedLayer) Compressed() (io.ReadCloser, error) {
+	r, err := l.Layer.Compressed()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	l.opened++
+	l.mu.Unlock()
+	var reader io.Reader = r
+	if l.readError != nil {
+		reader = failingLayerReader{err: l.readError}
+	}
+	return &trackedLayerReadCloser{Reader: reader, closer: r, onClose: func() {
+		l.mu.Lock()
+		l.closed++
+		l.mu.Unlock()
+	}}, nil
+}
+
+func (l *trackedCompressedLayer) counts() (int, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.opened, l.closed
+}
+
+type trackedLayerReadCloser struct {
+	io.Reader
+	closer  io.Closer
+	onClose func()
+	once    sync.Once
+}
+
+func (r *trackedLayerReadCloser) Close() error {
+	var err error
+	r.once.Do(func() {
+		err = r.closer.Close()
+		r.onClose()
+	})
+	return err
+}
+
+type failingLayerReader struct{ err error }
+
+func (r failingLayerReader) Read([]byte) (int, error) { return 0, r.err }
 
 func configureDockerCacheFixture(fixture *dockerAPIFixture, image sandbox.Image) {
 	fixture.cacheDigest = image.ConfigDigest
@@ -1119,7 +1224,7 @@ func dockerArchiveForImage(t *testing.T, image sandbox.Image) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tarball.Write(tag, image.Content, f); err != nil {
+	if err := writeImageArchive(tag, image.Content, f); err != nil {
 		_ = f.Close()
 		t.Fatal(err)
 	}
