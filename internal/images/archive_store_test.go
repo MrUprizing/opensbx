@@ -51,6 +51,7 @@ func writeLayoutArchive(t *testing.T, destination string, image v1.ImageIndex) {
 		if err != nil {
 			return err
 		}
+		name = filepath.ToSlash(name)
 		if info.IsDir() {
 			return writer.WriteHeader(&tar.Header{Name: name + "/", Typeflag: tar.TypeDir, Mode: 0700})
 		}

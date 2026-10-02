@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"opensbx/internal/applecontainer"
@@ -147,10 +146,7 @@ func stopServer(args []string, out io.Writer) error {
 func checkAddressAvailable(addr string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return fmt.Errorf("address %s is already in use; choose another loopback port with `-addr 127.0.0.1:18090`", addr)
-		}
-		return fmt.Errorf("cannot listen on %s: %w", addr, err)
+		return listenError(addr, err)
 	}
 	return listener.Close()
 }

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -636,6 +637,9 @@ func isolatedFileScriptRunner(t *testing.T, id, root string) *synchronizedRunner
 }
 
 func TestFileOperationScriptsCreateParentsAndTreatPathsAsLiteralArguments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the isolated guest-script fixture executes POSIX /bin/sh")
+	}
 	id := "opensbx-ffffffffffffffffffffffffffffffff"
 	root := t.TempDir()
 	r := isolatedFileScriptRunner(t, id, root)
@@ -668,6 +672,9 @@ func TestFileOperationScriptsCreateParentsAndTreatPathsAsLiteralArguments(t *tes
 }
 
 func TestDeleteFileRecursivelyRemovesNestedTreeAndTreatsAbsenceAsSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the isolated guest-script fixture executes POSIX /bin/sh")
+	}
 	id := "opensbx-ffffffffffffffffffffffffffffffff"
 	root := t.TempDir()
 	deleteTree := "nested delete/tree"
@@ -694,6 +701,9 @@ func TestDeleteFileRecursivelyRemovesNestedTreeAndTreatsAbsenceAsSuccess(t *test
 }
 
 func TestDeleteFileOfAlreadyAbsentPathIsSuccessful(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the isolated guest-script fixture executes POSIX /bin/sh")
+	}
 	const id = "opensbx-ffffffffffffffffffffffffffffffff"
 	root := t.TempDir()
 	r := isolatedFileScriptRunner(t, id, root)

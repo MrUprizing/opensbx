@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -52,5 +54,17 @@ func TestCheckAddressAvailableExplainsPortConflict(t *testing.T) {
 	err = checkAddressAvailable(listener.Addr().String())
 	if err == nil || !strings.Contains(err.Error(), "already in use") || !strings.Contains(err.Error(), "-addr") {
 		t.Fatalf("checkAddressAvailable() = %v, want actionable port-conflict error", err)
+	}
+}
+
+func TestListenErrorPreservesNonAddressInUseCause(t *testing.T) {
+	underlying := errors.New("synthetic listener failure")
+	wrapped := fmt.Errorf("listener setup: %w", underlying)
+	got := listenError("127.0.0.1:18089", wrapped)
+	if !errors.Is(got, underlying) {
+		t.Fatalf("listenError() = %v; want underlying cause %v to remain discoverable", got, underlying)
+	}
+	if isAddressInUse(wrapped) {
+		t.Fatalf("isAddressInUse(%v) = true for an unrelated listener failure", wrapped)
 	}
 }

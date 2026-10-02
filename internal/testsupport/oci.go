@@ -60,6 +60,7 @@ func OCIArchivePlatform(t testing.TB, platform v1.Platform) (string, v1.Platform
 		if err != nil {
 			return err
 		}
+		name = filepath.ToSlash(name)
 		if info.IsDir() {
 			return writer.WriteHeader(&tar.Header{Name: name + "/", Typeflag: tar.TypeDir, Mode: 0700})
 		}

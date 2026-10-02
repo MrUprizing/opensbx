@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"path/filepath"
+	"path"
 	"reflect"
+	"strings"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -34,6 +35,9 @@ func TestOCIArchivePlatformKeepsIndexAndConfigVariantConsistent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if strings.Contains(header.Name, `\`) {
+			t.Fatalf("OCI archive path %q contains a platform-specific separator", header.Name)
+		}
 		body, err := io.ReadAll(reader)
 		if err != nil {
 			t.Fatal(err)
@@ -49,12 +53,12 @@ func TestOCIArchivePlatformKeepsIndexAndConfigVariantConsistent(t *testing.T) {
 	if len(index.Manifests) != 1 || index.Manifests[0].Platform == nil || !reflect.DeepEqual(*index.Manifests[0].Platform, want) {
 		t.Fatalf("archive index platform=%+v want %+v", index.Manifests, want)
 	}
-	manifestRaw := blobs[filepath.Join("blobs", "sha256", index.Manifests[0].Digest.Hex)]
+	manifestRaw := blobs[path.Join("blobs", "sha256", index.Manifests[0].Digest.Hex)]
 	var manifest v1.Manifest
 	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
 		t.Fatalf("decode fixture manifest: %v", err)
 	}
-	configRaw := blobs[filepath.Join("blobs", "sha256", manifest.Config.Digest.Hex)]
+	configRaw := blobs[path.Join("blobs", "sha256", manifest.Config.Digest.Hex)]
 	var config v1.ConfigFile
 	if err := json.Unmarshal(configRaw, &config); err != nil {
 		t.Fatalf("decode fixture image config: %v", err)

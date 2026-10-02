@@ -20,6 +20,7 @@ import (
 
 	"opensbx/internal/database"
 	"opensbx/internal/docker"
+	"opensbx/internal/processctl"
 )
 
 func TestMainProcessHelper(t *testing.T) {
@@ -377,6 +378,7 @@ func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 		_ = sqlDB.Close()
 	}
 	workDir := t.TempDir()
+	dataDir := filepath.Join(workDir, "data")
 	logPath := filepath.Join(workDir, "logs", "api.log")
 	apiAddr := reserveTCPAddress(t)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestMainProcessHelper$")
@@ -385,7 +387,7 @@ func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 		"OPENSBX_MAIN_HELPER=1",
 		"ADDR="+apiAddr,
 		"API_KEY=test-key",
-		"OPENSBX_DATA_DIR="+filepath.Join(workDir, "data"),
+		"OPENSBX_DATA_DIR="+dataDir,
 		"LOG_FILE="+logPath,
 	)
 	// Share Go's standard coverage data directory with the subprocess. The Go
@@ -405,20 +407,18 @@ func TestMainStartsAndGracefullyShutsDownOnTermination(t *testing.T) {
 
 	client := &http.Client{Timeout: 200 * time.Millisecond}
 	deadline := time.Now().Add(10 * time.Second)
+	serverPublished := false
 	for time.Now().Before(deadline) {
-		response, err := client.Get("http://" + apiAddr + "/readiness-probe")
-		apiReady := err == nil
-		if response != nil {
-			_ = response.Body.Close()
-		}
-		if apiReady {
+		pid, running, err := processctl.Running(dataDir)
+		if err == nil && running && pid == cmd.Process.Pid {
+			serverPublished = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if time.Now().After(deadline) {
+	if !serverPublished {
 		stopChild()
-		t.Fatalf("timed out waiting for API readiness; stdout: %s; stderr: %s", stdout.String(), stderr.String())
+		t.Fatalf("timed out waiting for the child to publish its ready process record; stdout: %s; stderr: %s", stdout.String(), stderr.String())
 	}
 	if !listenerResponds(client, apiAddr) {
 		stopChild()
@@ -459,7 +459,11 @@ func TestStartAndStopCLIControlsBackgroundServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(t.TempDir(), "opensbx")
+	binName := "opensbx"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	bin := filepath.Join(t.TempDir(), binName)
 	build := exec.Command("go", "build", "-o", bin, "./cmd/api")
 	build.Dir = root
 	if output, err := build.CombinedOutput(); err != nil {

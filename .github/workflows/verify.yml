@@ -248,11 +248,18 @@ jobs:
           container --version
       - name: Prepare Apple runtime
         if: ${{ matrix.runtime == 'container' }}
+        timeout-minutes: 8
         run: |
-          container system kernel set --recommended --force
-          container system start
-          container image pull --platform linux/arm64 --progress plain ghcr.io/apple/containerization/vminit:0.45.0
-          container system status
+          set -euo pipefail
+          mkdir -p diagnostics/apple-runtime
+          {
+            # 1.4.1 registers and waits for the API before kernel installation.
+            # Disable the first-start prompt; install the kernel explicitly below.
+            container system start --disable-kernel-install --timeout 60 --log-root "$PWD/diagnostics/apple-runtime" </dev/null
+            container system kernel set --recommended --force
+            container image pull --platform linux/arm64 --progress plain ghcr.io/apple/containerization/vminit:0.45.0
+            container system status
+          } 2>&1 | tee diagnostics/apple-bootstrap.log
       - name: Packaged-binary E2E (harness race only)
         env:
           OPENSBX_E2E_BINARY: ${{ runner.temp }}/opensbx-release/opensbx

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"syscall"
 	"time"
 
 	"opensbx/internal/api"
@@ -230,7 +229,7 @@ func runServer(args []string) error {
 }
 
 func listenError(addr string, err error) error {
-	if errors.Is(err, syscall.EADDRINUSE) {
+	if isAddressInUse(err) {
 		return fmt.Errorf("address %s is already in use; choose another loopback port with -addr 127.0.0.1:18090", addr)
 	}
 	return fmt.Errorf("cannot listen on %s: %w", addr, err)

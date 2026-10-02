@@ -11,7 +11,7 @@ import (
 	"opensbx/internal/runtimeio"
 )
 
-func TestRecoverRegistersRetryForEveryOverdueSandboxBeforeCallerBudgetExpires(t *testing.T) {
+func TestRecoverRegistersRetryForEveryOverdueSandboxBeforeCallerCancellation(t *testing.T) {
 	db := database.New(filepath.Join(t.TempDir(), "overdue-budget.db"))
 	dbSQL, err := db.DB()
 	if err != nil {
@@ -39,22 +39,29 @@ func TestRecoverRegistersRetryForEveryOverdueSandboxBeforeCallerBudgetExpires(t 
 		fixture.mu.Unlock()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
-	defer cancel()
-	err = dc.Recover(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Recover() cancellation error=%v; caller budget exhaustion must remain actionable", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- dc.Recover(ctx) }()
 	select {
 	case <-fixture.stopEntered:
-	case <-time.After(time.Second):
-		t.Fatal("recovery did not begin a bounded overdue stop")
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("recovery did not reach the blocked overdue-stop request")
 	}
 	for _, nativeID := range []string{"container-1", "container-2"} {
 		entry := dc.getTimerEntry(nativeID)
 		if entry == nil || !entry.expiresAt.Equal(deadline) {
 			t.Errorf("overdue %s has no registered retry with original deadline %s; entry=%v", nativeID, deadline, entryDeadline(entry))
 		}
+	}
+	cancel()
+	select {
+	case err := <-recoveryDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Recover() after canceling the blocked caller returned %v; want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Recover() did not return after caller cancellation")
 	}
 }
 

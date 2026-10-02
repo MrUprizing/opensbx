@@ -144,9 +144,13 @@ func TestValidateEndpointAcceptsOnlyLocalDockerTransports(t *testing.T) {
 		{"https://localhost:2375/path", false}, {"npipe:////./pipe/docker_engine", true}, {"tcp://[not-an-ip", false},
 	} {
 		t.Run(tc.endpoint, func(t *testing.T) {
+			wantValid := tc.valid
+			if runtime.GOOS == "windows" && strings.HasPrefix(tc.endpoint, "unix://") {
+				wantValid = false
+			}
 			err := ValidateEndpoint(tc.endpoint)
-			if (err == nil) != tc.valid {
-				t.Fatalf("ValidateEndpoint(%q) err=%v want valid=%v", tc.endpoint, err, tc.valid)
+			if (err == nil) != wantValid {
+				t.Fatalf("ValidateEndpoint(%q) err=%v want valid=%v", tc.endpoint, err, wantValid)
 			}
 		})
 	}

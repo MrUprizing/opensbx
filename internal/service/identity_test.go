@@ -1052,6 +1052,7 @@ func TestRouteRejectsMissingStoppedAndNonTCPSandboxes(t *testing.T) {
 func TestServiceRejectsNonLinuxCapabilityBeforeApplicationConstruction(t *testing.T) {
 	cache := &cacheFake{caps: sandbox.Capabilities{Platform: sandbox.Platform{OS: "darwin", Architecture: "arm64"}}}
 	repoDB := database.New(filepath.Join(t.TempDir(), "db.sqlite"))
+	cleanupServiceTestDB(t, repoDB)
 	repo := database.NewRepository(repoDB)
 	adapter := runtimeio.New(&runtimeEngineFake{repo: repo.NativeView()}, cache, repo)
 	if _, err := New(context.Background(), adapter, adapter, nil, repo); !errors.Is(err, sandbox.ErrUnsupported) {
@@ -1063,6 +1064,7 @@ func TestServiceNewPropagatesCacheCapabilitiesFailure(t *testing.T) {
 	cacheErr := errors.New("native capability probe failed")
 	cache := &cacheFake{capsErr: cacheErr}
 	db := database.New(filepath.Join(t.TempDir(), "db.sqlite"))
+	cleanupServiceTestDB(t, db)
 	repo := database.NewRepository(db)
 	adapter := runtimeio.New(&runtimeEngineFake{repo: repo.NativeView()}, cache, repo)
 	if _, err := New(context.Background(), adapter, adapter, nil, repo); !errors.Is(err, cacheErr) {

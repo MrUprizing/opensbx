@@ -159,6 +159,14 @@ runtime. The CI Apple job uses the `macos-26` arm64 runner, installs signed Appl
 Container 1.4.1, prepares the recommended kernel and vminit, and stops the
 ephemeral runtime afterward.
 
+On a fresh CI runner, preparation first starts the service with
+`--disable-kernel-install --timeout 60`, avoiding the interactive kernel prompt
+and waiting up to 60 seconds for the API. It then explicitly installs the
+recommended kernel and pulls `ghcr.io/apple/containerization/vminit:0.45.0`.
+The preparation step has an eight-minute limit; bootstrap output and service logs
+are retained in the E2E diagnostics artifact. Preparation failures block both
+E2E runs rather than skipping runtime prerequisites.
+
 ## Performance data collection
 
 See [performance commands, prerequisites and measurement scopes](docs/performance.md)

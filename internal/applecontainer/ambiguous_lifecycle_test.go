@@ -40,14 +40,7 @@ func TestRecoveryWorkerRechecksMissingAndNewerAppleIntents(t *testing.T) {
 				t.Fatal(err)
 			}
 			client := New(repo, runner, time.Now)
-			t.Cleanup(func() {
-				client.recovery.Stop()
-				client.mu.Lock()
-				for timerID := range client.timers {
-					client.clearTimer(timerID)
-				}
-				client.mu.Unlock()
-			})
+			cleanupAppleTestClient(t, client, db)
 			if _, err := client.Start(context.Background(), id); err == nil {
 				t.Fatal("expected ambiguous start error")
 			}
@@ -110,23 +103,12 @@ func TestAmbiguousStartAndRestartScheduleSameProcessRecovery(t *testing.T) {
 			}
 			path := filepath.Join(t.TempDir(), "ambiguous.db")
 			db := database.New(path)
-			sqlDB, err := db.DB()
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = sqlDB.Close() })
 			repo := database.NewRepository(db)
 			if err := repo.CreateOwnership(database.Sandbox{ID: id, NativeID: id, RuntimeKind: "container", AttemptToken: id, Name: "ambiguous"}); err != nil {
 				t.Fatal(err)
 			}
 			client := New(repo, runner, func() time.Time { return base })
-			t.Cleanup(func() {
-				client.mu.Lock()
-				for key := range client.timers {
-					client.clearTimer(key)
-				}
-				client.mu.Unlock()
-			})
+			cleanupAppleTestClient(t, client, db)
 
 			var mutationErr error
 			if operation == "start" {

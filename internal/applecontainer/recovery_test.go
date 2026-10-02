@@ -109,6 +109,7 @@ func TestRecoverRetriesOverdueStopWithOriginalDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := New(repo, runner, func() time.Time { return base })
+	cleanupAppleTestClient(t, client, db)
 	if err := client.Recover(context.Background()); err != nil {
 		t.Fatalf("Recover() should keep retrying after transient stop failure: %v", err)
 	}
@@ -164,6 +165,7 @@ func TestRecoverRefusesForeignLabelWithoutDeletingPendingResource(t *testing.T) 
 		return nil
 	}}
 	client := New(repo, runner, time.Now)
+	cleanupAppleTestClient(t, client, db)
 	err := client.Recover(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ownership label mismatch") {
 		t.Fatalf("foreign-label recovery error=%v; want ownership refusal", err)
@@ -185,6 +187,7 @@ func TestShutdownCancelsQueuedRecoveryAndExpirationTimers(t *testing.T) {
 	db := database.New(t.TempDir() + "/shutdown-recovery.db")
 	runner := &scriptedRunner{t: t}
 	client := New(database.NewRepository(db), runner, time.Now)
+	cleanupAppleTestClient(t, client, db)
 	var workRan atomic.Bool
 	client.recovery.Schedule("pending-intent", func(context.Context) error {
 		workRan.Store(true)
@@ -251,6 +254,7 @@ func TestCreatePersistsIntentBeforeNativeCallAndRecoversLostResponse(t *testing.
 		return nil
 	}
 	client = New(repo, runner, func() time.Time { return time.Date(2037, 1, 2, 3, 4, 5, 0, time.UTC) })
+	cleanupAppleTestClient(t, client, db)
 	_, err := client.Create(context.Background(), runtimeio.CreateSandboxRequest{Image: imageRef})
 	if err == nil || !strings.Contains(err.Error(), "Apple container create failed") || !strings.Contains(err.Error(), "Apple container delete failed") {
 		t.Fatalf("Create() lost-response compensation error=%v", err)
@@ -310,6 +314,7 @@ func TestCreateIntentRemainsUntilRuntimeioProvenanceAdoption(t *testing.T) {
 		return nil
 	}
 	client := New(repo, runner, time.Now)
+	cleanupAppleTestClient(t, client, db)
 	adapter := runtimeio.New(client, recoveryImageCache{reference: imageRef}, repo)
 	prepared, err := adapter.Materialize(context.Background(), sandbox.Image{RootDigest: "sha256:root", ManifestDigest: "sha256:manifest"})
 	if err != nil {
